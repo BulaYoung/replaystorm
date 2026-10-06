@@ -131,7 +131,32 @@ Requirements for such a file:
   while the index is built (more with `--ts-order sort` on unordered timestamps). A 500 GB file
   with ~900-byte frames has ~550 million packets: ~9 GB during replay, ~19 GB at peak.
 - **Startup time.** The index pass reads the whole file once (about 2.4 GB/s cold on mendel17:
-  ~3.5 minutes for 500 GB), followed by single-threaded timeline normalization.
+  ~3.5 minutes for 500 GB), followed by single-threaded timeline normalization. Use
+  `--index-cache` so that only the first run pays for the scan.
+
+## Index cache
+
+`--index-cache FILE` (or `--index-cache auto` for `FILE.pcap.afridx` next to the pcap) keeps the
+packet index on disk. The first run builds the index as usual and saves it; later runs map the
+cache instead of reading the whole pcap. For a 500 GB file this replaces a ~3.5 minute scan with
+reading an ~11.5 GB cache.
+
+- The cache stores the part of the index that does not depend on options: offset and length,
+  timestamp, a 32-bit symmetric flow hash and classification flags (21 bytes per packet). Shard
+  numbers and the MTU-based skipping are recomputed in parallel on every start, so one cache
+  works for any `-t`, `--cpus` and MTU.
+- The cache is used only for the same pcap: same size, mtime, inode and a hash of its first and
+  last 64 KB, and the same cache format version. Otherwise it is rebuilt and overwritten, with a
+  message saying why.
+- It is written to a temporary file and then renamed, so an interrupted run never leaves a broken
+  cache. The cache file is mapped read-only from the disk's point of view (copy-on-write), and
+  is never modified by a run.
+- Timeline normalization (`--ts-order`, `--max-gap`, outliers) is not cached and is redone on
+  every start, since it depends on options.
+- To force a rebuild, delete the cache file.
+
+On the test laptop, a 4.2 GB file (4.7 million packets) produced a 98.5 MB cache, and a start
+took 0.19 s with it versus 1.06 s without it.
 
 ## Rate modes
 
@@ -450,7 +475,9 @@ about 1.2 M ENOBUFS/s with all threads at 100% CPU; it predates the ENOBUFS back
 ```
 src/pcap.[ch]      pcap parsing, mmap, preload
 src/dissect.[ch]   L2/L3/L4 parsing, symmetric hash
-src/index.[ch]     index: sequential pass + parallel hashing
+src/index.[ch]     index: sequential pass + parallel hashing, then resolve to shards
+src/idxcache.[ch]  on-disk index cache
+src/stream.[ch]    readahead and drop-behind for files larger than RAM
 src/sched.[ch]     timeline normalization, t_send, rate profile, histogram (pure functions)
 src/clock.[ch]     fast clock (TSC or CLOCK_MONOTONIC)
 src/worker.[ch]    sender thread: TX_RING, hot loop, waiting, batches

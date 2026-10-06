@@ -25,6 +25,7 @@ typedef struct {
 	double link_bps;       /* 0 means unknown */
 	const char *link_src;
 	int64_t index_ns, norm_ns; /* preparation time */
+	int index_cached;          /* index was loaded from the cache */
 } afr_ctx_t;
 
 /* Analysis report (--analyze) */

@@ -221,6 +221,23 @@ def t_bytes(pcaps):
     check(collections.Counter(f for _, f in frames) == collections.Counter(expected_frames(p) * 3),
           "drop-behind: all frames of 3 laps arrived byte for byte")
 
+    print("== Index cache: second run loads the index, also with another thread count")
+    p = os.path.join(pcaps, "l2mix.pcap")
+    cache = "/tmp/afr_func_l2mix.afridx"
+    if os.path.exists(cache):
+        os.unlink(cache)
+    rc1, out1, frames1, _ = replay(p, ["--pps", "5000", "-t", "3", "--index-cache", cache])
+    rc2, out2, frames2, _ = replay(p, ["--pps", "5000", "-t", "5", "--index-cache", cache])
+    check(rc1 == 0 and os.path.exists(cache), "first run saved the cache")
+    rc4, out4 = run_afr(["--analyze", "-t", "7", "--index-cache", cache, p])
+    check(rc2 == 0 and rc4 == 0 and "Index loaded from cache" in out4,
+          "later runs load the index from the cache (any -t)")
+    exp = collections.Counter(expected_frames(p))
+    check(collections.Counter(f for _, f in frames2) == exp, "cached index: all frames arrived byte for byte")
+    rc3, out3 = run_afr(["--analyze", "--index-cache", cache, os.path.join(pcaps, "l2mix_ns_be.pcap")])
+    check(rc3 == 0 and "not used" in out3, "cache of another pcap is not used")
+    os.unlink(cache)
+
     print("== RAW IP with synthetic Ethernet")
     p = os.path.join(pcaps, "raw_ip.pcap")
     sm, dm = "02:aa:00:00:00:01", "02:bb:00:00:00:02"

@@ -39,6 +39,7 @@ typedef struct {
 	unsigned mtu;          /* 0 means from interface */
 
 	int preload;
+	const char *index_cache; /* --index-cache FILE or "auto" */
 	uint64_t readahead;   /* bytes kept requested ahead of the senders */
 	int drop_behind;      /* -1 auto, 0 off, 1 on */
 	uint8_t smac[6], dmac[6];

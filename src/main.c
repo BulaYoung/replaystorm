@@ -1,3 +1,4 @@
+#include "idxcache.h"
 #include "replay.h"
 #include "util.h"
 
@@ -85,7 +86,39 @@ static int prepare(afr_ctx_t *c)
 	    .max_frame = c->mtu + 14,
 	    .hash_threads = c->ip_threads < (unsigned)c->ncpus ? c->ip_threads : (unsigned)c->ncpus,
 	};
-	if (afr_index_build(&c->pf, &icfg, &c->ix, err, sizeof(err)) < 0) {
+	/* Index cache: next to the pcap with "auto", or an explicit path. */
+	char cache_path[4096] = "";
+	if (o->index_cache) {
+		if (!strcmp(o->index_cache, "auto"))
+			snprintf(cache_path, sizeof(cache_path), "%s.afridx", o->file);
+		else
+			snprintf(cache_path, sizeof(cache_path), "%s", o->index_cache);
+	}
+	if (cache_path[0]) {
+		char why[256];
+		if (afr_idxcache_load(cache_path, &c->pf, &c->ix, why, sizeof(why)) == 1) {
+			c->index_cached = 1;
+			afr_log_info("Index loaded from cache %s", cache_path);
+		} else {
+			afr_log_info("Index cache %s not used: %s; building the index", cache_path, why);
+		}
+	}
+	if (!c->index_cached) {
+		if (afr_index_build(&c->pf, &icfg, &c->ix, err, sizeof(err)) < 0) {
+			afr_log_err("%s", err);
+			return 1;
+		}
+		if (cache_path[0]) {
+			int64_t ts0 = afr_now_ns();
+			if (afr_idxcache_save(cache_path, &c->pf, &c->ix, err, sizeof(err)) < 0)
+				afr_log_warn("index cache not saved: %s", err);
+			else
+				afr_log_info("Index saved to cache %s (%.1f GB) in %.1f s", cache_path,
+				             (double)c->ix.n * 21 / 1e9, (double)(afr_now_ns() - ts0) / 1e9);
+		}
+	}
+	/* Shards for the current thread count and MTU-dependent skipping. */
+	if (afr_index_resolve(&c->ix, c->pf.raw_ip, &icfg, err, sizeof(err)) < 0) {
 		afr_log_err("%s", err);
 		return 1;
 	}

@@ -1,9 +1,11 @@
+#include "idxcache.h"
 #include "index.h"
 #include "pcap.h"
 #include "t.h"
 
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct {
 	uint8_t buf[8192];
@@ -178,6 +180,7 @@ static void index_build(void)
 	idx_cfg_t cfg = {.ip_shards = 4, .max_frame = 1514, .hash_threads = 2};
 	pkt_index_t ix;
 	CHECK_EQ(afr_index_build(&pf, &cfg, &ix, err, sizeof(err)), 0);
+	CHECK_EQ(afr_index_resolve(&ix, pf.raw_ip, &cfg, err, sizeof(err)), 0);
 	CHECK_EQ(ix.n, 4);
 	CHECK_EQ(ix.st.skipped[SKIP_TOO_BIG], 1);
 	CHECK_EQ(ix.st.skipped[SKIP_TOO_SMALL], 1);
@@ -187,7 +190,102 @@ static void index_build(void)
 	CHECK_EQ(ix.shard[2], SHARD_SKIP);
 	CHECK_EQ(OFFLEN_LEN(ix.offlen[3]), 64);
 	CHECK_EQ(ix.ts[1], 1700000000LL * NS_PER_SEC + 10000);
+	/* The same index resolves for another MTU without rebuilding. */
+	idx_cfg_t jumbo = {.ip_shards = 4, .max_frame = 9014, .hash_threads = 2};
+	CHECK_EQ(afr_index_resolve(&ix, pf.raw_ip, &jumbo, err, sizeof(err)), 0);
+	CHECK_EQ(ix.st.skipped[SKIP_TOO_BIG], 0);
+	CHECK(ix.shard[1] != SHARD_SKIP);
+	CHECK_EQ(ix.st.max_frame, 2000);
 	afr_index_free(&ix);
+}
+
+/* Write a pcap with many flows to a real file (the cache checks inode and mtime). */
+static void write_flows_pcap(const char *path, int npkts, uint32_t salt)
+{
+	FILE *f = fopen(path, "wb");
+	uint32_t hdr[6] = {0xa1b2c3d4u, 0x00040002u, 0, 0, 65535, 1};
+	fwrite(hdr, 4, 6, f);
+	for (int i = 0; i < npkts; i++) {
+		uint8_t fr[80] = {0};
+		for (int k = 0; k < 12; k++)
+			fr[k] = (uint8_t)(k + 1);
+		fr[12] = 0x08; /* IPv4 */
+		fr[14] = 0x45;
+		fr[23] = 17;
+		uint32_t src = 0x0a000000u + (uint32_t)i % 97 + salt, dst = 0xc0a80001u;
+		for (int k = 0; k < 4; k++) {
+			fr[26 + k] = (uint8_t)(src >> (24 - 8 * k));
+			fr[30 + k] = (uint8_t)(dst >> (24 - 8 * k));
+		}
+		fr[34] = (uint8_t)(i >> 8);
+		fr[35] = (uint8_t)i;
+		uint32_t len = (i % 5 == 0) ? 60 : 80;
+		uint32_t rh[4] = {1700000000u + (uint32_t)i / 1000, (uint32_t)(i % 1000) * 1000, len, len};
+		fwrite(rh, 4, 4, f);
+		fwrite(fr, 1, len, f);
+	}
+	fclose(f);
+}
+
+static void index_cache(void)
+{
+	char pcap[] = "/tmp/afr_test_XXXXXX";
+	int fd = mkstemp(pcap);
+	close(fd);
+	char cache[64];
+	snprintf(cache, sizeof(cache), "%s.afridx", pcap);
+	unlink(cache);
+	write_flows_pcap(pcap, 5000, 0);
+
+	pcap_file_t pf;
+	char err[256], why[256];
+	CHECK_EQ(pcap_open(&pf, pcap, 0, err, sizeof(err)), 0);
+	idx_cfg_t cfg = {.ip_shards = 3, .max_frame = 1514, .hash_threads = 2};
+	pkt_index_t a, b;
+	CHECK_EQ(afr_idxcache_load(cache, &pf, &b, why, sizeof(why)), 0); /* no file yet */
+	CHECK_EQ(afr_index_build(&pf, &cfg, &a, err, sizeof(err)), 0);
+	CHECK_EQ(afr_idxcache_save(cache, &pf, &a, err, sizeof(err)), 0);
+	CHECK_EQ(afr_idxcache_load(cache, &pf, &b, why, sizeof(why)), 1);
+	CHECK_EQ(b.n, a.n);
+	CHECK(memcmp(a.offlen, b.offlen, a.n * 8) == 0);
+	CHECK(memcmp(a.ts, b.ts, a.n * 8) == 0);
+	CHECK(memcmp(a.h32, b.h32, a.n * 4) == 0);
+	CHECK(memcmp(a.flags, b.flags, a.n) == 0);
+	CHECK_EQ(b.st.ipv4, a.st.ipv4);
+	/* Resolving the cached index gives the same shards, also for another -t */
+	CHECK_EQ(afr_index_resolve(&a, 0, &cfg, err, sizeof(err)), 0);
+	CHECK_EQ(afr_index_resolve(&b, 0, &cfg, err, sizeof(err)), 0);
+	CHECK(memcmp(a.shard, b.shard, a.n * 2) == 0);
+	for (unsigned k = 0; k < a.nshards; k++)
+		CHECK_EQ(a.shard_pkts[k], b.shard_pkts[k]);
+	idx_cfg_t cfg7 = {.ip_shards = 7, .max_frame = 1514, .hash_threads = 3};
+	CHECK_EQ(afr_index_resolve(&b, 0, &cfg7, err, sizeof(err)), 0);
+	uint64_t total = 0;
+	for (unsigned k = 0; k < b.nshards; k++)
+		total += b.shard_pkts[k];
+	CHECK_EQ(total, 5000);
+	/* Writing to the cached timestamps does not change the cache file */
+	b.ts[0] = 12345;
+	afr_index_free(&b);
+	CHECK_EQ(afr_idxcache_load(cache, &pf, &b, why, sizeof(why)), 1);
+	CHECK_EQ(b.ts[0], a.ts[0]);
+	afr_index_free(&b);
+	afr_index_free(&a);
+	pcap_close(&pf);
+
+	/* The pcap is rewritten with other content: the cache must be rejected */
+	write_flows_pcap(pcap, 5000, 1000);
+	CHECK_EQ(pcap_open(&pf, pcap, 0, err, sizeof(err)), 0);
+	CHECK_EQ(afr_idxcache_load(cache, &pf, &b, why, sizeof(why)), 0);
+	CHECK(strstr(why, "changed") != NULL);
+	pcap_close(&pf);
+	/* A damaged cache file is rejected */
+	CHECK_EQ(truncate(cache, 4096 + 100), 0);
+	CHECK_EQ(pcap_open(&pf, pcap, 0, err, sizeof(err)), 0);
+	CHECK_EQ(afr_idxcache_load(cache, &pf, &b, why, sizeof(why)), 0);
+	pcap_close(&pf);
+	unlink(cache);
+	unlink(pcap);
 }
 
 void test_pcap(void)
@@ -196,4 +294,5 @@ void test_pcap(void)
 	truncated();
 	bad_headers();
 	index_build();
+	index_cache();
 }

@@ -47,8 +47,8 @@ void afr_report_analysis(const afr_ctx_t *c)
 	printf("Packets: %" PRIu64 " (%s), to send: %" PRIu64 "\n", s->pkts, b1, t->n);
 	afr_fmt_ns(b1, sizeof(b1), (double)(c->index_ns));
 	afr_fmt_ns(b2, sizeof(b2), (double)(c->norm_ns));
-	printf("Index built in %s, timeline in %s (%u hashing threads)\n", b1, b2,
-	       c->ip_threads);
+	printf("Index %s in %s, timeline in %s (%u threads)\n",
+	       c->index_cached ? "loaded from cache" : "built", b1, b2, c->ip_threads);
 
 	/* Time */
 	if (t->n > 0) {

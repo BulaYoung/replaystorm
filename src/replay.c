@@ -298,7 +298,8 @@ static void print_plan(const afr_ctx_t *c, worker_t **ws, unsigned nw)
 	const opts_t *o = c->o;
 	char b1[64], b2[64];
 	afr_fmt_ns(b1, sizeof(b1), (double)c->index_ns);
-	afr_log_info("File %s: %" PRIu64 " packets to send, index built in %s", o->file, c->tsr.n, b1);
+	afr_log_info("File %s: %" PRIu64 " packets to send, index %s in %s", o->file, c->tsr.n,
+	             c->index_cached ? "loaded from cache" : "built", b1);
 	switch (o->mode) {
 	case MODE_TOPSPEED: afr_log_info("Mode: top speed"); break;
 	case MODE_MBPS:

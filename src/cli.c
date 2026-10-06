@@ -60,6 +60,10 @@ void afr_usage(FILE *f)
 	    "\n"
 	    "Input:\n"
 	    "  --preload               load the whole file into memory before start\n"
+	    "  --index-cache FILE      keep the packet index on disk: the first run builds and saves\n"
+	    "                          it, later runs load it instead of scanning the pcap; auto =\n"
+	    "                          FILE.pcap.afridx next to the pcap. Rebuilt automatically if the\n"
+	    "                          pcap changes; valid for any -t and MTU\n"
 	    "  --readahead SIZE        keep this much of the file requested ahead of the senders\n"
 	    "                          (default 2G); a background thread does it every 20 ms\n"
 	    "  --drop-behind M         auto | on | off: drop already sent parts of the file from the\n"
@@ -80,6 +84,7 @@ void afr_usage(FILE *f)
 	    "\n"
 	    "Examples:\n"
 	    "  afreplay --analyze big.pcap\n"
+	    "  afreplay -i ens1f0 --mbps 99% --index-cache /var/tmp/big.afridx big.pcap\n"
 	    "  afreplay --analyze --multiplier 10 --link-speed 25G big.pcap\n"
 	    "  afreplay -i ens1f0 --topspeed --qdisc-bypass -t 12 big.pcap\n"
 	    "  afreplay -i ens1f0 --mbps 20000 --loop 0 big.pcap\n"
@@ -118,6 +123,7 @@ enum {
 	O_LINK,
 	O_MTU,
 	O_PRELOAD,
+	O_INDEX_CACHE,
 	O_READAHEAD,
 	O_DROP_BEHIND,
 	O_SMAC,
@@ -157,6 +163,7 @@ static const struct option long_opts[] = {
     {"link-speed", required_argument, NULL, O_LINK},
     {"mtu", required_argument, NULL, O_MTU},
     {"preload", no_argument, NULL, O_PRELOAD},
+    {"index-cache", required_argument, NULL, O_INDEX_CACHE},
     {"readahead", required_argument, NULL, O_READAHEAD},
     {"drop-behind", required_argument, NULL, O_DROP_BEHIND},
     {"smac", required_argument, NULL, O_SMAC},
@@ -342,6 +349,7 @@ int afr_parse_args(int argc, char **argv, opts_t *o)
 			o->mtu = (unsigned)u;
 			break;
 		case O_PRELOAD: o->preload = 1; break;
+		case O_INDEX_CACHE: o->index_cache = optarg; break;
 		case O_READAHEAD:
 			if (afr_parse_size(optarg, &o->readahead) < 0 || o->readahead < (16u << 20))
 				return bad("--readahead", optarg);
