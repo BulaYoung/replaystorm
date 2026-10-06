@@ -14,6 +14,7 @@
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <sys/resource.h>
 
 atomic_int g_stop;
 
@@ -370,6 +371,45 @@ static inline void publish_pos(worker_t *w, size_t i, uint64_t lap, int64_t lap_
 	PUB(w->st.gpos, next);
 }
 
+/*
+ * Keep this thread within fence_lead of the slowest one. Without it, at top speed (or a
+ * rate the link cannot reach) threads drift apart in the file: the fast ones outrun the
+ * readahead window and wait for the disk, the slow one keeps the pages behind it alive.
+ * The lap still ends with the slowest thread, so the total rate does not suffer.
+ */
+static uint64_t slowest_pos(const worker_t *w)
+{
+	uint64_t mn = UINT64_MAX;
+	for (unsigned i = 0; i < w->npeers; i++) {
+		const worker_t *p = w->peers[i];
+		if (atomic_load_explicit(&p->st.finished, RLX))
+			continue;
+		uint64_t g = atomic_load_explicit(&p->st.gpos, RLX);
+		if (g < mn)
+			mn = g;
+	}
+	return mn;
+}
+
+static void wait_fence(worker_t *w, uint64_t g)
+{
+	/* Recompute from the peers' positions (cheap) before deciding to wait. */
+	w->fence_min = slowest_pos(w);
+	if (g <= w->fence_min + w->fence_lead || w->fence_min == UINT64_MAX)
+		return;
+	if (w->pending)
+		flush(w);
+	w->st.fence_waits++;
+	while (!STOP_REQUESTED()) {
+		struct timespec ts = {0, 50000};
+		nanosleep(&ts, NULL);
+		w->fence_min = slowest_pos(w);
+		if (g <= w->fence_min + w->fence_lead)
+			break;
+	}
+	w->now = afr_clock_ns();
+}
+
 static void run(worker_t *w)
 {
 	const afr_ctx_t *c = w->c;
@@ -395,6 +435,11 @@ static void run(worker_t *w)
 			if (AFR_UNLIKELY(STOP_REQUESTED()))
 				return;
 			const pkt_t *p = &w->pk[i];
+			if (w->peers) {
+				uint64_t g = lap * c->pf.size + OFFLEN_OFF(p->offlen);
+				if (AFR_UNLIKELY(g > w->fence_min + w->fence_lead))
+					wait_fence(w, g);
+			}
 			if (mode == MODE_TIMED) {
 				if (asis && p->ts < max_sched) {
 					/* "Backward in time" under asis: no wait, lateness not counted. */
@@ -517,6 +562,7 @@ void *afr_worker_main(void *arg)
 		drain(w, 3 * NS_PER_SEC);
 	}
 	PUB(w->st.t_end, afr_now_ns());
+	{ struct rusage ru; getrusage(RUSAGE_THREAD, &ru); fprintf(stderr, "DBG majflt %ld\n", ru.ru_majflt); }
 	publish(w);
 	free(w->pk);
 	w->pk = NULL;

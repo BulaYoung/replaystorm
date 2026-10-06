@@ -26,6 +26,7 @@ typedef struct AFR_ALIGNED {
 	_Atomic uint64_t sends, enobufs, eagain;
 	_Atomic uint64_t asis_back;  /* packets "backward in time" under asis */
 	_Atomic uint64_t rebases;
+	_Atomic uint64_t fence_waits; /* times the thread waited for the slowest one */
 	_Atomic int64_t late_max;
 	_Atomic int64_t pos;         /* position on the timeline (lap*length + ts) */
 	_Atomic uint64_t lap;
@@ -42,7 +43,7 @@ typedef struct {
 	unsigned data_off;
 } tx_ring_t;
 
-typedef struct {
+typedef struct worker {
 	/* settings */
 	unsigned id;
 	int cpu;
@@ -51,6 +52,10 @@ typedef struct {
 	shared_t *sh;
 	mutate_cfg_t mut;
 	int mutate;
+	struct worker **peers;   /* all sender threads (NULL: no position fence) */
+	unsigned npeers;
+	uint64_t fence_lead;     /* how far ahead of the slowest thread this one may read */
+	uint64_t fence_min;      /* last computed slowest position */
 	/* data */
 	pkt_t *pk;
 	size_t n;

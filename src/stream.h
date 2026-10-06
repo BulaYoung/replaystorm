@@ -21,6 +21,7 @@ typedef struct {
 	int running;
 	/* positions are "global": lap * file_size + offset */
 	uint64_t ra_upto;    /* readahead requested up to here */
+	_Atomic uint64_t front; /* slowest next-read position: threads may not run far ahead */
 	uint64_t drop_upto;  /* dropped from the cache below here */
 	uint64_t pop_upto;   /* pages mapped (MADV_POPULATE_READ) up to here */
 	int populate;        /* STREAM_POP_*: how pages are pre-mapped */

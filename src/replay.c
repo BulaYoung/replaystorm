@@ -418,10 +418,17 @@ int afr_replay_run(afr_ctx_t *c)
 	if (!c->pf.preloaded) {
 		char ra[32];
 		snprintf(ra, sizeof(ra), "%.1f GB", (double)o->readahead / (1 << 30));
-		if (afr_stream_start(&stream) == 0)
+		if (afr_stream_start(&stream) == 0) {
 			afr_log_info("File streaming: readahead %s, drop-behind %s", ra,
 			             stream.drop_behind ? "on (file larger than free RAM)" : "off");
-		else
+			/* Threads stay within half the readahead window of the slowest one. */
+			uint64_t lead = o->readahead / 2 > (256ull << 20) ? o->readahead / 2 : (256ull << 20);
+			for (unsigned i = 0; i < nw; i++) {
+				ws[i]->peers = (struct worker **)ws;
+				ws[i]->npeers = nw;
+				ws[i]->fence_lead = lead;
+			}
+		} else
 			afr_log_warn("could not start the readahead thread");
 	}
 	snap_t start, prev, cur;
@@ -497,6 +504,13 @@ int afr_replay_run(afr_ctx_t *c)
 	int stopped = atomic_load(&g_stop) && !atomic_load(&sh->failed);
 	print_summary(c, &cur, &start, (double)(t_end - t0) / 1e9, ws, nw, json, stopped,
 	              atomic_load(&sh->shift));
+	uint64_t fwaits = 0;
+	for (unsigned i = 0; i < nw; i++)
+		fwaits += LD(ws[i]->st.fence_waits);
+	if (fwaits)
+		printf("Threads waited %" PRIu64 " times for the slowest one (kept within half the "
+		       "readahead window)\n",
+		       fwaits);
 	if (!c->pf.preloaded)
 		printf("File streaming: requested ahead %.1f GB, dropped from page cache %.1f GB, pages "
 		       "pre-mapped by %s\n",

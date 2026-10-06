@@ -125,6 +125,12 @@ streamed from disk during replay:
   available RAM): everything the slowest thread has passed (minus a 256 MB margin) is dropped
   from the page cache (`MADV_DONTNEED` + `POSIX_FADV_DONTNEED`). Without it the page cache would
   churn through hundreds of GB and push the packet index out to swap.
+- Threads are kept within half the readahead window of the slowest one (the slowest
+  next-read position is recomputed from all threads when a thread gets that far ahead). At top
+  speed, or at a rate the link cannot reach, threads would otherwise drift apart in the file:
+  the fast ones outrun the readahead and wait for the disk, the slowest one keeps the pages
+  behind it alive. A lap ends with the slowest thread anyway, so the total rate does not
+  change. The summary reports how many times threads waited.
 - The per-thread packet index is locked in RAM with `mlock` (works as root; otherwise raise
   `ulimit -l`).
 - `--preload` is ignored with a warning when the file does not fit into available memory.

@@ -95,6 +95,7 @@ static void *stream_main(void *arg)
 			/* Every thread reports the position it reads next, and all threads move
 			 * through the file together (both timestamp and rate modes follow file
 			 * order), so the slowest position is the front: read ahead from it. */
+			atomic_store_explicit(&s->front, mn, memory_order_release);
 			uint64_t target = mn + s->window;
 			uint64_t from = s->ra_upto > mn ? s->ra_upto : mn;
 			if (from < target) {
@@ -119,7 +120,7 @@ static void *stream_main(void *arg)
 				}
 			}
 		}
-		struct timespec ts = {0, 20 * 1000 * 1000};
+		struct timespec ts = {0, 10 * 1000 * 1000};
 		nanosleep(&ts, NULL);
 	}
 	return NULL;
@@ -129,6 +130,7 @@ int afr_stream_start(streamer_t *s)
 {
 	atomic_store(&s->stop, 0);
 	s->ra_upto = s->drop_upto = s->pop_upto = 0;
+	atomic_store(&s->front, 0);
 	s->populate = getenv("AFR_NO_POPULATE_MADVISE") ? STREAM_POP_TOUCH : STREAM_POP_MADVISE;
 	s->running = pthread_create(&s->th, NULL, stream_main, s) == 0;
 	if (s->running)
