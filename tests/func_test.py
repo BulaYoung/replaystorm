@@ -238,6 +238,19 @@ def t_bytes(pcaps):
     check(rc3 == 0 and "not used" in out3, "cache of another pcap is not used")
     os.unlink(cache)
 
+    print("== Direct I/O (O_DIRECT window instead of the page cache)")
+    p = os.path.join(pcaps, "l2mix.pcap")
+    for extra in (["--topspeed", "-t", "3", "--loop", "3"], ["--pps", "4000", "-t", "2", "--loop", "2"]):
+        rc, out, frames, js = replay(p, ["--io", "direct", "--io-threads", "2"] + extra, "/tmp/afr_dio.json")
+        laps = int(extra[-1])
+        check(rc == 0 and "Direct I/O: read" in out, "direct I/O %s: exit code 0, direct I/O summary" % " ".join(extra))
+        check(collections.Counter(f for _, f in frames) == collections.Counter(expected_frames(p) * laps),
+              "direct I/O %s: all frames of %d laps arrived byte for byte" % (" ".join(extra), laps))
+    rc, out, frames, _ = replay(p, ["--io", "direct", "--loop", "2", "--topspeed", "-t", "1",
+                                    "--loop-mutate", "ip,port"])
+    got = [f for _, f in frames]
+    check(rc == 0 and len(got) == 2 * len(expected_frames(p)), "direct I/O with --loop-mutate: 2 laps")
+
     print("== RAW IP with synthetic Ethernet")
     p = os.path.join(pcaps, "raw_ip.pcap")
     sm, dm = "02:aa:00:00:00:01", "02:bb:00:00:00:02"

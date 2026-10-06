@@ -1,6 +1,7 @@
 #include "replay.h"
 
 #include "clock.h"
+#include "dio.h"
 #include "util.h"
 #include "stream.h"
 #include "worker.h"
@@ -17,6 +18,9 @@
 #define RLX memory_order_relaxed
 #define LD(x) atomic_load_explicit(&(x), RLX)
 
+static dio_t g_dio;
+static int g_dio_on;
+
 static void on_signal(int sig)
 {
 	(void)sig;
@@ -29,6 +33,7 @@ typedef struct {
 	int64_t late_max;
 	uint64_t hist[LH_BUCKETS];
 	uint64_t sys_tx, sys_drop;
+	uint64_t disk_bytes;
 	int sys_ok;
 	int64_t pos_min, pos_last;
 	uint64_t lap_min, lap_last;
@@ -70,6 +75,7 @@ static void take_snap(worker_t **ws, unsigned nw, const char *iface, snap_t *s)
 				s->lap_min = l;
 		}
 	}
+	s->disk_bytes = g_dio_on ? LD(g_dio.bytes_read) : 0;
 	s->sys_ok = afr_sysfs_read_u64(iface, "statistics/tx_packets", &s->sys_tx) == 0 &&
 	            afr_sysfs_read_u64(iface, "statistics/tx_dropped", &s->sys_drop) == 0;
 }
@@ -115,7 +121,7 @@ static FILE *json_open(const afr_ctx_t *c, unsigned nw)
 typedef struct {
 	double t;
 	double dt;
-	uint64_t pkts, bytes, sys_tx, sys_drop, enobufs, eagain, sends;
+	uint64_t pkts, bytes, sys_tx, sys_drop, enobufs, eagain, sends, disk;
 	int sys_ok;
 	uint64_t p50, p99, pmax, late_n;
 	int timed;
@@ -133,6 +139,8 @@ static void json_row(FILE *f, int first, const row_t *r)
 	if (r->sys_ok)
 		fprintf(f, ", \"sys_tx_packets\": %" PRIu64 ", \"sys_tx_dropped\": %" PRIu64, r->sys_tx,
 		        r->sys_drop);
+	if (g_dio_on)
+		fprintf(f, ", \"disk_gbytes_per_s\": %.3f", (double)r->disk / r->dt / 1e9);
 	if (r->timed)
 		fprintf(f, ", \"late_p50_ns\": %" PRIu64 ", \"late_p99_ns\": %" PRIu64
 		           ", \"late_max_ns\": %" PRIu64 ", \"pcap_pos_s\": %.6f, \"lap\": %" PRIu64,
@@ -155,6 +163,8 @@ static void print_row(const row_t *r, const afr_ctx_t *c)
 	else
 		printf(" | sysfs unavailable");
 	printf(" | ENOBUFS +%" PRIu64 " EAGAIN +%" PRIu64, r->enobufs, r->eagain);
+	if (g_dio_on)
+		printf(" | disk %.2f GB/s", (double)r->disk / r->dt / 1e9);
 	if (r->timed) {
 		if (r->late_n) {
 			char a[32], p[32], x[32];
@@ -182,6 +192,7 @@ static void make_row(row_t *r, const snap_t *cur, const snap_t *prev, double t, 
 	r->sends = cur->sends - prev->sends;
 	r->enobufs = cur->enobufs - prev->enobufs;
 	r->eagain = cur->eagain - prev->eagain;
+	r->disk = cur->disk_bytes - prev->disk_bytes;
 	r->sys_ok = cur->sys_ok && prev->sys_ok;
 	if (r->sys_ok) {
 		r->sys_tx = cur->sys_tx - prev->sys_tx;
@@ -412,17 +423,46 @@ int afr_replay_run(afr_ctx_t *c)
 			break;
 		}
 	}
+	/* Threads stay within half the window of the slowest one. */
+	const uint64_t lead = o->readahead / 2 > (256ull << 20) ? o->readahead / 2 : (256ull << 20);
+	/* Direct I/O: reader threads fill a RAM window with O_DIRECT, bypassing the page cache. */
+	int64_t dio_t0 = 0;
+	int want_dio = !c->pf.preloaded &&
+	               (o->io_mode == IO_DIRECT || (o->io_mode == IO_AUTO && c->big_file));
+	if (want_dio) {
+		char derr[256];
+		if (afr_dio_open(&g_dio, o->file, c->pf.size, o->readahead, o->io_threads, o->loops, derr,
+		                 sizeof(derr)) < 0) {
+			afr_log_warn("direct I/O unavailable (%s); reading through the page cache", derr);
+		} else if (afr_dio_start(&g_dio, (struct worker **)ws, nw) < 0) {
+			afr_log_warn("could not start direct I/O readers; reading through the page cache");
+			afr_dio_close(&g_dio);
+		} else {
+			g_dio_on = 1;
+			dio_t0 = afr_now_ns();
+			for (unsigned i = 0; i < nw; i++) {
+				ws[i]->dio = &g_dio;
+				ws[i]->peers = (struct worker **)ws;
+				ws[i]->npeers = nw;
+				ws[i]->fence_lead = lead;
+			}
+			double wnd = (double)g_dio.nslots * DIO_CHUNK;
+			double sec = afr_dio_prefill(&g_dio, 300.0);
+			afr_log_info("Direct I/O: window %.1f GB (%u x 32 MB), %u reader threads; filled in "
+			             "%.1f s (%.2f GB/s)",
+			             wnd / (1 << 30), g_dio.nslots, g_dio.nreaders, sec,
+			             sec > 0 ? (double)atomic_load(&g_dio.bytes_read) / sec / 1e9 : 0.0);
+		}
+	}
 	/* Streaming of the file: readahead ahead of the senders, drop-behind for big files. */
 	streamer_t stream = {.pf = &c->pf, .ws = ws, .nw = nw, .window = o->readahead,
 	                     .drop_behind = o->drop_behind > 0};
-	if (!c->pf.preloaded) {
+	if (!c->pf.preloaded && !g_dio_on) {
 		char ra[32];
 		snprintf(ra, sizeof(ra), "%.1f GB", (double)o->readahead / (1 << 30));
 		if (afr_stream_start(&stream) == 0) {
 			afr_log_info("File streaming: readahead %s, drop-behind %s", ra,
 			             stream.drop_behind ? "on (file larger than free RAM)" : "off");
-			/* Threads stay within half the readahead window of the slowest one. */
-			uint64_t lead = o->readahead / 2 > (256ull << 20) ? o->readahead / 2 : (256ull << 20);
 			for (unsigned i = 0; i < nw; i++) {
 				ws[i]->peers = (struct worker **)ws;
 				ws[i]->npeers = nw;
@@ -441,6 +481,10 @@ int afr_replay_run(afr_ctx_t *c)
 		for (unsigned i = 0; i < nw; i++)
 			pthread_join(ws[i]->th, NULL);
 		afr_stream_stop(&stream);
+		if (g_dio_on) {
+			afr_dio_stop(&g_dio);
+			afr_dio_close(&g_dio);
+		}
 		for (unsigned i = 0; i < nw; i++)
 			if (ws[i]->err[0])
 				afr_log_err("%s", ws[i]->err);
@@ -498,6 +542,8 @@ int afr_replay_run(afr_ctx_t *c)
 			t_end = LD(ws[i]->st.t_end);
 	}
 	afr_stream_stop(&stream);
+	if (g_dio_on)
+		afr_dio_stop(&g_dio);
 	/* Wait for interface counters to catch up (frames may still be queued). */
 	usleep(100000);
 	take_snap(ws, nw, o->iface, &cur);
@@ -511,7 +557,23 @@ int afr_replay_run(afr_ctx_t *c)
 		printf("Threads waited %" PRIu64 " times for the slowest one (kept within half the "
 		       "readahead window)\n",
 		       fwaits);
-	if (!c->pf.preloaded)
+	if (g_dio_on) {
+		uint64_t dw = 0;
+		for (unsigned i = 0; i < nw; i++)
+			dw += LD(ws[i]->st.dio_waits);
+		double secs = (double)(t_end - dio_t0) / 1e9;
+		printf("Direct I/O: read %.1f GB, %.2f GB/s on average; senders waited for data %" PRIu64
+		       " times, readers waited for the slowest sender %" PRIu64 " times\n",
+		       (double)atomic_load(&g_dio.bytes_read) / 1e9,
+		       secs > 0 ? (double)atomic_load(&g_dio.bytes_read) / secs / 1e9 : 0.0, dw,
+		       (uint64_t)atomic_load(&g_dio.reader_waits));
+		if (atomic_load(&g_dio.failed)) {
+			afr_log_err("%s", g_dio.err);
+			rc = 1;
+		}
+		afr_dio_close(&g_dio);
+	}
+	if (!c->pf.preloaded && !g_dio_on)
 		printf("File streaming: requested ahead %.1f GB, dropped from page cache %.1f GB, pages "
 		       "pre-mapped by %s\n",
 		       (double)atomic_load(&stream.ra_bytes) / 1e9,

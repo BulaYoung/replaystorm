@@ -5,6 +5,7 @@
 
 enum { MODE_TIMED = 0, MODE_TOPSPEED, MODE_MBPS, MODE_PPS };
 enum { LAG_CATCHUP = 0, LAG_REBASE };
+enum { IO_AUTO = 0, IO_DIRECT, IO_MMAP };
 
 #define MAX_CPUS 1024
 
@@ -43,6 +44,8 @@ typedef struct {
 	const char *index_cache; /* --index-cache FILE or "auto" */
 	uint64_t readahead;   /* bytes kept requested ahead of the senders */
 	int drop_behind;      /* -1 auto, 0 off, 1 on */
+	int io_mode;          /* IO_AUTO / IO_DIRECT / IO_MMAP */
+	unsigned io_threads;  /* direct I/O reader threads */
 	uint8_t smac[6], dmac[6];
 
 	int analyze;

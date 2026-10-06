@@ -27,6 +27,7 @@ typedef struct {
 	int64_t index_ns, norm_ns; /* preparation time */
 	int index_cached;          /* index was loaded from the cache */
 	int64_t rate_lap_ns;       /* --mbps/--pps: duration of one lap of the rate timeline */
+	int big_file;              /* the file is larger than 80% of available RAM */
 } afr_ctx_t;
 
 /* Analysis report (--analyze) */

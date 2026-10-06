@@ -4,6 +4,7 @@
 #ifndef AFR_WORKER_H
 #define AFR_WORKER_H
 
+#include "dio.h"
 #include "mutate.h"
 #include "replay.h"
 
@@ -27,6 +28,7 @@ typedef struct AFR_ALIGNED {
 	_Atomic uint64_t asis_back;  /* packets "backward in time" under asis */
 	_Atomic uint64_t rebases;
 	_Atomic uint64_t fence_waits; /* times the thread waited for the slowest one */
+	_Atomic uint64_t dio_waits;   /* times the thread waited for data from the disk */
 	_Atomic int64_t late_max;
 	_Atomic int64_t pos;         /* position on the timeline (lap*length + ts) */
 	_Atomic uint64_t lap;
@@ -56,6 +58,9 @@ typedef struct worker {
 	unsigned npeers;
 	uint64_t fence_lead;     /* how far ahead of the slowest thread this one may read */
 	uint64_t fence_min;      /* last computed slowest position */
+	dio_t *dio;              /* direct I/O window (NULL: data from the mmap) */
+	uint64_t dio_q;          /* chunk of the last packet and its buffer */
+	const uint8_t *dio_buf;
 	/* data */
 	pkt_t *pk;
 	size_t n;

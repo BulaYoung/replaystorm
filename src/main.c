@@ -69,6 +69,7 @@ static int prepare(afr_ctx_t *c)
 			             (double)fsize / 1e9, (double)avail / 1e9);
 			o->preload = 0;
 		}
+		c->big_file = too_big;
 		if (o->drop_behind < 0)
 			o->drop_behind = !o->preload && too_big;
 		if (o->preload)

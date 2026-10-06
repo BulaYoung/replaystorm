@@ -68,7 +68,11 @@ void afr_usage(FILE *f)
 	    "  --readahead SIZE        keep this much of the file requested ahead of the senders\n"
 	    "                          (default 2G); a background thread does it every 20 ms\n"
 	    "  --drop-behind M         auto | on | off: drop already sent parts of the file from the\n"
-	    "                          page cache; auto = on when the file is larger than free RAM\n"
+	    "                          page cache; auto = on when the file is larger than free RAM\n"	    "  --io MODE               auto | direct | mmap: how the file is read during replay.\n"
+	    "                          direct: O_DIRECT reader threads fill a RAM window of\n"
+	    "                          --readahead size, bypassing the page cache; mmap: through the\n"
+	    "                          page cache; auto = direct when the file is larger than free RAM\n"
+	    "  --io-threads N          direct I/O reader threads (default 4)\n"
 	    "  --smac MAC, --dmac MAC  MAC addresses of the synthetic Ethernet header for RAW IP\n"
 	    "\n"
 	    "Looping with mutation:\n"
@@ -128,6 +132,8 @@ enum {
 	O_INDEX_CACHE,
 	O_READAHEAD,
 	O_DROP_BEHIND,
+	O_IO,
+	O_IO_THREADS,
 	O_SMAC,
 	O_DMAC,
 	O_ANALYZE,
@@ -169,6 +175,8 @@ static const struct option long_opts[] = {
     {"index-cache", required_argument, NULL, O_INDEX_CACHE},
     {"readahead", required_argument, NULL, O_READAHEAD},
     {"drop-behind", required_argument, NULL, O_DROP_BEHIND},
+    {"io", required_argument, NULL, O_IO},
+    {"io-threads", required_argument, NULL, O_IO_THREADS},
     {"smac", required_argument, NULL, O_SMAC},
     {"dmac", required_argument, NULL, O_DMAC},
     {"analyze", no_argument, NULL, O_ANALYZE},
@@ -201,6 +209,7 @@ int afr_parse_args(int argc, char **argv, opts_t *o)
 	o->batch = 64;
 	o->readahead = 2ull << 30;
 	o->drop_behind = -1;
+	o->io_threads = 4;
 	o->ring_frames = 4096;
 	static const uint8_t smac[6] = {0x02, 0, 0, 0, 0, 0x01}, dmac[6] = {0x02, 0, 0, 0, 0, 0x02};
 	memcpy(o->smac, smac, 6);
@@ -361,6 +370,21 @@ int afr_parse_args(int argc, char **argv, opts_t *o)
 		case O_READAHEAD:
 			if (afr_parse_size(optarg, &o->readahead) < 0 || o->readahead < (16u << 20))
 				return bad("--readahead", optarg);
+			break;
+		case O_IO:
+			if (!strcmp(optarg, "auto"))
+				o->io_mode = IO_AUTO;
+			else if (!strcmp(optarg, "direct"))
+				o->io_mode = IO_DIRECT;
+			else if (!strcmp(optarg, "mmap"))
+				o->io_mode = IO_MMAP;
+			else
+				return bad("--io", optarg);
+			break;
+		case O_IO_THREADS:
+			if (afr_parse_u64(optarg, &u) < 0 || u == 0 || u > 32)
+				return bad("--io-threads", optarg);
+			o->io_threads = (unsigned)u;
 			break;
 		case O_DROP_BEHIND:
 			if (!strcmp(optarg, "auto"))

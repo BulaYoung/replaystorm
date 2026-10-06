@@ -260,15 +260,58 @@ static void drain(worker_t *w, int64_t timeout)
 	publish(w);
 }
 
+/* The chunk is not in the direct I/O window yet: wait in memory, never in the kernel. */
+static const uint8_t *dio_wait(worker_t *w, uint64_t q)
+{
+	if (w->pending)
+		flush(w);
+	w->st.dio_waits++;
+	const uint8_t *b;
+	unsigned spins = 0;
+	while (!(b = afr_dio_chunk(w->dio, q))) {
+		if (STOP_REQUESTED())
+			return NULL;
+		if (++spins < 64) {
+			afr_cpu_relax();
+		} else {
+			struct timespec ts = {0, 20000};
+			nanosleep(&ts, NULL);
+		}
+	}
+	w->now = afr_clock_ns();
+	return b;
+}
+
+/* Packet data: from the direct I/O window or from the mmap of the file. */
+static inline const uint8_t *pkt_data(worker_t *w, const pkt_t *p, uint64_t lap)
+{
+	uint64_t off = OFFLEN_OFF(p->offlen);
+	if (!w->dio)
+		return w->c->pf.base + off;
+	uint64_t q = lap * w->dio->nchunks + (off >> DIO_CHUNK_SHIFT);
+	if (AFR_UNLIKELY(q != w->dio_q)) {
+		/* The previous chunk may be recycled once our published position moved past it,
+		 * but the current one cannot: our position is still inside it. */
+		const uint8_t *b = afr_dio_chunk(w->dio, q);
+		if (!b && !(b = dio_wait(w, q)))
+			return NULL;
+		w->dio_q = q;
+		w->dio_buf = b;
+	}
+	return w->dio_buf + (off & (DIO_CHUNK - 1));
+}
+
 /* Copy a packet into the ring and mark it for sending. */
 static inline int emit(worker_t *w, const pkt_t *p, uint64_t lap)
 {
+	const uint8_t *src = pkt_data(w, p, lap);
+	if (AFR_UNLIKELY(!src))
+		return -1;
 	struct tpacket2_hdr *h = acquire(w);
 	if (AFR_UNLIKELY(!h))
 		return -1;
 	uint8_t *dst = (uint8_t *)h + w->tx.data_off;
 	const uint32_t len = OFFLEN_LEN(p->offlen);
-	const uint8_t *src = w->c->pf.base + OFFLEN_OFF(p->offlen);
 	uint32_t flen = len;
 	if (w->c->pf.raw_ip) {
 		/* Synthetic Ethernet header for RAW IP. */
@@ -490,6 +533,7 @@ static int build_shard(worker_t *w)
 			w->pk[k++] = (pkt_t){.ts = ix->ts[i], .offlen = ix->offlen[i]};
 	}
 	w->n = k;
+	w->dio_q = UINT64_MAX;
 	if (w->c->o->ts_order == TS_ORDER_SORT && !w->c->tsr.monotone) {
 		/* Stable sort of the shard index by timestamp; data is not touched. */
 		rec16_t *tmp = malloc((k ? k : 1) * sizeof(rec16_t));

@@ -106,7 +106,36 @@ non-monotonic timestamps, another 32 bytes per packet is added while the timelin
 ## Files larger than RAM
 
 A file much larger than RAM (for example 500 GB on a 62 GB machine) cannot be preloaded and is
-streamed from disk during replay:
+streamed from disk during replay. There are two ways to do it (`--io auto|direct|mmap`; auto =
+direct when the file is larger than 80% of available RAM).
+
+### Direct I/O (`--io direct`, the default for big files)
+
+Reader threads (`--io-threads`, default 4) read the file sequentially with `O_DIRECT` in 32 MB
+chunks into a ring of buffers in RAM (the window, `--readahead` bytes), bypassing the page cache
+entirely, like `dd iflag=direct`. Chunks are numbered across laps, so reading simply continues
+into the next lap. Each slot holds its chunk plus 128 KB of the next one, so a packet starting in a
+chunk is always contiguous. A slot is reused only when every sender thread has moved past it
+(each thread publishes the position it reads next). The window is filled before T0.
+
+Sender threads take packet data from the window: they never touch the disk, never take page
+faults and never wait in the kernel. If a chunk is not loaded yet, a thread waits in memory and the
+summary counts it. The per-second line shows the disk read rate (`disk X GB/s`), the summary shows
+the total, the average and how often senders waited for data or readers waited for a free slot
+(readers waiting means the disk is faster than sending). If `O_DIRECT` is not supported by the
+filesystem (tmpfs, some network filesystems), afreplay falls back to the page cache with a warning.
+
+On the test laptop (3 GB file streamed from NVMe, top speed, 8 threads, two laps):
+
+| | rate | disk waits in sender threads |
+|---|---|---|
+| page cache (`--io mmap`) | 17.2-18.1 Gbit/s | 1150-1350 |
+| direct I/O (`--io direct`) | 22.7 Gbit/s | 0 (2 faults in total) |
+
+The disk delivered 2.5 GB/s with four readers in flight versus 1.9 GB/s for a single `dd`; the
+remaining limit was the veth sender, not the disk.
+
+### Page cache (`--io mmap`)
 
 - A background thread (`afr-stream`) wakes every 20 ms and keeps `--readahead` bytes (default
   2 GB) of the file requested with `madvise(MADV_WILLNEED)` ahead of the sender threads, so
