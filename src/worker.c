@@ -14,7 +14,6 @@
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <sys/resource.h>
 
 atomic_int g_stop;
 
@@ -562,7 +561,6 @@ void *afr_worker_main(void *arg)
 		drain(w, 3 * NS_PER_SEC);
 	}
 	PUB(w->st.t_end, afr_now_ns());
-	{ struct rusage ru; getrusage(RUSAGE_THREAD, &ru); fprintf(stderr, "DBG majflt %ld\n", ru.ru_majflt); }
 	publish(w);
 	free(w->pk);
 	w->pk = NULL;
