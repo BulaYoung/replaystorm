@@ -447,14 +447,13 @@ void *afr_worker_main(void *arg)
 
 	/* Память шарда и кольцо выделяются после привязки — на «своём» узле NUMA. */
 	w->tx.fd = -1;
-	if (build_shard(w) < 0 ||
-	    tx_open(&w->tx, c->o->iface, c->o->ring_frames, c->mtu + 14 + 4, c->o->qdisc_bypass,
-	            c->o->packet_loss, w->err, sizeof(w->err)) < 0) {
-		if (w->err[0] && !strstr(w->err, "поток")) {
-			char tmp[256];
-			snprintf(tmp, sizeof(tmp), "поток %u: %s", w->id, w->err);
-			memcpy(w->err, tmp, sizeof(tmp));
-		}
+	char terr[200] = "";
+	if (build_shard(w) < 0) {
+		atomic_store(&w->sh->failed, 1);
+		ok = 0;
+	} else if (tx_open(&w->tx, c->o->iface, c->o->ring_frames, c->mtu + 14 + 4, c->o->qdisc_bypass,
+	                   c->o->packet_loss, terr, sizeof(terr)) < 0) {
+		snprintf(w->err, sizeof(w->err), "поток %u: %s", w->id, terr);
 		atomic_store(&w->sh->failed, 1);
 		ok = 0;
 	}

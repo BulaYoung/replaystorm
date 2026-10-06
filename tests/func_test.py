@@ -274,6 +274,34 @@ def t_timing(pcaps, spin):
         check(abs(real - want) < 0.002 * want + 300_000, "x%g: общая длительность совпадает (±0.2%%)" % mult)
         check(js and "late_p99_ns" in js["summary"], "x%g: lateness p50/p99/max в JSON" % mult)
 
+    print("== --duration подбирает множитель")
+    p = os.path.join(pcaps, "timing.pcap")
+    rc, out, frames, _ = replay(p, ["--duration", "500ms", "--spin-us", str(spin)])
+    ts = sorted(t for t, _ in frames)
+    dur = (ts[-1] - ts[0]) / 1e9
+    check(rc == 0 and len(frames) == 300 and abs(dur - 0.5) < 0.005, "--duration 500ms: проиграно за %.4f с" % dur)
+
+    print("== --ts-order: sort/clamp/asis на метках со скачками назад")
+    p = os.path.join(pcaps, "ts_backward.pcap")
+    _, recs = read_pcap(p)
+    for order in ("sort", "clamp", "asis"):
+        rc, out, frames, js = replay(p, ["--ts-order", order, "-t", "3", "--spin-us", str(spin)], "/tmp/afr_func.json")
+        check(rc == 0 and len(frames) == 100, "%s: все 100 пакетов" % order)
+        per_flow = collections.defaultdict(list)
+        for t, f in sorted(frames):
+            per_flow[flow_key(f)].append(recs[seq_of(f)][0])
+        if order == "sort":
+            ok = all(v == sorted(v) for v in per_flow.values())
+            check(ok, "sort: внутри сессий пакеты уходят по возрастанию меток pcap")
+        else:
+            seqs = collections.defaultdict(list)
+            for t, f in sorted(frames):
+                seqs[flow_key(f)].append(seq_of(f))
+            check(all(v == sorted(v) for v in seqs.values()), "%s: внутри сессий сохранён порядок файла" % order)
+        if order == "asis":
+            check(js and js["summary"].get("asis_backward", 0) > 0,
+                  "asis: пакеты «назад во времени» учтены отдельно (%s)" % (js and js["summary"].get("asis_backward")))
+
     print("== --max-gap сжимает паузы")
     p = os.path.join(pcaps, "ts_gaps.pcap")
     rc, out, frames, _ = replay(p, ["--max-gap", "100ms", "--spin-us", str(spin)])
@@ -297,6 +325,72 @@ def t_timing(pcaps, spin):
     ts = sorted(t for t, _ in frames)
     check(rc == 0 and len(frames) == 50, "ts_spike: все 50 пакетов")
     check((ts[-1] - ts[0]) / 1e9 < 0.1, "ts_spike: скачок часов на час исключён из шкалы")
+
+
+def ip_l4_sums_ok(fr):
+    """Проверка IPv4-суммы и суммы TCP/UDP (IPv4, с VLAN). None — кадр не проверяется."""
+    off, et = 12, struct.unpack("!H", fr[12:14])[0]
+    while et in (0x8100, 0x88A8):
+        off += 4
+        et = struct.unpack("!H", fr[off:off + 2])[0]
+    off += 2
+    if et != 0x0800:
+        return None
+
+    def s16(b):
+        if len(b) % 2:
+            b += b"\0"
+        x = sum(struct.unpack("!%dH" % (len(b) // 2), b))
+        while x >> 16:
+            x = (x & 0xFFFF) + (x >> 16)
+        return x
+
+    ihl = (fr[off] & 0xF) * 4
+    if s16(fr[off:off + ihl]) != 0xFFFF:
+        return False
+    total = struct.unpack("!H", fr[off + 2:off + 4])[0]
+    proto = fr[off + 9]
+    if struct.unpack("!H", fr[off + 6:off + 8])[0] & 0x3FFF or proto not in (6, 17):
+        return True
+    seg = fr[off + ihl:off + total]
+    if len(seg) < total - ihl:
+        return True  # обрезан при захвате
+    if proto == 17 and seg[6:8] == b"\0\0":
+        return True
+    ph = fr[off + 12:off + 20] + struct.pack("!BBH", 0, proto, len(seg))
+    return s16(ph + seg) == 0xFFFF
+
+
+def t_mutate(pcaps):
+    print("== --loop-mutate: новые сессии на каждом круге, суммы пересчитаны, L2 не тронут")
+    p = os.path.join(pcaps, "l2mix.pcap")
+    exp = expected_frames(p)
+    # Один IP-поток: его кадры приходят строго по кругам. Не-IP кадры идут
+    # отдельным потоком и перемежаются с ними, поэтому разбираем их отдельно.
+    rc, out, frames, _ = replay(p, ["--loop", "3", "--pps", "20000", "-t", "1", "--loop-mutate", "ip,port"])
+    got = [f for _, f in frames]
+    check(rc == 0 and len(got) == 3 * len(exp), "3 круга: %d кадров из %d" % (len(got), 3 * len(exp)))
+    is_ip = lambda f: ip_l4_sums_ok(f) is not None or flow_key(f) is not None or \
+        struct.unpack("!H", f[12:14])[0] in (0x86DD, 0x8847, 0x8864, 0x0800) or \
+        (struct.unpack("!H", f[12:14])[0] in (0x8100, 0x88A8) and f[16:18] != b"\x88\xcc")
+    exp_ip = [f for f in exp if is_ip(f)]
+    exp_l2 = [f for f in exp if not is_ip(f)]
+    got_ip = [f for f in got if is_ip(f)]
+    got_l2 = [f for f in got if not is_ip(f)]
+    n = len(exp_ip)
+    check(collections.Counter(got_ip[:n]) == collections.Counter(exp_ip), "круг 0 без изменений")
+    check(collections.Counter(got_l2) == collections.Counter(exp_l2 * 3),
+          "не-IP кадры (ARP, STP, LLDP, ...) на всех кругах без изменений (%d)" % len(got_l2))
+    expset = set(exp_ip)
+    bad = [f for f in got_ip if ip_l4_sums_ok(f) is False]
+    checked = [f for f in got_ip if ip_l4_sums_ok(f) is True]
+    check(not bad and checked, "контрольные суммы IPv4/TCP/UDP верны (%d кадров, ошибок %d)" % (len(checked), len(bad)))
+    changed1 = sum(1 for f in got_ip[n:2 * n] if f not in expset)
+    changed2 = sum(1 for f in got_ip[2 * n:] if f not in expset)
+    check(changed1 == n and changed2 == n, "все IP-кадры кругов 1 и 2 изменены (%d, %d из %d)" % (changed1, changed2, n))
+    check(not (set(got_ip[n:2 * n]) & set(got_ip[2 * n:])), "круги 1 и 2 дают разные кадры")
+    l2_ok = all(a[:12] == b[:12] for a, b in zip(got_ip[n:2 * n], got_ip[:n]))
+    check(l2_ok, "MAC-адреса на изменённых кругах те же")
 
 
 def t_cli(pcaps):
@@ -335,7 +429,7 @@ def main():
     BIN, TX, RX = os.path.abspath(a.bin), a.tx, a.rx
     TOL_P95, TOL_MAX = a.tol_p95_us * 1000, a.tol_max_us * 1000
     tests = {"bytes": lambda: t_bytes(a.pcaps), "timing": lambda: t_timing(a.pcaps, a.spin_us),
-             "cli": lambda: t_cli(a.pcaps)}
+             "mutate": lambda: t_mutate(a.pcaps), "cli": lambda: t_cli(a.pcaps)}
     for name, fn in tests.items():
         if not a.only or name in a.only.split(","):
             fn()
