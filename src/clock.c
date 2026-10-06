@@ -1,5 +1,7 @@
 #include "clock.h"
 
+#include <math.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -67,26 +69,58 @@ const char *afr_clock_init(int mode)
 	else if (mode == CLOCK_MODE_AUTO)
 		want = strcmp(cs, "tsc") != 0 && cpu_has_invariant_tsc();
 	if (want) {
-		uint64_t t1 = 0, t2 = 0;
-		int64_t n1 = 0, n2 = 0;
-		sample(&t1, &n1);
-		struct timespec ts = {0, 200 * 1000 * 1000};
-		nanosleep(&ts, NULL);
-		sample(&t2, &n2);
-		if (t2 > t1 && n2 > n1) {
-			afr_clk_ns_per_tick = (double)(n2 - n1) / (double)(t2 - t1);
+		/* Калибруем на одном ядре: TSC разных ядер могут быть не синхронизированы. */
+		cpu_set_t saved, one;
+		int pinned = sched_getaffinity(0, sizeof(saved), &saved) == 0;
+		if (pinned) {
+			CPU_ZERO(&one);
+			CPU_SET(sched_getcpu(), &one);
+			pinned = sched_setaffinity(0, sizeof(one), &one) == 0;
+		}
+		double k[2] = {0, 0};
+		for (int r = 0; r < 2; r++) {
+			uint64_t t1 = 0, t2 = 0;
+			int64_t n1 = 0, n2 = 0;
+			sample(&t1, &n1);
+			struct timespec ts = {0, 100 * 1000 * 1000};
+			nanosleep(&ts, NULL);
+			sample(&t2, &n2);
+			if (t2 > t1 && n2 > n1)
+				k[r] = (double)(n2 - n1) / (double)(t2 - t1);
+		}
+		if (pinned)
+			sched_setaffinity(0, sizeof(saved), &saved);
+		if (k[0] > 0 && k[1] > 0 && fabs(k[0] - k[1]) / k[0] < 1e-3) {
+			afr_clk_ns_per_tick = (k[0] + k[1]) / 2;
 			afr_clk_use_tsc = 1;
 			snprintf(desc, sizeof(desc), "TSC %.3f ГГц (clocksource ядра: %s)",
 			         1.0 / afr_clk_ns_per_tick, cs);
 			afr_clock_thread_init();
 			return desc;
 		}
+		snprintf(desc, sizeof(desc),
+		         "CLOCK_MONOTONIC (clocksource ядра: %s; калибровка TSC нестабильна)", cs);
+		return desc;
 	}
 #else
 	(void)mode;
 #endif
 	snprintf(desc, sizeof(desc), "CLOCK_MONOTONIC (clocksource ядра: %s)", cs);
 	return desc;
+}
+
+int afr_clock_resync(void)
+{
+#if AFR_HAVE_TSC
+	if (afr_clk_use_tsc) {
+		int64_t d = afr_clock_ns() - afr_now_ns();
+		if (d > AFR_CLOCK_RESYNC_NS || d < -AFR_CLOCK_RESYNC_NS) {
+			afr_clock_thread_init();
+			return 1;
+		}
+	}
+#endif
+	return 0;
 }
 
 void afr_clock_thread_init(void)

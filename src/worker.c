@@ -277,6 +277,11 @@ static int64_t wait_until(int64_t target, int64_t spin_ns)
 	while (now < target) {
 		int64_t d = target - now;
 		if (d > spin_ns) {
+			/* Перед сном сверяем TSC с CLOCK_MONOTONIC (чтение часов здесь ничего не стоит). */
+			if (afr_clock_resync()) {
+				now = afr_clock_ns();
+				continue;
+			}
 			int64_t sl = d - spin_ns;
 			if (sl > 50 * NS_PER_MS)
 				sl = 50 * NS_PER_MS; /* чтобы вовремя заметить остановку */

@@ -32,6 +32,11 @@ const char *afr_clock_init(int mode);
 /* Привязать смещение TSC текущего потока к CLOCK_MONOTONIC. */
 void afr_clock_thread_init(void);
 
+/* Сверить TSC с CLOCK_MONOTONIC и пересинхронизировать при расхождении (вызывать
+ * там, где поток всё равно собирается спать). Возвращает 1, если была пересинхронизация. */
+#define AFR_CLOCK_RESYNC_NS (50 * NS_PER_US)
+int afr_clock_resync(void);
+
 static inline int64_t afr_clock_ns(void)
 {
 #if AFR_HAVE_TSC

@@ -2,6 +2,7 @@
 #include "util.h"
 
 #include <inttypes.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -55,8 +56,23 @@ static int prepare(afr_ctx_t *c)
 	}
 
 	/* Файл. */
-	if (o->preload)
+	if (o->preload) {
+		struct stat st;
+		uint64_t avail = 0;
+		FILE *mi = fopen("/proc/meminfo", "r");
+		if (mi) {
+			char line[256];
+			while (fgets(line, sizeof(line), mi))
+				if (sscanf(line, "MemAvailable: %" SCNu64 " kB", &avail) == 1)
+					break;
+			fclose(mi);
+		}
+		if (stat(o->file, &st) == 0 && avail && (uint64_t)st.st_size > avail * 1024 * 9 / 10)
+			afr_log_warn("--preload: файл %.1f ГБ, а доступно %.1f ГБ памяти — страницы будут "
+			             "вытесняться, и предзагрузка не поможет",
+			             (double)st.st_size / 1e9, (double)avail * 1024 / 1e9);
 		afr_log_info("Загружаю файл в память целиком (--preload)...");
+	}
 	if (pcap_open(&c->pf, o->file, o->preload, err, sizeof(err)) < 0) {
 		afr_log_err("%s", err);
 		return 1;
