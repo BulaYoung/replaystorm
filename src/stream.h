@@ -22,12 +22,16 @@ typedef struct {
 	/* positions are "global": lap * file_size + offset */
 	uint64_t ra_upto;    /* readahead requested up to here */
 	uint64_t drop_upto;  /* dropped from the cache below here */
+	uint64_t pop_upto;   /* pages mapped (MADV_POPULATE_READ) up to here */
+	int populate;        /* 1 while the kernel supports MADV_POPULATE_READ */
 	_Atomic uint64_t ra_bytes, dropped_bytes;
 } streamer_t;
 
 /* Margin kept behind the slowest thread before dropping (covers small reordering). */
 #define STREAM_DROP_MARGIN (256ull << 20)
 #define STREAM_CHUNK (64ull << 20)
+/* How far ahead of the fastest thread pages are pre-mapped into the process. */
+#define STREAM_POPULATE_AHEAD (512ull << 20)
 
 int afr_stream_start(streamer_t *s);
 void afr_stream_stop(streamer_t *s);

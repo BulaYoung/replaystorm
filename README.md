@@ -110,7 +110,10 @@ streamed from disk during replay:
 
 - A background thread (`afr-stream`) wakes every 20 ms and keeps `--readahead` bytes (default
   2 GB) of the file requested with `madvise(MADV_WILLNEED)` ahead of the fastest sender thread,
-  so sender threads do not stall on disk reads inside the hot loop.
+  so sender threads do not stall on disk reads inside the hot loop. The nearest 512 MB are
+  also pre-mapped into the process with `MADV_POPULATE_READ` (Linux 5.14+; older kernels fall
+  back to readahead only), so sender threads take no page faults at all: in a test with the
+  file streamed from disk, major faults per sender thread went from about 200 to 0.
 - Drop-behind (`--drop-behind auto|on|off`, auto = on when the file is larger than 80% of
   available RAM): everything the slowest thread has passed (minus a 256 MB margin) is dropped
   from the page cache (`MADV_DONTNEED` + `POSIX_FADV_DONTNEED`). Without it the page cache would
@@ -165,6 +168,7 @@ took 0.19 s with it versus 1.06 s without it.
 | `--topspeed` | As fast as possible. Threads wait for nothing but free frames in the ring. |
 | `--mbps X` | Total rate of X Mbit/s by L2 frame length (without FCS, preamble and IFG). It is split between threads **in proportion to the byte volume of their shards**, so all threads finish at the same time and the sum equals X. |
 | `--mbps line`, `--mbps N%` | Rate as a share of the link speed **on the wire** (preamble, IFG, FCS and the 60-byte minimum included): `line` = 100%, e.g. `99%`. The link speed comes from ethtool or `--link-speed`. It is converted to an L2 rate with the file's own ratio of L2 bytes to on-the-wire bytes and then paced like `--mbps X`. If an explicit `--mbps X` exceeds the link on the wire, afreplay warns before start. |
+| `--pace-slack T` | For `--mbps`/`--pps`: instead of busy-waiting for every packet, a thread sleeps and sends everything due within the next T at once (default 200 us). The schedule stays absolute, so the average rate is exact; bursts are at most T long per thread. In a 4 Gbit/s test this cut user CPU from 15.3 s to 2.5 s with the same rate. `--spin-us` only applies to timestamp replay. |
 | `--pps X` | The same, but in packets per second; split in proportion to the packet count of the shards. |
 | `--multiplier X` | Replay by timestamps (the default mode, X = 1). 2.0 is twice as fast, 0.5 twice as slow. |
 | `--duration T` | The multiplier is chosen so that the whole file (one lap) plays in T. Suffixes: `ns`, `us`, `ms`, `s`, `m`, `h`. |

@@ -371,6 +371,7 @@ static void run(worker_t *w)
 	const opts_t *o = c->o;
 	const int64_t t0 = atomic_load(&w->sh->t0);
 	const int64_t spin = o->spin_ns;
+	const int64_t pace_slack = o->pace_slack;
 	const int64_t lap_len = c->tsr.lap_len;
 	const uint64_t loops = o->loops;
 	const int mode = o->mode;
@@ -415,7 +416,10 @@ static void run(worker_t *w)
 					}
 				}
 			} else if (mode != MODE_TOPSPEED) {
-				pace(w, t0 + (int64_t)(cum * ns_per_unit), spin);
+				/* Fixed rate needs no microsecond precision: sleep instead of spinning and
+				 * send everything due within the next pace_slack at once. The schedule is
+				 * absolute, so the average rate is unchanged. */
+				pace(w, t0 + (int64_t)(cum * ns_per_unit) - pace_slack, 0);
 				cum += mode == MODE_MBPS ? (double)(OFFLEN_LEN(p->offlen) + l2_extra) : 1.0;
 			}
 			if (AFR_UNLIKELY(emit(w, p, lap) < 0))

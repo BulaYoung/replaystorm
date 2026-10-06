@@ -20,7 +20,8 @@ void afr_usage(FILE *f)
 	    "  --topspeed              as fast as possible\n"
 	    "  --mbps X                fixed total rate, Mbit/s (L2, without FCS)\n"
 	    "  --mbps line | N%        rate as a share of the link speed counted on the wire\n"
-	    "                          (preamble, IFG, FCS included): line = 100%, e.g. 99%\n"
+	    "                          (preamble, IFG, FCS included): line = 100%, e.g. 99%\n"	    "  --pace-slack T          --mbps/--pps: threads sleep and send packets due within T at\n"
+	    "                          once instead of busy-waiting each packet (default 200us)\n"
 	    "  --pps X                 fixed total rate, packets/s\n"
 	    "  --multiplier X          replay by timestamps: 2.0 is twice as fast, 0.5 is twice\n"
 	    "                          as slow, 1.0 is real time\n"
@@ -113,6 +114,7 @@ enum {
 	O_LAG_POLICY,
 	O_LAG_THRESHOLD,
 	O_SPIN_US,
+	O_PACE_SLACK,
 	O_TIMING_RES,
 	O_CLOCK,
 	O_CPUS,
@@ -153,6 +155,7 @@ static const struct option long_opts[] = {
     {"lag-policy", required_argument, NULL, O_LAG_POLICY},
     {"lag-threshold", required_argument, NULL, O_LAG_THRESHOLD},
     {"spin-us", required_argument, NULL, O_SPIN_US},
+    {"pace-slack", required_argument, NULL, O_PACE_SLACK},
     {"timing-res", required_argument, NULL, O_TIMING_RES},
     {"clock", required_argument, NULL, O_CLOCK},
     {"cpus", required_argument, NULL, O_CPUS},
@@ -193,6 +196,7 @@ int afr_parse_args(int argc, char **argv, opts_t *o)
 	o->lag_policy = LAG_CATCHUP;
 	o->lag_threshold = 10 * NS_PER_MS;
 	o->spin_ns = 50 * NS_PER_US;
+	o->pace_slack = 200 * NS_PER_US;
 	o->timing_res = 2 * NS_PER_US;
 	o->batch = 64;
 	o->readahead = 2ull << 30;
@@ -311,6 +315,10 @@ int afr_parse_args(int argc, char **argv, opts_t *o)
 			if (afr_parse_u64(optarg, &u) < 0 || u > 1000000)
 				return bad("--spin-us", optarg);
 			o->spin_ns = (int64_t)u * NS_PER_US;
+			break;
+		case O_PACE_SLACK:
+			if (afr_parse_duration(optarg, &o->pace_slack) < 0)
+				return bad("--pace-slack", optarg);
 			break;
 		case O_TIMING_RES:
 			if (afr_parse_duration(optarg, &o->timing_res) < 0)

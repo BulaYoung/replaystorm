@@ -28,6 +28,7 @@ typedef struct {
 	int lag_policy;
 	int64_t lag_threshold;
 	int64_t spin_ns;
+	int64_t pace_slack;   /* --mbps/--pps: send packets due within this window at once */
 	int64_t timing_res;
 	int clock_mode;       /* CLOCK_MODE_* from clock.h */
 

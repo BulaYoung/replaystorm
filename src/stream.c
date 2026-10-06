@@ -1,5 +1,6 @@
 #include "stream.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -12,6 +13,19 @@ static void do_willneed(streamer_t *s, uint64_t off, uint64_t len)
 {
 	madvise((void *)(s->pf->base + off), len, MADV_WILLNEED);
 	atomic_fetch_add_explicit(&s->ra_bytes, len, RLX);
+}
+
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22 /* Linux 5.14+ */
+#endif
+
+/* Map the pages into our page tables ahead of the senders, so they take no page
+ * faults (and never wait for the disk) in the hot loop. Blocks this thread, not them. */
+static void do_populate(streamer_t *s, uint64_t off, uint64_t len)
+{
+	if (s->populate && madvise((void *)(s->pf->base + off), len, MADV_POPULATE_READ) != 0 &&
+	    (errno == EINVAL || errno == ENOSYS))
+		s->populate = 0; /* old kernel: readahead only */
 }
 
 static void do_drop(streamer_t *s, uint64_t off, uint64_t len)
@@ -68,6 +82,15 @@ static void *stream_main(void *arg)
 				apply(s, from, target, do_willneed);
 				s->ra_upto = target;
 			}
+			/* Pre-map the nearest part of the window. */
+			if (s->populate) {
+				uint64_t ahead = s->window < STREAM_POPULATE_AHEAD ? s->window : STREAM_POPULATE_AHEAD;
+				uint64_t pfrom = s->pop_upto > mn ? s->pop_upto : mn;
+				if (pfrom < mx + ahead) {
+					apply(s, pfrom, mx + ahead, do_populate);
+					s->pop_upto = mx + ahead;
+				}
+			}
 			/* Drop-behind: everything the slowest thread has passed, minus a margin. */
 			if (s->drop_behind && mn > STREAM_DROP_MARGIN) {
 				uint64_t end = mn - STREAM_DROP_MARGIN;
@@ -86,7 +109,8 @@ static void *stream_main(void *arg)
 int afr_stream_start(streamer_t *s)
 {
 	atomic_store(&s->stop, 0);
-	s->ra_upto = s->drop_upto = 0;
+	s->ra_upto = s->drop_upto = s->pop_upto = 0;
+	s->populate = 1;
 	s->running = pthread_create(&s->th, NULL, stream_main, s) == 0;
 	if (s->running)
 		pthread_setname_np(s->th, "afr-stream");
