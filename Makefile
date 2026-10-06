@@ -8,7 +8,7 @@ LDLIBS  += -pthread -lm
 BUILD   := build
 SRCS    := $(filter-out src/main.c,$(wildcard src/*.c))
 OBJS    := $(SRCS:src/%.c=$(BUILD)/%.o)
-TESTSRC := $(wildcard tests/test_*.c)
+TESTSRC := $(wildcard tests/test_*.c tests/ref_*.c)
 
 .PHONY: all clean test unit-test func-test pcaps sanitize
 

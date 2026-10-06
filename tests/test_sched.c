@@ -267,6 +267,8 @@ static void histogram(void)
 	CHECK(afr_lh_quantile(h, 1.0) >= 1000000);
 }
 
+static void parallel_equivalence(void);
+
 void test_sched(void)
 {
 	orders();
@@ -277,4 +279,156 @@ void test_sched(void)
 	radix();
 	rate();
 	histogram();
+	parallel_equivalence();
+}
+
+/* ---------- Parallel implementation vs the original single-threaded one ---------- */
+
+int ref_ts_normalize(int64_t *ts, const uint16_t *shard, size_t n, const ts_cfg_t *cfg,
+                     ts_result_t *res);
+int ref_rate_profile(const int64_t *sched, const uint64_t *offlen, const uint16_t *shard, size_t n,
+                     int monotone, const rate_cfg_t *cfg, rate_result_t *res);
+
+static uint64_t rng_state = 88172645463325252ULL;
+static uint64_t rnd(void)
+{
+	rng_state ^= rng_state << 13;
+	rng_state ^= rng_state >> 7;
+	rng_state ^= rng_state << 17;
+	return rng_state;
+}
+
+/* Timestamps with gaps, backward jumps, outliers and spikes; some packets skipped. */
+static void gen_data(int64_t *ts, uint16_t *sh, uint64_t *ol, size_t n, int pattern)
+{
+	int64_t t = T0;
+	size_t skip_run = 0;
+	for (size_t i = 0; i < n; i++) {
+		/* pattern 3: every other gap is above max-gap, so chunk boundaries hit them */
+		t += (int64_t)(rnd() % (pattern == 3 ? 100000 : 3000));
+		if (rnd() % 5000 == 0)
+			t += (int64_t)(rnd() % (5 * NS_PER_SEC)); /* big pause */
+		int64_t v = t;
+		if (pattern >= 1 && rnd() % 50 == 0)
+			v -= (int64_t)(rnd() % 20000); /* backward in time */
+		if (pattern >= 2) {
+			uint64_t r = rnd() % 20000;
+			if (r == 0)
+				v = 0;
+			else if (r == 1)
+				v = 4000000000LL * NS_PER_SEC; /* far future */
+			else if (r == 2)
+				v = t + 3600 * NS_PER_SEC; /* short clock spike */
+		}
+		if (pattern == 5 && rnd() % 5 == 0)
+			v = (rnd() & 1) ? 0 : 4000000000LL * NS_PER_SEC; /* frequent outliers */
+		ts[i] = v;
+		/* pattern 4: long runs of skipped packets that cover chunk boundaries */
+		if (pattern == 4 && skip_run == 0 && rnd() % 3000 == 0)
+			skip_run = 500 + rnd() % 5000;
+		if (skip_run) {
+			skip_run--;
+			sh[i] = SHARD_SKIP;
+		} else {
+			sh[i] = (rnd() % 37 == 0) ? SHARD_SKIP : (uint16_t)(rnd() % 6);
+		}
+		if (pattern == 4 && rnd() % 40 == 0)
+			ts[i] -= (int64_t)(rnd() % 20000); /* unordered too */
+		ol[i] = OFFLEN_MAKE(i * 100, 40 + rnd() % 1500);
+	}
+}
+
+static int same_res(const ts_result_t *a, const ts_result_t *b)
+{
+	int ok = a->n == b->n && a->first_abs == b->first_abs && a->min_abs == b->min_abs &&
+	         a->max_abs == b->max_abs && a->base_abs == b->base_abs && a->backward == b->backward &&
+	         a->max_backward == b->max_backward && a->max_backward_idx == b->max_backward_idx &&
+	         a->outl_zero == b->outl_zero && a->outl_past == b->outl_past &&
+	         a->outl_future == b->outl_future && a->outl_spike == b->outl_spike &&
+	         a->outliers == b->outliers && a->excluded == b->excluded &&
+	         a->gaps_over == b->gaps_over && a->gap_removed == b->gap_removed &&
+	         a->ntop == b->ntop && a->monotone == b->monotone && a->duration == b->duration &&
+	         a->lap_len == b->lap_len;
+	for (int i = 0; ok && i < a->ntop; i++)
+		ok = a->top[i].at == b->top[i].at && a->top[i].len == b->top[i].len &&
+		     a->top[i].idx == b->top[i].idx && a->top[i].idx_known == b->top[i].idx_known;
+	return ok;
+}
+
+static int same_rate(const rate_result_t *a, const rate_result_t *b)
+{
+	int ok = a->pkts == b->pkts && a->bytes == b->bytes && a->gaps_total == b->gaps_total &&
+	         a->gaps_below_res == b->gaps_below_res && a->wall_duration_s == b->wall_duration_s &&
+	         a->avg_bps == b->avg_bps;
+	for (int q = 0; q < 3; q++)
+		ok = ok && a->gaps_lt[q] == b->gaps_lt[q];
+	for (int w = 0; w < RATE_WINDOWS; w++)
+		ok = ok && a->peak_bps[w] == b->peak_bps[w] && a->peak_l1_bps[w] == b->peak_l1_bps[w];
+	return ok;
+}
+
+static void parallel_equivalence(void)
+{
+	enum { N = 300000 };
+	int64_t *orig = malloc(N * sizeof(int64_t)), *a = malloc(N * sizeof(int64_t)),
+	        *b = malloc(N * sizeof(int64_t));
+	uint16_t *sh = malloc(N * sizeof(uint16_t));
+	uint64_t *ol = malloc(N * sizeof(uint64_t));
+	const unsigned threads[] = {1, 2, 3, 7, 16};
+	int cases = 0, bad = 0;
+	for (int pattern = 0; pattern < 6; pattern++) {
+		gen_data(orig, sh, ol, N, pattern);
+		for (int order = 0; order < 3; order++) {
+			for (int mg = 0; mg < 2; mg++) {
+				for (int ex = 0; ex < 2; ex++) {
+					ts_cfg_t c = {.order = order, .max_gap = mg ? 50000 : 0,
+					              .exclude_outliers = ex, .outlier_jump = 60 * NS_PER_SEC,
+					              .now_ns = 1800000000LL * NS_PER_SEC};
+					ts_result_t rr, rp;
+					memcpy(a, orig, N * sizeof(int64_t));
+					ref_ts_normalize(a, sh, N, &c, &rr);
+					rate_cfg_t rc = {.mult = 3.0, .timing_res = 2000, .nshards = 6};
+					rate_result_t qr, qp;
+					ref_rate_profile(a, ol, sh, N, rr.monotone, &rc, &qr);
+					for (size_t k = 0; k < sizeof(threads) / sizeof(threads[0]); k++) {
+						c.threads = threads[k];
+						rc.threads = threads[k];
+						memcpy(b, orig, N * sizeof(int64_t));
+						afr_ts_normalize(b, sh, N, &c, &rp);
+						afr_rate_profile(b, ol, sh, N, rp.monotone, &rc, &qp);
+						cases++;
+						int ok = memcmp(a, b, N * sizeof(int64_t)) == 0 && same_res(&rr, &rp) &&
+						         same_rate(&qr, &qp);
+						if (!ok) {
+							bad++;
+							fprintf(stderr,
+							        "  parallel mismatch: pattern %d order %d max_gap %d "
+							        "exclude %d threads %u\n",
+							        pattern, order, mg, ex, threads[k]);
+						}
+					}
+				}
+			}
+		}
+	}
+	CHECK(cases == 6 * 3 * 2 * 2 * 5);
+	CHECK_EQ(bad, 0);
+
+	/* Parallel radix sort: same order of equal keys as the sequential one */
+	rec16_t *r1 = malloc(N * sizeof(rec16_t)), *r2 = malloc(N * sizeof(rec16_t)),
+	        *tmp = malloc(N * sizeof(rec16_t));
+	for (size_t i = 0; i < N; i++)
+		r1[i] = (rec16_t){.key = (int64_t)(rnd() % 100000) - 50000, .val = i};
+	memcpy(r2, r1, N * sizeof(rec16_t));
+	afr_radix_sort16(r1, tmp, N);
+	afr_radix_sort16_mt(r2, tmp, N, 7);
+	CHECK(memcmp(r1, r2, N * sizeof(rec16_t)) == 0);
+	free(r1);
+	free(r2);
+	free(tmp);
+	free(orig);
+	free(a);
+	free(b);
+	free(sh);
+	free(ol);
 }

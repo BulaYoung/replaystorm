@@ -17,6 +17,8 @@ typedef struct {
 
 /* Stably sorts a[0..n) by signed key; tmp is a buffer of the same size. */
 void afr_radix_sort16(rec16_t *a, rec16_t *tmp, size_t n);
+/* The same, using up to nt threads (identical result). */
+void afr_radix_sort16_mt(rec16_t *a, rec16_t *tmp, size_t n, unsigned nt);
 
 /* ---------- Timestamp normalization ---------- */
 
@@ -28,6 +30,7 @@ typedef struct {
 	int exclude_outliers; /* exclude outliers from the timeline */
 	int64_t outlier_jump; /* clock jump threshold, ns (0 = do not look for jumps) */
 	int64_t now_ns;       /* current UTC time, ns, for detecting "future" timestamps */
+	unsigned threads;     /* threads for the computation (0/1 = one); result is identical */
 } ts_cfg_t;
 
 #define TS_TOP_GAPS 10
@@ -94,6 +97,7 @@ typedef struct {
 	int64_t timing_res;  /* achievable timing resolution, ns */
 	uint32_t l2_extra;   /* bytes added to each frame (synthetic Ethernet) */
 	unsigned nshards;    /* number of shards (including non-IP) */
+	unsigned threads;     /* threads for the computation (0/1 = one); result is identical */
 } rate_cfg_t;
 
 typedef struct {

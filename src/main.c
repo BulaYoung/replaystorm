@@ -137,6 +137,7 @@ static int prepare(afr_ctx_t *c)
 	    .exclude_outliers = o->exclude_outliers,
 	    .outlier_jump = o->outlier_jump,
 	    .now_ns = afr_realtime_ns(),
+	    .threads = icfg.hash_threads,
 	};
 	if (afr_ts_normalize(c->ix.ts, c->ix.shard, c->ix.n, &tcfg, &c->tsr) < 0) {
 		afr_log_err("out of memory for timestamp normalization");
@@ -189,6 +190,7 @@ static int prepare(afr_ctx_t *c)
 		    .timing_res = o->timing_res,
 		    .l2_extra = c->pf.raw_ip ? 14 : 0,
 		    .nshards = c->ix.nshards,
+		    .threads = icfg.hash_threads,
 		};
 		if (afr_rate_profile(c->ix.ts, c->ix.offlen, c->ix.shard, c->ix.n, c->tsr.monotone, &rcfg,
 		                     &c->rr) == 0)

@@ -134,8 +134,9 @@ Requirements for such a file:
   while the index is built (more with `--ts-order sort` on unordered timestamps). A 500 GB file
   with ~900-byte frames has ~550 million packets: ~9 GB during replay, ~19 GB at peak.
 - **Startup time.** The index pass reads the whole file once (about 2.4 GB/s cold on mendel17:
-  ~3.5 minutes for 500 GB), followed by single-threaded timeline normalization. Use
-  `--index-cache` so that only the first run pays for the scan.
+  ~3.5 minutes for 500 GB). Use `--index-cache` so that only the first run pays for the scan.
+  Timeline normalization, the radix sort and the rate profile run in parallel on the same
+  threads as hashing (see below).
 
 ## Index cache
 
@@ -160,6 +161,30 @@ reading an ~11.5 GB cache.
 
 On the test laptop, a 4.2 GB file (4.7 million packets) produced a 98.5 MB cache, and a start
 took 0.19 s with it versus 1.06 s without it.
+
+## Parallel preparation
+
+Timeline normalization (outliers, clamp, max-gap, mapping), the radix sort used for unordered
+timestamps and the rate profile (peaks, interval statistics) run on as many threads as the index
+hashing. Each phase is split into contiguous chunks; phases that carry state from packet to
+packet (running maximum, accumulated gap excess, last mapped value, last good timestamp) first
+summarize every chunk, then merge the summaries in chunk order, then redo each chunk from the
+exact state the sequential algorithm would have had. The result is bit for bit identical to the
+original single-threaded code, which is kept in `tests/ref_sched.c`; the unit tests compare both
+on 360 combinations of data patterns, `--ts-order`, `--max-gap`, outlier exclusion and thread
+counts (1 to 16). Clock spike detection stays sequential: each decision depends on the previous
+good packet, and it is a single light pass.
+
+On the test laptop, 4.7 million packets, 1 vs 11 threads:
+
+| Phase | 1 thread | 11 threads |
+|---|---|---|
+| normalization, ordered timestamps | 34 ms | 14 ms |
+| rate profile, ordered timestamps | 131 ms | 24 ms |
+| normalization, unordered (sort + max-gap) | 219 ms | 116 ms |
+| rate profile, unordered | 293 ms | 124 ms |
+
+The unordered case is bound by memory bandwidth of the radix sort.
 
 ## Rate modes
 
@@ -482,6 +507,7 @@ src/dissect.[ch]   L2/L3/L4 parsing, symmetric hash
 src/index.[ch]     index: sequential pass + parallel hashing, then resolve to shards
 src/idxcache.[ch]  on-disk index cache
 src/stream.[ch]    readahead and drop-behind for files larger than RAM
+src/par.[ch]       parallel-for over chunks
 src/sched.[ch]     timeline normalization, t_send, rate profile, histogram (pure functions)
 src/clock.[ch]     fast clock (TSC or CLOCK_MONOTONIC)
 src/worker.[ch]    sender thread: TX_RING, hot loop, waiting, batches
