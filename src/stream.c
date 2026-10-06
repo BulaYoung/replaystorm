@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -11,7 +12,13 @@ typedef void (*range_fn)(streamer_t *s, uint64_t off, uint64_t len);
 
 static void do_willneed(streamer_t *s, uint64_t off, uint64_t len)
 {
-	madvise((void *)(s->pf->base + off), len, MADV_WILLNEED);
+	/* The kernel caps one WILLNEED request at the device readahead size (128 KB by
+	 * default), so a large range has to be requested piece by piece. Each piece only
+	 * queues I/O and returns. */
+	for (uint64_t o = 0; o < len; o += STREAM_RA_PIECE) {
+		uint64_t l = len - o < STREAM_RA_PIECE ? len - o : STREAM_RA_PIECE;
+		madvise((void *)(s->pf->base + off + o), l, MADV_WILLNEED);
+	}
 	atomic_fetch_add_explicit(&s->ra_bytes, len, RLX);
 }
 
@@ -23,9 +30,21 @@ static void do_willneed(streamer_t *s, uint64_t off, uint64_t len)
  * faults (and never wait for the disk) in the hot loop. Blocks this thread, not them. */
 static void do_populate(streamer_t *s, uint64_t off, uint64_t len)
 {
-	if (s->populate && madvise((void *)(s->pf->base + off), len, MADV_POPULATE_READ) != 0 &&
-	    (errno == EINVAL || errno == ENOSYS))
-		s->populate = 0; /* old kernel: readahead only */
+	if (s->populate == STREAM_POP_MADVISE) {
+		if (madvise((void *)(s->pf->base + off), len, MADV_POPULATE_READ) == 0)
+			return;
+		if (errno != EINVAL && errno != ENOSYS)
+			return;
+		s->populate = STREAM_POP_TOUCH; /* kernel older than 5.14 */
+	}
+	/* Fallback: read one byte per page. The faults (and any disk wait) happen in this
+	 * thread; the kernel's fault-around maps neighbouring pages as well. */
+	const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+	const volatile uint8_t *p = s->pf->base + off;
+	uint8_t sink = 0;
+	for (uint64_t o = 0; o < len && !atomic_load_explicit(&s->stop, RLX); o += page)
+		sink ^= p[o];
+	(void)sink;
 }
 
 static void do_drop(streamer_t *s, uint64_t off, uint64_t len)
@@ -110,7 +129,7 @@ int afr_stream_start(streamer_t *s)
 {
 	atomic_store(&s->stop, 0);
 	s->ra_upto = s->drop_upto = s->pop_upto = 0;
-	s->populate = 1;
+	s->populate = getenv("AFR_NO_POPULATE_MADVISE") ? STREAM_POP_TOUCH : STREAM_POP_MADVISE;
 	s->running = pthread_create(&s->th, NULL, stream_main, s) == 0;
 	if (s->running)
 		pthread_setname_np(s->th, "afr-stream");

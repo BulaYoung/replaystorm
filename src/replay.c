@@ -504,9 +504,12 @@ int afr_replay_run(afr_ctx_t *c)
 	print_summary(c, &cur, &start, (double)(t_end - t0) / 1e9, ws, nw, json, stopped,
 	              atomic_load(&sh->shift));
 	if (!c->pf.preloaded)
-		printf("File streaming: requested ahead %.1f GB, dropped from page cache %.1f GB\n",
+		printf("File streaming: requested ahead %.1f GB, dropped from page cache %.1f GB, pages "
+		       "pre-mapped by %s\n",
 		       (double)atomic_load(&stream.ra_bytes) / 1e9,
-		       (double)atomic_load(&stream.dropped_bytes) / 1e9);
+		       (double)atomic_load(&stream.dropped_bytes) / 1e9,
+		       stream.populate == STREAM_POP_MADVISE ? "MADV_POPULATE_READ"
+		                                             : "touching (kernel without MADV_POPULATE_READ)");
 	for (unsigned i = 0; i < nw; i++) {
 		if (ws[i]->err[0]) {
 			afr_log_err("%s", ws[i]->err);

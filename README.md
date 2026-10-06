@@ -111,9 +111,15 @@ streamed from disk during replay:
 - A background thread (`afr-stream`) wakes every 20 ms and keeps `--readahead` bytes (default
   2 GB) of the file requested with `madvise(MADV_WILLNEED)` ahead of the fastest sender thread,
   so sender threads do not stall on disk reads inside the hot loop. The nearest 512 MB are
-  also pre-mapped into the process with `MADV_POPULATE_READ` (Linux 5.14+; older kernels fall
-  back to readahead only), so sender threads take no page faults at all: in a test with the
-  file streamed from disk, major faults per sender thread went from about 200 to 0.
+  also pre-mapped into the process with `MADV_POPULATE_READ` (Linux 5.14+); on older kernels
+  (RHEL 8: 4.18) the background thread touches one byte per page instead, with the same
+  effect: page faults and disk waits happen in that thread, not in the sender threads.
+- The kernel caps one `MADV_WILLNEED` request at the device readahead size (`read_ahead_kb`,
+  128 KB by default on many systems), so readahead is requested in 1 MB pieces. In a test at
+  top speed with the file streamed from disk, this cut disk waits in sender threads from about
+  1500 to about 150 and raised the rate from 14.4 to 19.4 Gbit/s (the disk was the limit).
+- A larger device readahead also helps the kernel's own readahead:
+  `blockdev --setra 16384 /dev/nvme0n1` (8 MB, value in 512-byte sectors).
 - Drop-behind (`--drop-behind auto|on|off`, auto = on when the file is larger than 80% of
   available RAM): everything the slowest thread has passed (minus a 256 MB margin) is dropped
   from the page cache (`MADV_DONTNEED` + `POSIX_FADV_DONTNEED`). Without it the page cache would

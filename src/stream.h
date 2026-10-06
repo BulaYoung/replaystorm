@@ -23,13 +23,17 @@ typedef struct {
 	uint64_t ra_upto;    /* readahead requested up to here */
 	uint64_t drop_upto;  /* dropped from the cache below here */
 	uint64_t pop_upto;   /* pages mapped (MADV_POPULATE_READ) up to here */
-	int populate;        /* 1 while the kernel supports MADV_POPULATE_READ */
+	int populate;        /* STREAM_POP_*: how pages are pre-mapped */
 	_Atomic uint64_t ra_bytes, dropped_bytes;
 } streamer_t;
 
 /* Margin kept behind the slowest thread before dropping (covers small reordering). */
 #define STREAM_DROP_MARGIN (256ull << 20)
 #define STREAM_CHUNK (64ull << 20)
+/* One readahead request (the kernel caps each at the device readahead size anyway). */
+#define STREAM_RA_PIECE (1ull << 20)
+
+enum { STREAM_POP_OFF = 0, STREAM_POP_MADVISE, STREAM_POP_TOUCH };
 /* How far ahead of the fastest thread pages are pre-mapped into the process. */
 #define STREAM_POPULATE_AHEAD (512ull << 20)
 
