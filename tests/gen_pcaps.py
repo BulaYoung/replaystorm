@@ -242,14 +242,16 @@ def main():
                linktype=101)
 
     def flow_frames(n, seed):
+        """UDP в обе стороны, 8 потоков; первые 4 байта нагрузки — номер пакета."""
         r = random.Random(seed)
         fr = []
         for i in range(n):
             s = i % 8
+            pl = struct.pack("!I", i) + bytes(r.randrange(10, 400))
             if r.random() < 0.5:
-                fr.append(eth(B, A, 0x0800, ipv4_udp("10.8.0.%d" % s, "10.8.1.1", 2000 + s, 9000, bytes(r.randrange(10, 400)))))
+                fr.append(eth(B, A, 0x0800, ipv4_udp("10.8.0.%d" % s, "10.8.1.1", 2000 + s, 9000, pl)))
             else:
-                fr.append(eth(A, B, 0x0800, ipv4_udp("10.8.1.1", "10.8.0.%d" % s, 9000, 2000 + s, bytes(r.randrange(10, 400)))))
+                fr.append(eth(A, B, 0x0800, ipv4_udp("10.8.1.1", "10.8.0.%d" % s, 9000, 2000 + s, pl)))
         return fr
 
     # Скачки назад: каждый 10-й пакет на 3 мс раньше

@@ -28,6 +28,7 @@ typedef struct {
 	int64_t lag_threshold;
 	int64_t spin_ns;
 	int64_t timing_res;
+	int clock_mode;       /* CLOCK_MODE_* из clock.h */
 
 	unsigned batch;
 	unsigned ring_frames;

@@ -73,7 +73,10 @@ void afr_report_analysis(const afr_ctx_t *c)
 		for (int w = 0; w < RATE_WINDOWS; w++) {
 			afr_fmt_bps(b1, sizeof(b1), r->peak_bps[w]);
 			afr_fmt_bps(b2, sizeof(b2), r->peak_l1_bps[w]);
-			printf("  окно %s: %s / %s\n", afr_rate_window_names[w], b1, b2);
+			printf("  окно %s: %s / %s%s\n", afr_rate_window_names[w], b1, b2,
+			       r->wall_duration_s * 1e9 < (double)afr_rate_windows_ns[w]
+			           ? " (файл короче окна: весь объём, делённый на окно)"
+			           : "");
 		}
 		if (r->gaps_total) {
 			afr_fmt_ns(b1, sizeof(b1), (double)c->o->timing_res);

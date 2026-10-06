@@ -1,5 +1,6 @@
 #include "cli.h"
 
+#include "clock.h"
 #include "sched.h"
 #include "util.h"
 
@@ -39,6 +40,8 @@ void afr_usage(FILE *f)
 	    "  --lag-threshold T       отставание, после которого срабатывает rebase (10ms)\n"
 	    "  --spin-us N             последние N мкс ожидания — busy-spin (50)\n"
 	    "  --timing-res T          достижимая точность тайминга для оценки пачек (2us)\n"
+	    "  --clock C               auto | tsc | monotonic: часы горячего цикла. auto берёт TSC,\n"
+	    "                          если clocksource ядра не tsc (тогда clock_gettime медленный)\n"
 	    "\n"
 	    "Отправка:\n"
 	    "  -i, --interface IF      интерфейс\n"
@@ -99,6 +102,7 @@ enum {
 	O_LAG_THRESHOLD,
 	O_SPIN_US,
 	O_TIMING_RES,
+	O_CLOCK,
 	O_CPUS,
 	O_BATCH,
 	O_RING,
@@ -135,6 +139,7 @@ static const struct option long_opts[] = {
     {"lag-threshold", required_argument, NULL, O_LAG_THRESHOLD},
     {"spin-us", required_argument, NULL, O_SPIN_US},
     {"timing-res", required_argument, NULL, O_TIMING_RES},
+    {"clock", required_argument, NULL, O_CLOCK},
     {"cpus", required_argument, NULL, O_CPUS},
     {"batch", required_argument, NULL, O_BATCH},
     {"ring-frames", required_argument, NULL, O_RING},
@@ -275,6 +280,16 @@ int afr_parse_args(int argc, char **argv, opts_t *o)
 		case O_TIMING_RES:
 			if (afr_parse_duration(optarg, &o->timing_res) < 0)
 				return bad("--timing-res", optarg);
+			break;
+		case O_CLOCK:
+			if (!strcmp(optarg, "auto"))
+				o->clock_mode = CLOCK_MODE_AUTO;
+			else if (!strcmp(optarg, "tsc"))
+				o->clock_mode = CLOCK_MODE_TSC;
+			else if (!strcmp(optarg, "monotonic"))
+				o->clock_mode = CLOCK_MODE_MONO;
+			else
+				return bad("--clock", optarg);
 			break;
 		case O_CPUS: o->cpus = optarg; break;
 		case O_BATCH:
