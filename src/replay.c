@@ -23,7 +23,7 @@ static void on_signal(int sig)
 	atomic_store(&g_stop, 1);
 }
 
-/* Снимок счётчиков всех потоков. */
+/* Snapshot of all threads' counters. */
 typedef struct {
 	uint64_t pkts, bytes, sends, enobufs, eagain, asis_back, rebases;
 	int64_t late_max;
@@ -96,7 +96,7 @@ static FILE *json_open(const afr_ctx_t *c, unsigned nw)
 	const opts_t *o = c->o;
 	FILE *f = fopen(o->stats_json, "w");
 	if (!f) {
-		afr_log_err("не удалось открыть %s: %s", o->stats_json, strerror(errno));
+		afr_log_err("failed to open %s: %s", o->stats_json, strerror(errno));
 		return NULL;
 	}
 	fprintf(f, "{\n  \"file\": \"");
@@ -146,19 +146,19 @@ static void json_row(FILE *f, int first, const row_t *r)
 	fflush(f);
 }
 
-/* ---------- Вывод ---------- */
+/* ---------- Output ---------- */
 
 static void print_row(const row_t *r, const afr_ctx_t *c)
 {
 	char g[48], m[48], b[64];
 	snprintf(g, sizeof(g), "%.3f", (double)r->bytes * 8 / r->dt / 1e9);
 	snprintf(m, sizeof(m), "%.3f", (double)r->pkts / r->dt / 1e6);
-	printf("[%7.1f с] %8s Гбит/с %8s Mpps", r->t, g, m);
+	printf("[%7.1f s] %8s Gbit/s %8s Mpps", r->t, g, m);
 	if (r->sys_ok)
-		printf(" | ушло (sysfs) %.3f Mpps, tx_dropped +%" PRIu64, (double)r->sys_tx / r->dt / 1e6,
+		printf(" | sent (sysfs) %.3f Mpps, tx_dropped +%" PRIu64, (double)r->sys_tx / r->dt / 1e6,
 		       r->sys_drop);
 	else
-		printf(" | sysfs недоступен");
+		printf(" | sysfs unavailable");
 	printf(" | ENOBUFS +%" PRIu64 " EAGAIN +%" PRIu64, r->enobufs, r->eagain);
 	if (r->timed) {
 		if (r->late_n) {
@@ -166,12 +166,12 @@ static void print_row(const row_t *r, const afr_ctx_t *c)
 			afr_fmt_ns(a, sizeof(a), (double)r->p50);
 			afr_fmt_ns(p, sizeof(p), (double)r->p99);
 			afr_fmt_ns(x, sizeof(x), (double)r->pmax);
-			printf(" | опоздание p50 %s p99 %s max %s", a, p, x);
+			printf(" | lateness p50 %s p99 %s max %s", a, p, x);
 		}
 		afr_fmt_ns(b, sizeof(b), (double)c->tsr.duration);
-		printf(" | pcap +%.3f с из %s", r->pos_s, b);
+		printf(" | pcap +%.3f s of %s", r->pos_s, b);
 		if (c->o->loops != 1)
-			printf(", круг %" PRIu64, r->lap + 1);
+			printf(", lap %" PRIu64, r->lap + 1);
 	}
 	printf("\n");
 }
@@ -208,7 +208,7 @@ static void make_row(row_t *r, const snap_t *cur, const snap_t *prev, double t, 
 			r->pos_s = (double)in_lap / 1e9;
 			r->lap = lap;
 		} else if (cur->pos_last != INT64_MIN) {
-			/* Все потоки закончили или остановлены: последняя позиция. */
+			/* All threads finished or stopped: final position. */
 			r->lap = cur->lap_last;
 			r->pos_s = (double)(cur->pos_last - (int64_t)r->lap * c->tsr.lap_len) / 1e9;
 		}
@@ -223,27 +223,27 @@ static void print_summary(const afr_ctx_t *c, const snap_t *end, const snap_t *s
 	uint64_t pkts = end->pkts, bytes = end->bytes;
 	double gbps = elapsed > 0 ? (double)bytes * 8 / elapsed / 1e9 : 0;
 	double mpps = elapsed > 0 ? (double)pkts / elapsed / 1e6 : 0;
-	printf("\n=== Итог%s ===\n", stopped ? " (остановлено по сигналу)" : "");
+	printf("\n=== Summary%s ===\n", stopped ? " (stopped by signal)" : "");
 	afr_fmt_count(b1, sizeof(b1), (double)pkts);
-	printf("Отправлено в ядро: %" PRIu64 " пакетов (%s), %" PRIu64 " байт за %.3f с: %.3f Гбит/с, "
+	printf("Sent to kernel: %" PRIu64 " packets (%s), %" PRIu64 " bytes in %.3f s: %.3f Gbit/s, "
 	       "%.3f Mpps\n",
 	       pkts, b1, bytes, elapsed, gbps, mpps);
 	if (end->sys_ok && start->sys_ok) {
 		uint64_t d = end->sys_tx - start->sys_tx;
-		printf("Ушло по sysfs tx_packets: %" PRIu64 " (%+.0f к отправленным; другой трафик "
-		       "интерфейса тоже учитывается), tx_dropped: +%" PRIu64 "\n",
+		printf("Sent per sysfs tx_packets: %" PRIu64 " (%+.0f vs sent; other traffic on the "
+		       "interface is counted too), tx_dropped: +%" PRIu64 "\n",
 		       d, (double)d - (double)pkts, end->sys_drop - start->sys_drop);
 	} else {
-		printf("Статистика интерфейса в sysfs недоступна\n");
+		printf("Interface statistics unavailable in sysfs\n");
 	}
-	printf("send(): %" PRIu64 " вызовов (%.1f кадров на вызов), ENOBUFS: %" PRIu64
+	printf("send(): %" PRIu64 " calls (%.1f frames per call), ENOBUFS: %" PRIu64
 	       ", EAGAIN: %" PRIu64 "\n",
 	       end->sends, end->sends ? (double)pkts / (double)end->sends : 0.0, end->enobufs,
 	       end->eagain);
 	uint64_t skipped = 0;
 	for (int k = 0; k < SKIP_REASONS; k++)
 		skipped += c->ix.st.skipped[k];
-	printf("Пропущено кадров (на каждом круге): %" PRIu64 ", обрезанных при захвате: %" PRIu64
+	printf("Skipped frames (per lap): %" PRIu64 ", truncated at capture: %" PRIu64
 	       "\n",
 	       skipped, c->ix.st.truncated_caplen);
 	uint64_t late_n = 0;
@@ -254,21 +254,21 @@ static void print_summary(const afr_ctx_t *c, const snap_t *end, const snap_t *s
 		afr_fmt_ns(b2, sizeof(b2), (double)afr_lh_quantile(end->hist, 0.99));
 		afr_fmt_ns(b3, sizeof(b3), (double)afr_lh_quantile(end->hist, 0.999));
 		afr_fmt_ns(b4, sizeof(b4), (double)end->late_max);
-		printf("Опоздание относительно расписания: p50 %s, p99 %s, p99.9 %s, max %s\n", b1, b2,
+		printf("Lateness vs schedule: p50 %s, p99 %s, p99.9 %s, max %s\n", b1, b2,
 		       b3, b4);
 		if (end->rebases)
-			printf("Сдвигов T0 (rebase): %" PRIu64 ", итоговый сдвиг %.3f мс\n", end->rebases,
+			printf("T0 shifts (rebase): %" PRIu64 ", total shift %.3f ms\n", end->rebases,
 			       (double)shift / 1e6);
 		if (end->asis_back)
-			printf("Отправлено без ожидания (назад во времени, asis): %" PRIu64 "\n",
+			printf("Sent without waiting (backward in time, asis): %" PRIu64 "\n",
 			       end->asis_back);
 	}
-	printf("По потокам:\n");
+	printf("Per thread:\n");
 	for (unsigned i = 0; i < nw; i++) {
 		worker_t *w = ws[i];
-		printf("  %s %2u (CPU %3d): %12" PRIu64 " пакетов, %14" PRIu64 " байт, ENOBUFS %" PRIu64
+		printf("  %s %2u (CPU %3d): %12" PRIu64 " packets, %14" PRIu64 " bytes, ENOBUFS %" PRIu64
 		       "\n",
-		       w->is_l2 ? "не-IP" : "поток", w->id, w->cpu, LD(w->st.pkts), LD(w->st.bytes),
+		       w->is_l2 ? "non-IP" : "thread", w->id, w->cpu, LD(w->st.pkts), LD(w->st.bytes),
 		       LD(w->st.enobufs));
 	}
 	if (json) {
@@ -303,21 +303,21 @@ static void print_plan(const afr_ctx_t *c, worker_t **ws, unsigned nw)
 	const opts_t *o = c->o;
 	char b1[64], b2[64];
 	afr_fmt_ns(b1, sizeof(b1), (double)c->index_ns);
-	afr_log_info("Файл %s: %" PRIu64 " пакетов к отправке, индекс за %s", o->file, c->tsr.n, b1);
+	afr_log_info("File %s: %" PRIu64 " packets to send, index built in %s", o->file, c->tsr.n, b1);
 	switch (o->mode) {
-	case MODE_TOPSPEED: afr_log_info("Режим: максимальная скорость"); break;
+	case MODE_TOPSPEED: afr_log_info("Mode: top speed"); break;
 	case MODE_MBPS:
 		afr_fmt_bps(b1, sizeof(b1), o->mbps * 1e6);
-		afr_log_info("Режим: фиксированная скорость %s (делится пропорционально объёму шардов)", b1);
+		afr_log_info("Mode: fixed rate %s (split proportionally to shard volume)", b1);
 		break;
 	case MODE_PPS:
 		afr_fmt_count(b1, sizeof(b1), o->pps);
-		afr_log_info("Режим: фиксированная скорость %spps", b1);
+		afr_log_info("Mode: fixed rate %spps", b1);
 		break;
 	default:
 		afr_fmt_ns(b1, sizeof(b1), (double)c->tsr.duration);
 		afr_fmt_ns(b2, sizeof(b2), (double)c->tsr.duration / c->mult);
-		afr_log_info("Режим: по тайм-стампам x%g, шкала %s -> %s на круг, lag-policy=%s", c->mult,
+		afr_log_info("Mode: timestamps x%g, timeline %s -> %s per lap, lag-policy=%s", c->mult,
 		             b1, b2, o->lag_policy == LAG_REBASE ? "rebase" : "catchup");
 	}
 	char cpus[256] = "";
@@ -325,15 +325,15 @@ static void print_plan(const afr_ctx_t *c, worker_t **ws, unsigned nw)
 	for (unsigned i = 0; i < nw && len < sizeof(cpus) - 8; i++)
 		len += (size_t)snprintf(cpus + len, sizeof(cpus) - len, "%s%d", i ? "," : "", ws[i]->cpu);
 	afr_fmt_bps(b1, sizeof(b1), c->link_bps);
-	afr_log_info("Интерфейс %s, MTU %u, линк %s (%s); потоков %u (CPU %s%s), qdisc-bypass %s, "
-	             "packet-loss %s, пачка %u, кольцо %u кадров",
+	afr_log_info("Interface %s, MTU %u, link %s (%s); %u threads (CPU %s%s), qdisc-bypass %s, "
+	             "packet-loss %s, batch %u, ring %u frames",
 	             o->iface, c->mtu, c->link_bps > 0 ? b1 : "?", c->link_src, nw, cpus,
-	             c->cpus_from_numa ? ", NUMA-узел карты" : "", o->qdisc_bypass ? "вкл" : "выкл",
-	             o->packet_loss ? "вкл" : "выкл", o->batch, o->ring_frames);
+	             c->cpus_from_numa ? ", NIC NUMA node" : "", o->qdisc_bypass ? "on" : "off",
+	             o->packet_loss ? "on" : "off", o->batch, o->ring_frames);
 	if (o->loops == 0)
-		afr_log_info("Повторов: бесконечно (до SIGINT/SIGTERM)");
+		afr_log_info("Loops: infinite (until SIGINT/SIGTERM)");
 	else if (o->loops > 1)
-		afr_log_info("Повторов: %" PRIu64, o->loops);
+		afr_log_info("Loops: %" PRIu64, o->loops);
 }
 
 int afr_replay_run(afr_ctx_t *c)
@@ -343,13 +343,13 @@ int afr_replay_run(afr_ctx_t *c)
 
 	afr_report_warnings(c);
 
-	/* Потоки: по одному на непустой IP-шард и отдельный — для не-IP. */
+	/* Threads: one per non-empty IP shard plus a separate one for non-IP. */
 	unsigned nw = 0;
 	worker_t **ws = calloc(c->ix.nshards, sizeof(*ws));
 	shared_t *sh = aligned_alloc(AFR_CACHELINE, (sizeof(shared_t) + AFR_CACHELINE - 1) /
 	                                                AFR_CACHELINE * AFR_CACHELINE);
 	if (!ws || !sh) {
-		afr_log_err("нет памяти");
+		afr_log_err("out of memory");
 		return 1;
 	}
 	memset(sh, 0, sizeof(*sh));
@@ -359,7 +359,7 @@ int afr_replay_run(afr_ctx_t *c)
 		tot_pkts += c->ix.shard_pkts[s];
 	}
 	if (c->ip_threads > (unsigned)c->ncpus)
-		afr_log_warn("потоков (%u) больше, чем CPU (%d): несколько потоков на одном ядре",
+		afr_log_warn("more threads (%u) than CPUs (%d): several threads share a core",
 		             c->ip_threads, c->ncpus);
 	for (unsigned s = 0; s < c->ix.nshards; s++) {
 		if (c->ix.shard_pkts[s] == 0)
@@ -367,7 +367,7 @@ int afr_replay_run(afr_ctx_t *c)
 		worker_t *w = aligned_alloc(AFR_CACHELINE, (sizeof(worker_t) + AFR_CACHELINE - 1) /
 		                                               AFR_CACHELINE * AFR_CACHELINE);
 		if (!w) {
-			afr_log_err("нет памяти");
+			afr_log_err("out of memory");
 			return 1;
 		}
 		memset(w, 0, sizeof(*w));
@@ -390,7 +390,7 @@ int afr_replay_run(afr_ctx_t *c)
 		ws[nw++] = w;
 	}
 	print_plan(c, ws, nw);
-	afr_log_info("Часы: %s", afr_clock_init(o->clock_mode));
+	afr_log_info("Clock: %s", afr_clock_init(o->clock_mode));
 
 	struct sigaction sa = {.sa_handler = on_signal};
 	sigemptyset(&sa.sa_mask);
@@ -401,19 +401,19 @@ int afr_replay_run(afr_ctx_t *c)
 	unsigned started = 0;
 	for (; started < nw; started++) {
 		if (pthread_create(&ws[started]->th, NULL, afr_worker_main, ws[started]) != 0) {
-			afr_log_err("не удалось создать поток %u", started);
+			afr_log_err("failed to create thread %u", started);
 			atomic_store(&sh->failed, 1);
 			break;
 		}
 	}
 	if (started < nw) {
-		/* Созданные потоки уже ждут на барьере, рассчитанном на всех: корректно
-		 * их не дождаться, поэтому аварийный выход. */
+		/* Already created threads are waiting on a barrier sized for all of them:
+		 * they cannot be joined cleanly, so exit abruptly. */
 		_exit(1);
 	}
 
 	pthread_barrier_wait(&sh->bar); /* 1 */
-	/* Потоки скопировали свои шарды — глобальный индекс больше не нужен. */
+	/* Threads have copied their shards; the global index is no longer needed. */
 	afr_index_free_arrays(&c->ix);
 	snap_t start, prev, cur;
 	take_snap(ws, nw, o->iface, &start);
@@ -440,7 +440,7 @@ int afr_replay_run(afr_ctx_t *c)
 	int first_row = 1;
 	for (;;) {
 		tick += NS_PER_SEC;
-		/* Спим до следующей секунды, но выходим раньше, если все потоки закончили. */
+		/* Sleep until the next second, but wake earlier if all threads have finished. */
 		for (;;) {
 			int64_t now = afr_now_ns();
 			if (now >= tick)
@@ -471,7 +471,7 @@ int afr_replay_run(afr_ctx_t *c)
 			prev = cur;
 			last = now;
 		}
-		/* Опережающее чтение файла, если он не загружен целиком. */
+		/* Read ahead in the file if it is not fully preloaded. */
 		if (!c->pf.preloaded && cur.off_min != UINT64_MAX) {
 			uint64_t a = cur.off_min & ~(uint64_t)(sysconf(_SC_PAGESIZE) - 1);
 			if (a < c->pf.size) {
@@ -488,7 +488,7 @@ int afr_replay_run(afr_ctx_t *c)
 		if (LD(ws[i]->st.t_end) > t_end)
 			t_end = LD(ws[i]->st.t_end);
 	}
-	/* Ждём, пока счётчики интерфейса догонят (кадры могли ещё быть в очереди). */
+	/* Wait for interface counters to catch up (frames may still be queued). */
 	usleep(100000);
 	take_snap(ws, nw, o->iface, &cur);
 	int stopped = atomic_load(&g_stop) && !atomic_load(&sh->failed);

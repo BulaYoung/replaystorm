@@ -77,7 +77,7 @@ static void parse_ipv6(const uint8_t *p, uint32_t len, uint32_t off, dis_t *d)
 			uint8_t next = p[cur];
 			cur += ((uint32_t)p[cur + 1] + 2) * 4;
 			nh = next;
-		} else if (nh == 44) { /* фрагмент */
+		} else if (nh == 44) { /* fragment */
 			if (cur + 8 > len) {
 				d->proto = nh;
 				d->frag = 1;
@@ -144,7 +144,7 @@ static void parse_ethertype(const uint8_t *p, uint32_t len, uint32_t off, uint16
 		case 4: parse_ipv4(p, len, off, d); return;
 		case 6: parse_ipv6(p, len, off, d); return;
 		case 0:
-			/* Псевдопровод с control word: внутри Ethernet-кадр. */
+			/* Pseudowire with control word: an Ethernet frame inside. */
 			if (depth == 0)
 				parse_eth(p, len, off + 4, d, depth + 1);
 			return;
@@ -218,7 +218,7 @@ uint64_t afr_flow_hash(const dis_t *d)
 		uint32_t a, b;
 		memcpy(&a, d->src, 4);
 		memcpy(&b, d->dst, 4);
-		/* Упорядочиваем концы соединения, чтобы хеш был симметричным. */
+		/* Order the connection endpoints so the hash is symmetric. */
 		if (a > b || (a == b && pa > pb)) {
 			uint32_t t = a;
 			a = b;

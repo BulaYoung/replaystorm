@@ -10,80 +10,83 @@
 void afr_usage(FILE *f)
 {
 	fputs(
-	    "afreplay — многопоточный реплеер pcap через AF_PACKET с сохранением L2\n"
+	    "afreplay - multithreaded pcap replayer over AF_PACKET preserving L2\n"
 	    "\n"
-	    "Использование:\n"
-	    "  afreplay -i ИНТЕРФЕЙС [опции] ФАЙЛ.pcap\n"
-	    "  afreplay --analyze [опции] ФАЙЛ.pcap\n"
+	    "Usage:\n"
+	    "  afreplay -i INTERFACE [options] FILE.pcap\n"
+	    "  afreplay --analyze [options] FILE.pcap\n"
 	    "\n"
-	    "Режимы скорости (взаимоисключающие, по умолчанию --multiplier 1):\n"
-	    "  --topspeed              максимально быстро\n"
-	    "  --mbps X                фиксированная общая скорость, Мбит/с (L2, без FCS)\n"
-	    "  --pps X                 фиксированная общая скорость, пакетов/с\n"
-	    "  --multiplier X          реплей по тайм-стампам: 2.0 — вдвое быстрее, 0.5 — вдвое\n"
-	    "                          медленнее, 1.0 — реальное время\n"
-	    "  --duration T            подобрать множитель, чтобы файл проигрался за T\n"
-	    "  --loop N                проиграть N раз (0 — бесконечно), по умолчанию 1\n"
+	    "Rate modes (mutually exclusive, default --multiplier 1):\n"
+	    "  --topspeed              as fast as possible\n"
+	    "  --mbps X                fixed total rate, Mbit/s (L2, without FCS)\n"
+	    "  --mbps line | N%        rate as a share of the link speed counted on the wire\n"
+	    "                          (preamble, IFG, FCS included): line = 100%, e.g. 99%\n"
+	    "  --pps X                 fixed total rate, packets/s\n"
+	    "  --multiplier X          replay by timestamps: 2.0 is twice as fast, 0.5 is twice\n"
+	    "                          as slow, 1.0 is real time\n"
+	    "  --duration T            pick the multiplier so the file plays in T\n"
+	    "  --loop N                play N times (0 means infinite), default 1\n"
 	    "\n"
-	    "Тайм-стампы:\n"
-	    "  --ts-order MODE         asis | clamp | sort (по умолчанию clamp)\n"
-	    "                            asis  — как есть, «назад во времени» шлётся без ожидания\n"
-	    "                            clamp — «назад во времени» заменяется предыдущей меткой\n"
-	    "                            sort  — стабильная сортировка индекса по меткам\n"
-	    "  --max-gap T             сжимать паузы длиннее T до T\n"
-	    "  --ts-outliers MODE      report | exclude: выбросы (ts=0, до 1990, будущее,\n"
-	    "                          кратковременный скачок часов) только сообщать или\n"
-	    "                          исключить из расчёта шкалы (по умолчанию report)\n"
-	    "  --outlier-jump T        порог скачка часов для поиска выбросов (по умолчанию 60s,\n"
-	    "                          0 — не искать)\n"
-	    "  --lag-policy P          catchup | rebase: при отставании догонять или сдвигать T0\n"
-	    "  --lag-threshold T       отставание, после которого срабатывает rebase (10ms)\n"
-	    "  --spin-us N             последние N мкс ожидания — busy-spin (50)\n"
-	    "  --timing-res T          достижимая точность тайминга для оценки пачек (2us)\n"
-	    "  --clock C               auto | tsc | monotonic: часы горячего цикла. auto берёт TSC,\n"
-	    "                          если clocksource ядра не tsc (тогда clock_gettime медленный)\n"
+	    "Timestamps:\n"
+	    "  --ts-order MODE         asis | clamp | sort (default clamp)\n"
+	    "                            asis  - as is, \"backward in time\" is sent without waiting\n"
+	    "                            clamp - \"backward in time\" is replaced by the previous stamp\n"
+	    "                            sort  - stable sort of the index by timestamp\n"
+	    "  --max-gap T             compress pauses longer than T down to T\n"
+	    "  --ts-outliers MODE      report | exclude: outliers (ts=0, before 1990, future,\n"
+	    "                          short clock jump) are only reported or excluded\n"
+	    "                          from the timeline computation (default report)\n"
+	    "  --outlier-jump T        clock jump threshold for outlier detection (default 60s,\n"
+	    "                          0 disables detection)\n"
+	    "  --lag-policy P          catchup | rebase: when lagging, catch up or shift T0\n"
+	    "  --lag-threshold T       lag after which rebase kicks in (10ms)\n"
+	    "  --spin-us N             busy-spin for the last N us of each wait (50)\n"
+	    "  --timing-res T          achievable timing precision for burst estimation (2us)\n"
+	    "  --clock C               auto | tsc | monotonic: hot-loop clock. auto picks TSC\n"
+	    "                          if the kernel clocksource is not tsc (clock_gettime is slow then)\n"
 	    "\n"
-	    "Отправка:\n"
-	    "  -i, --interface IF      интерфейс\n"
-	    "  -t, --threads N         потоков для IP-трафика (по умолчанию: CPU узла NUMA - 1);\n"
-	    "                          не-IP кадры всегда идут отдельным потоком\n"
-	    "  --cpus LIST             ядра для потоков, например 2-9,12 (по умолчанию —\n"
+	    "Sending:\n"
+	    "  -i, --interface IF      interface\n"
+	    "  -t, --threads N         threads for IP traffic (default: CPUs of the NUMA node - 1);\n"
+	    "                          non-IP frames always go through a separate thread\n"
+	    "  --cpus LIST             CPUs for threads, e.g. 2-9,12 (default:\n"
 	    "                          /sys/class/net/IF/device/local_cpulist)\n"
-	    "  --batch N               кадров на один send() (64)\n"
-	    "  --ring-frames N         кадров в TX_RING каждого потока (4096)\n"
-	    "  --qdisc-bypass          PACKET_QDISC_BYPASS: мимо qdisc прямо в драйвер\n"
-	    "  --packet-loss           PACKET_LOSS: ядро молча пропускает битые кадры\n"
-	    "  --link-speed X          скорость линка (25G, 10000M); по умолчанию из ethtool\n"
-	    "  --mtu N                 MTU (по умолчанию с интерфейса, для --analyze 1500)\n"
+	    "  --batch N               frames per send() call (64)\n"
+	    "  --ring-frames N         frames in each thread's TX_RING (4096)\n"
+	    "  --qdisc-bypass          PACKET_QDISC_BYPASS: bypass qdisc, straight to the driver\n"
+	    "  --packet-loss           PACKET_LOSS: kernel silently skips malformed frames\n"
+	    "  --link-speed X          link speed (25G, 10000M); default from ethtool\n"
+	    "  --mtu N                 MTU (default from the interface, 1500 for --analyze)\n"
 	    "\n"
-	    "Вход:\n"
-	    "  --preload               загрузить файл в память целиком до старта\n"
-	    "  --smac MAC, --dmac MAC  MAC-адреса синтетического Ethernet для RAW IP\n"
+	    "Input:\n"
+	    "  --preload               load the whole file into memory before start\n"
+	    "  --smac MAC, --dmac MAC  MAC addresses of the synthetic Ethernet header for RAW IP\n"
 	    "\n"
-	    "Зацикливание с модификацией:\n"
-	    "  --loop-mutate WHAT      ip | port | ip,port — на круге k>0 сдвигать адреса/порты,\n"
-	    "                          чтобы сенсор видел новые сессии (L2 не трогается)\n"
-	    "  --mutate-ip-offset A    сдвиг IPv4 на круг, как адрес (по умолчанию 0.1.0.0)\n"
-	    "  --mutate-port-step N    сдвиг портов >= 1024 на круг (по умолчанию 1)\n"
+	    "Looping with mutation:\n"
+	    "  --loop-mutate WHAT      ip | port | ip,port - on lap k>0 shift addresses/ports\n"
+	    "                          so the sensor sees new sessions (L2 is untouched)\n"
+	    "  --mutate-ip-offset A    IPv4 shift per lap, as an address (default 0.1.0.0)\n"
+	    "  --mutate-port-step N    shift of ports >= 1024 per lap (default 1)\n"
 	    "\n"
-	    "Вывод:\n"
-	    "  --analyze               только анализ файла, без отправки\n"
-	    "  --stats-json FILE       писать статистику в JSON\n"
-	    "  -q, --quiet             не печатать ежесекундную статистику\n"
-	    "  -h, --help              эта справка\n"
+	    "Output:\n"
+	    "  --analyze               analyze the file only, do not send\n"
+	    "  --stats-json FILE       write statistics as JSON\n"
+	    "  -q, --quiet             do not print per-second statistics\n"
+	    "  -h, --help              this help\n"
 	    "\n"
-	    "Примеры:\n"
+	    "Examples:\n"
 	    "  afreplay --analyze big.pcap\n"
 	    "  afreplay --analyze --multiplier 10 --link-speed 25G big.pcap\n"
 	    "  afreplay -i ens1f0 --topspeed --qdisc-bypass -t 12 big.pcap\n"
 	    "  afreplay -i ens1f0 --mbps 20000 --loop 0 big.pcap\n"
+	    "  afreplay -i ens1f0 --mbps 99% --loop 0 --loop-mutate ip,port big.pcap\n"
 	    "  afreplay -i ens1f0 --multiplier 2 --max-gap 1s --ts-order sort big.pcap\n"
 	    "  afreplay -i ens1f0 --duration 10m --stats-json run.json big.pcap\n"
 	    "  afreplay -i ens1f0 --loop 5 --loop-mutate ip,port big.pcap\n"
 	    "  afreplay -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap\n"
 	    "\n"
-	    "Код выхода: 0 — успех (в т.ч. остановка по SIGINT/SIGTERM), 1 — ошибка выполнения,\n"
-	    "2 — ошибка в аргументах.\n",
+	    "Exit code: 0 - success (including stop by SIGINT/SIGTERM), 1 - runtime error,\n"
+	    "2 - invalid arguments.\n",
 	    f);
 }
 
@@ -160,7 +163,7 @@ static const struct option long_opts[] = {
 
 static int bad(const char *opt, const char *val)
 {
-	afr_log_err("неверное значение %s: '%s' (см. --help)", opt, val);
+	afr_log_err("invalid value for %s: '%s' (see --help)", opt, val);
 	return -1;
 }
 
@@ -203,13 +206,28 @@ int afr_parse_args(int argc, char **argv, opts_t *o)
 			o->mode = MODE_TOPSPEED;
 			nmodes++;
 			break;
-		case O_MBPS:
-			if (afr_parse_double(optarg, &d) < 0 || d <= 0)
+		case O_MBPS: {
+			size_t len = strlen(optarg);
+			if (!strcmp(optarg, "line")) {
+				o->line_frac = 1.0;
+			} else if (len > 1 && optarg[len - 1] == '%') {
+				char buf[32];
+				if (len >= sizeof(buf))
+					return bad("--mbps", optarg);
+				memcpy(buf, optarg, len - 1);
+				buf[len - 1] = 0;
+				if (afr_parse_double(buf, &d) < 0 || d <= 0 || d > 100)
+					return bad("--mbps", optarg);
+				o->line_frac = d / 100.0;
+			} else if (afr_parse_double(optarg, &d) < 0 || d <= 0) {
 				return bad("--mbps", optarg);
+			} else {
+				o->mbps = d;
+			}
 			o->mode = MODE_MBPS;
-			o->mbps = d;
 			nmodes++;
 			break;
+		}
 		case O_PPS:
 			if (afr_parse_double(optarg, &d) < 0 || d <= 0)
 				return bad("--pps", optarg);
@@ -350,25 +368,25 @@ int afr_parse_args(int argc, char **argv, opts_t *o)
 			o->mutate_port_step = (uint32_t)u;
 			break;
 		case ':':
-			afr_log_err("опции %s нужен аргумент", argv[optind - 1]);
+			afr_log_err("option %s requires an argument", argv[optind - 1]);
 			return -1;
 		default:
-			afr_log_err("неизвестная опция %s (см. --help)", argv[optind - 1]);
+			afr_log_err("unknown option %s (see --help)", argv[optind - 1]);
 			return -1;
 		}
 	}
 	if (nmodes > 1) {
-		afr_log_err("--topspeed, --mbps, --pps, --multiplier и --duration взаимоисключающие");
+		afr_log_err("--topspeed, --mbps, --pps, --multiplier and --duration are mutually exclusive");
 		return -1;
 	}
 	if (optind != argc - 1) {
-		afr_log_err(optind >= argc ? "не указан pcap-файл (см. --help)"
-		                           : "ожидается ровно один pcap-файл");
+		afr_log_err(optind >= argc ? "no pcap file given (see --help)"
+		                           : "exactly one pcap file expected");
 		return -1;
 	}
 	o->file = argv[optind];
 	if (!o->analyze && !o->iface) {
-		afr_log_err("не указан интерфейс (-i), или используйте --analyze");
+		afr_log_err("no interface given (-i), or use --analyze");
 		return -1;
 	}
 	afr_quiet = o->quiet;

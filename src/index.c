@@ -1,5 +1,7 @@
 #include "index.h"
 
+#include "sched.h"
+
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -27,14 +29,14 @@ unsigned afr_classify(const uint8_t *p, uint32_t caplen, int raw_ip, const idx_c
 		*reason = SKIP_BAD_RAW;
 		return SHARD_SKIP;
 	}
-	/* Так же проверяет ядро: сверх MTU+14 допускается только тег 802.1Q. */
+	/* Same check as the kernel: beyond MTU+14 only an 802.1Q tag is allowed. */
 	uint32_t limit = cfg->max_frame + (!raw_ip && d->outer_ethertype == ETHT_VLAN ? 4 : 0);
 	if (flen > limit || flen > 0xFFFF) {
 		*reason = SKIP_TOO_BIG;
 		return SHARD_SKIP;
 	}
 	if (!d->l3)
-		return cfg->ip_shards; /* отдельный шард для не-IP */
+		return cfg->ip_shards; /* separate shard for non-IP */
 	uint64_t h = afr_flow_hash(d);
 	return (unsigned)(((unsigned __int128)h * cfg->ip_shards) >> 64);
 }
@@ -75,6 +77,9 @@ static void hash_range(hasher_t *h, size_t a, size_t b)
 		} else {
 			h->shard_pkts[sh]++;
 			h->shard_bytes[sh] += flen;
+			h->st.l1_bytes += afr_l1_bytes(flen);
+			if (flen > h->st.max_frame)
+				h->st.max_frame = flen;
 		}
 		ix->shard[i] = (uint16_t)sh;
 		h->st.l2kind[d.l2kind]++;
@@ -139,7 +144,7 @@ static int alloc_arrays(pkt_index_t *ix, size_t cap)
 		return 0;
 	}
 	afr_index_free_arrays(ix);
-	/* Запасной вариант: растущие массивы, хеширование после прохода. */
+	/* Fallback: growing arrays, hashing after the pass. */
 	ix->mmapped = 0;
 	ix->cap = 1u << 20;
 	ix->offlen = malloc(ix->cap * sizeof(uint64_t));
@@ -174,10 +179,10 @@ int afr_index_build(const pcap_file_t *pf, const idx_cfg_t *cfg, pkt_index_t *ix
 	ix->nshards = cfg->ip_shards + 1;
 	ix->shard_pkts = calloc(ix->nshards, sizeof(uint64_t));
 	ix->shard_bytes = calloc(ix->nshards, sizeof(uint64_t));
-	/* Верхняя оценка числа записей: каждая занимает не меньше 16 байт. */
+	/* Upper bound on the record count: each takes at least 16 bytes. */
 	if (!ix->shard_pkts || !ix->shard_bytes ||
 	    alloc_arrays(ix, (pf->size - PCAP_FILE_HDR_LEN) / PCAP_REC_HDR_LEN + 1) < 0) {
-		snprintf(err, errlen, "нет памяти под индекс пакетов");
+		snprintf(err, errlen, "out of memory for the packet index");
 		afr_index_free(ix);
 		return -1;
 	}
@@ -186,7 +191,7 @@ int afr_index_build(const pcap_file_t *pf, const idx_cfg_t *cfg, pkt_index_t *ix
 	unsigned nh = cfg->hash_threads ? cfg->hash_threads : 1;
 	hasher_t *hs = calloc(nh, sizeof(*hs));
 	if (!hs) {
-		snprintf(err, errlen, "нет памяти");
+		snprintf(err, errlen, "out of memory");
 		afr_index_free(ix);
 		return -1;
 	}
@@ -202,7 +207,7 @@ int afr_index_build(const pcap_file_t *pf, const idx_cfg_t *cfg, pkt_index_t *ix
 				break;
 	}
 
-	/* Последовательный проход: цепочку записей pcap иначе не пройти. */
+	/* Sequential pass: the pcap record chain cannot be walked any other way. */
 	uint64_t off = PCAP_FILE_HDR_LEN;
 	pcap_rec_t r;
 	size_t n = 0;
@@ -215,7 +220,7 @@ int afr_index_build(const pcap_file_t *pf, const idx_cfg_t *cfg, pkt_index_t *ix
 				break;
 			}
 		}
-		/* Кадр длиннее 64 КБ всё равно будет пропущен как слишком большой. */
+		/* A frame longer than 64 KB will be skipped as oversized anyway. */
 		uint32_t len = r.caplen > 0xFFFF ? 0xFFFF : r.caplen;
 		ix->offlen[n] = OFFLEN_MAKE(r.data_off, len);
 		ix->ts[n] = r.ts_ns;
@@ -239,7 +244,7 @@ int afr_index_build(const pcap_file_t *pf, const idx_cfg_t *cfg, pkt_index_t *ix
 				break;
 	}
 	if (started == 0 && !oom) {
-		/* Потоки не создались — хешируем сами. */
+		/* Threads failed to start; hash in this thread. */
 		atomic_store(&ctx.next_chunk, 0);
 		hasher_main(&hs[0]);
 	}
@@ -250,6 +255,9 @@ int afr_index_build(const pcap_file_t *pf, const idx_cfg_t *cfg, pkt_index_t *ix
 		idx_stats_t *s = &hs[i].st;
 		ix->st.bytes += s->bytes;
 		ix->st.skipped_bytes += s->skipped_bytes;
+		ix->st.l1_bytes += s->l1_bytes;
+		if (s->max_frame > ix->st.max_frame)
+			ix->st.max_frame = s->max_frame;
 		for (int k = 0; k < SKIP_REASONS; k++)
 			ix->st.skipped[k] += s->skipped[k];
 		for (int k = 0; k < L2K_COUNT; k++)
@@ -274,7 +282,7 @@ int afr_index_build(const pcap_file_t *pf, const idx_cfg_t *cfg, pkt_index_t *ix
 	free(hs);
 	ix->st.pkts = n;
 	if (oom) {
-		snprintf(err, errlen, "нет памяти под индекс (%zu пакетов)", n);
+		snprintf(err, errlen, "out of memory for the index (%zu packets)", n);
 		afr_index_free(ix);
 		return -1;
 	}

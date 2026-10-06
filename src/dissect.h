@@ -1,5 +1,5 @@
 /*
- * Разбор кадра: L2 (VLAN/QinQ/MPLS/PPPoE) -> L3 -> L4 и симметричный хеш потока.
+ * Frame dissection: L2 (VLAN/QinQ/MPLS/PPPoE) -> L3 -> L4, plus a symmetric flow hash.
  */
 #ifndef AFR_DISSECT_H
 #define AFR_DISSECT_H
@@ -19,39 +19,39 @@
 #define ETHT_PPPOE_S 0x8864
 #define ETHT_LLDP 0x88cc
 
-/* Вид не-IP кадра (для статистики). */
+/* Kind of non-IP frame (for statistics). */
 enum {
 	L2K_IP = 0,
 	L2K_ARP,
-	L2K_LLC,  /* 802.3 + LLC: STP, CDP и т.п. */
+	L2K_LLC,  /* 802.3 + LLC: STP, CDP, etc. */
 	L2K_LLDP,
 	L2K_OTHER,
 	L2K_COUNT
 };
 
 typedef struct {
-	uint8_t l3;          /* 0 — не IP, 4 или 6 */
-	uint8_t proto;       /* L4-протокол (после заголовков расширения IPv6) */
-	uint8_t frag;        /* 1 — фрагмент (любой) */
-	uint8_t frag_first;  /* 1 — первый фрагмент (offset == 0) или не фрагмент */
-	uint8_t vlan_depth;  /* число VLAN-тегов */
-	uint8_t mpls;        /* 1 — был стек MPLS */
+	uint8_t l3;          /* 0 = not IP, 4 or 6 */
+	uint8_t proto;       /* L4 protocol (after IPv6 extension headers) */
+	uint8_t frag;        /* 1 = fragment (any) */
+	uint8_t frag_first;  /* 1 = first fragment (offset == 0) or not a fragment */
+	uint8_t vlan_depth;  /* number of VLAN tags */
+	uint8_t mpls;        /* 1 = MPLS stack present */
 	uint8_t pppoe;
 	uint8_t l2kind;
-	uint16_t outer_ethertype; /* ethertype сразу после MAC-адресов */
-	uint16_t l3_off;     /* смещение L3 в кадре */
-	uint16_t l4_off;     /* смещение L4, 0 если нет */
-	uint16_t sport, dport; /* в порядке хоста; 0 если нет портов */
-	const uint8_t *src, *dst; /* адреса L3 (4 или 16 байт) */
+	uint16_t outer_ethertype; /* ethertype right after the MAC addresses */
+	uint16_t l3_off;     /* L3 offset in the frame */
+	uint16_t l4_off;     /* L4 offset, 0 if none */
+	uint16_t sport, dport; /* host byte order; 0 if no ports */
+	const uint8_t *src, *dst; /* L3 addresses (4 or 16 bytes) */
 } dis_t;
 
 /*
- * Разобрать кадр. raw_ip: 0 — кадр начинается с Ethernet, 4/6 — с IP указанной
- * версии, 1 — с IP, версия из первого полубайта.
+ * Dissect a frame. raw_ip: 0 = frame starts with Ethernet, 4/6 = with IP of the given
+ * version, 1 = with IP, version taken from the first nibble.
  */
 void afr_dissect(const uint8_t *p, uint32_t len, int raw_ip, dis_t *d);
 
-/* Симметричный хеш потока: A->B и B->A дают одно значение. Только для d->l3 != 0. */
+/* Symmetric flow hash: A->B and B->A yield the same value. Only for d->l3 != 0. */
 uint64_t afr_flow_hash(const dis_t *d);
 
 #endif

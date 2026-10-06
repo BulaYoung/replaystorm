@@ -28,23 +28,23 @@ const char *pcap_linktype_name(uint32_t lt)
 	case LINKTYPE_RAW_OLD: return "RAW IP";
 	case LINKTYPE_IPV4: return "RAW IPv4";
 	case LINKTYPE_IPV6: return "RAW IPv6";
-	default: return "неизвестный";
+	default: return "unknown";
 	}
 }
 
 int pcap_parse_header(pcap_file_t *pf, char *err, size_t errlen)
 {
 	if (pf->size < 4) {
-		set_err(err, errlen, "файл слишком короткий для pcap (%zu байт)", pf->size);
+		set_err(err, errlen, "file too short for pcap (%zu bytes)", pf->size);
 		return -1;
 	}
 	uint32_t magic;
 	memcpy(&magic, pf->base, 4);
 	if (magic == MAGIC_PCAPNG) {
 		set_err(err, errlen,
-		        "это pcapng, а поддерживается только классический pcap. "
-		        "Сконвертируйте файл: editcap -F pcap вход.pcapng выход.pcap "
-		        "(для наносекундных меток: editcap -F nsecpcap ...)");
+		        "this is pcapng, only classic pcap is supported. "
+		        "Convert it: editcap -F pcap in.pcapng out.pcap "
+		        "(for nanosecond timestamps: editcap -F nsecpcap ...)");
 		return -1;
 	}
 	if (magic == MAGIC_US || magic == MAGIC_NS) {
@@ -53,16 +53,16 @@ int pcap_parse_header(pcap_file_t *pf, char *err, size_t errlen)
 		pf->swapped = 1;
 		magic = __builtin_bswap32(magic);
 	} else {
-		set_err(err, errlen, "неизвестная сигнатура файла 0x%08x: это не pcap", magic);
+		set_err(err, errlen, "unknown file magic 0x%08x: not a pcap", magic);
 		return -1;
 	}
 	pf->nsec = (magic == MAGIC_NS);
 	if (pf->size < PCAP_FILE_HDR_LEN) {
-		set_err(err, errlen, "файл обрезан: нет полного заголовка pcap");
+		set_err(err, errlen, "file truncated: incomplete pcap header");
 		return -1;
 	}
 	pf->snaplen = pcap_u32(pf, pf->base + 16);
-	/* Старшие биты поля linktype могут содержать длину FCS. */
+	/* The upper bits of the linktype field may carry the FCS length. */
 	pf->linktype = pcap_u32(pf, pf->base + 20) & 0x0FFFFFFFu;
 	switch (pf->linktype) {
 	case LINKTYPE_ETHERNET: pf->raw_ip = 0; break;
@@ -72,7 +72,7 @@ int pcap_parse_header(pcap_file_t *pf, char *err, size_t errlen)
 	case LINKTYPE_IPV6: pf->raw_ip = 6; break;
 	default:
 		set_err(err, errlen,
-		        "linktype %u не поддерживается (нужен Ethernet=1 или RAW IP=101/228/229)",
+		        "linktype %u is not supported (need Ethernet=1 or RAW IP=101/228/229)",
 		        pf->linktype);
 		return -1;
 	}
@@ -84,18 +84,18 @@ int pcap_open(pcap_file_t *pf, const char *path, int preload, char *err, size_t 
 	memset(pf, 0, sizeof(*pf));
 	pf->fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (pf->fd < 0) {
-		set_err(err, errlen, "не удалось открыть %s: %s", path, strerror(errno));
+		set_err(err, errlen, "cannot open %s: %s", path, strerror(errno));
 		return -1;
 	}
 	struct stat st;
 	if (fstat(pf->fd, &st) < 0 || !S_ISREG(st.st_mode)) {
-		set_err(err, errlen, "%s: не обычный файл", path);
+		set_err(err, errlen, "%s: not a regular file", path);
 		close(pf->fd);
 		return -1;
 	}
 	pf->size = (size_t)st.st_size;
 	if (pf->size == 0) {
-		set_err(err, errlen, "%s: пустой файл", path);
+		set_err(err, errlen, "%s: empty file", path);
 		close(pf->fd);
 		return -1;
 	}
@@ -108,7 +108,7 @@ int pcap_open(pcap_file_t *pf, const char *path, int preload, char *err, size_t 
 	}
 	pf->base = p;
 	pf->preloaded = preload;
-	/* Индексация читает файл последовательно. */
+	/* Indexing reads the file sequentially. */
 	madvise(p, pf->size, preload ? MADV_WILLNEED : MADV_SEQUENTIAL);
 	if (pcap_parse_header(pf, err, errlen) < 0) {
 		pcap_close(pf);

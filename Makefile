@@ -1,7 +1,7 @@
-# afreplay — многопоточный реплеер pcap через AF_PACKET
+# afreplay — multithreaded pcap replayer over AF_PACKET
 CC      ?= cc
 CFLAGS  ?= -O2 -g
-# Обязательные флаги отдельно, чтобы make CFLAGS=... их не терял
+# Mandatory flags kept separate so that make CFLAGS=... does not drop them
 XCFLAGS := -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -pthread -MMD -MP
 LDLIBS  += -pthread -lm
 
@@ -44,8 +44,8 @@ test: unit-test func-test
 clean:
 	rm -rf build build-san afreplay
 
-# Проверочная сборка: UBSan в режиме trap (без рантайм-библиотеки) и FORTIFY.
-# Если установлен libasan, можно добавить SAN=-fsanitize=address.
+# Checking build: UBSan in trap mode (no runtime library) and FORTIFY.
+# If libasan is installed, SAN=-fsanitize=address can be added.
 SAN ?=
 sanitize:
 	$(MAKE) BUILD=build-san CFLAGS="-O1 -g -fsanitize=undefined -fsanitize-trap=all \

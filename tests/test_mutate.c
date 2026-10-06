@@ -4,7 +4,7 @@
 
 #include <string.h>
 
-/* Полный пересчёт контрольной суммы для проверки инкрементального. */
+/* Full checksum recomputation to verify the incremental one. */
 static uint32_t sum16(const uint8_t *p, size_t n, uint32_t s)
 {
 	for (size_t i = 0; i + 1 < n; i += 2)
@@ -24,7 +24,7 @@ static uint16_t fold(uint32_t s)
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
 static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 
-/* Проверить, что IP- и L4-суммы кадра корректны (как при полном пересчёте). */
+/* Check that the frame's IP and L4 checksums are correct (as with full recomputation). */
 static int sums_ok(const uint8_t *f, uint32_t len)
 {
 	dis_t d;
@@ -48,7 +48,7 @@ static int sums_ok(const uint8_t *f, uint32_t len)
 	return fold(sum16(f + d.l4_off, seglen, ps)) == 0;
 }
 
-/* Заполнить корректные суммы. */
+/* Fill in correct checksums. */
 static void fill_sums(uint8_t *f, uint32_t len)
 {
 	dis_t d;
@@ -152,32 +152,32 @@ static void v4_cases(void)
 			uint32_t len = build_v4(f, vlan, proto, 0x0a000001, 0xc0a80105, 51000, 443, 0);
 			memcpy(orig, f, len);
 			CHECK(sums_ok(f, len));
-			CHECK_EQ(afr_mutate(f, len, 0, &cfg), 0); /* круг 0 не меняется */
+			CHECK_EQ(afr_mutate(f, len, 0, &cfg), 0); /* lap 0 is unchanged */
 			CHECK(memcmp(f, orig, len) == 0);
 			CHECK_EQ(afr_mutate(f, len, 3, &cfg), 1);
 			CHECK(sums_ok(f, len));
 			uint32_t l2 = vlan ? 18 : 14;
-			CHECK(memcmp(f, orig, l2) == 0); /* L2 не тронут */
+			CHECK(memcmp(f, orig, l2) == 0); /* L2 untouched */
 			const uint8_t *ip = f + l2;
 			CHECK_EQ(ip[13], 0x03); /* 10.0.0.1 + 3*0.1.0.0 = 10.3.0.1 */
 			CHECK_EQ(ip[17], 0xab); /* 192.168.1.5 -> 192.171.1.5 */
 			CHECK_EQ(rd16(ip + 20), 51003);
-			CHECK_EQ(rd16(ip + 22), 443); /* порт < 1024 не меняется */
+			CHECK_EQ(rd16(ip + 22), 443); /* port < 1024 is unchanged */
 		}
 	}
-	/* UDP без контрольной суммы: остаётся без неё */
+	/* UDP without checksum: stays without one */
 	uint8_t f[256];
 	uint32_t len = build_v4(f, 0, 17, 1, 2, 2000, 3000, 0);
 	wr16(f + 14 + 20 + 6, 0);
 	afr_mutate(f, len, 1, &cfg);
 	CHECK_EQ(rd16(f + 14 + 20 + 6), 0);
 	CHECK(sums_ok(f, len));
-	/* Перенос через 65535 у порта и через 255 у октета */
+	/* Wraparound past 65535 for the port and past 255 for the octet */
 	len = build_v4(f, 0, 6, 0x0affffff, 0x0b000000, 65535, 65000, 0);
 	afr_mutate(f, len, 1, &cfg);
 	CHECK(sums_ok(f, len));
 	CHECK_EQ(rd16(f + 34), 1024);
-	/* Симметрия: прямой и обратный пакет после сдвига по-прежнему зеркальны */
+	/* Symmetry: forward and reverse packets are still mirrored after the shift */
 	uint8_t a[256], b[256];
 	uint32_t la = build_v4(a, 0, 6, 0x0a000001, 0x0a000002, 40000, 50000, 0);
 	uint32_t lb = build_v4(b, 0, 6, 0x0a000002, 0x0a000001, 50000, 40000, 0);
@@ -195,15 +195,15 @@ static void fragments(void)
 {
 	mutate_cfg_t cfg = {.ip = 1, .port = 1, .ip_offset = 0x00010000u, .port_step = 1};
 	uint8_t f[256];
-	/* Первый фрагмент: L4-сумма покрывает всю датаграмму, сдвигаем только адреса
-	 * (порты у фрагментов не трогаем, иначе разойдутся с остальными фрагментами). */
+	/* First fragment: the L4 checksum covers the whole datagram, shift only the addresses
+	 * (fragment ports are left alone, otherwise they would diverge from the other fragments). */
 	uint32_t len = build_v4(f, 0, 17, 0x0a000001, 0x0a000002, 5000, 6000, 0x2000);
 	uint16_t c0 = rd16(f + 34 + 6);
 	afr_mutate(f, len, 2, &cfg);
 	CHECK_EQ(rd16(f + 34), 5000);
 	CHECK(rd16(f + 34 + 6) != c0);
 	CHECK_EQ(fold(sum16(f + 14, 20, 0)), 0);
-	/* Не первый фрагмент: L4 нет, меняются только адреса и сумма IP */
+	/* Non-first fragment: no L4, only the addresses and the IP checksum change */
 	len = build_v4(f, 0, 17, 0x0a000001, 0x0a000002, 0x1111, 0x2222, 100);
 	uint8_t before[256];
 	memcpy(before, f, len);
@@ -224,7 +224,7 @@ static void v6_cases(void)
 		CHECK_EQ(afr_mutate(f, len, 4, &cfg), 1);
 		CHECK(sums_ok(f, len));
 		CHECK(memcmp(f, orig, 14) == 0);
-		CHECK(memcmp(f + 14 + 8, orig + 14 + 8, 8) == 0); /* префикс /64 не меняется */
+		CHECK(memcmp(f + 14 + 8, orig + 14 + 8, 8) == 0); /* /64 prefix is unchanged */
 		CHECK(memcmp(f + 14 + 16, orig + 14 + 16, 8) != 0);
 		CHECK_EQ(rd16(f + 54), 50000 + 28);
 	}
@@ -238,9 +238,9 @@ static void only_ports(void)
 	memcpy(orig, f, len);
 	afr_mutate(f, len, 1, &cfg);
 	CHECK(sums_ok(f, len));
-	CHECK(memcmp(f + 18, orig + 18, 20) == 0); /* IP-заголовок не изменился */
+	CHECK(memcmp(f + 18, orig + 18, 20) == 0); /* IP header unchanged */
 	CHECK_EQ(rd16(f + 38), 2100);
-	/* не-IP кадр не трогается */
+	/* non-IP frame is left untouched */
 	uint8_t arp[60] = {0};
 	arp[12] = 0x08;
 	arp[13] = 0x06;
@@ -249,7 +249,7 @@ static void only_ports(void)
 
 static void rfc1624(void)
 {
-	/* Пример из RFC 1624, раздел 4: HC=0xDD2F, m=0x5555 -> m'=0x3285, HC'=0x0000 */
+	/* Example from RFC 1624, section 4: HC=0xDD2F, m=0x5555 -> m'=0x3285, HC'=0x0000 */
 	CHECK_EQ(afr_csum_update16(0xDD2F, 0x5555, 0x3285), 0x0000);
 }
 

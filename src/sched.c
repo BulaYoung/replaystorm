@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ---------- Поразрядная сортировка ---------- */
+/* ---------- Radix sort ---------- */
 
 void afr_radix_sort16(rec16_t *a, rec16_t *tmp, size_t n)
 {
@@ -21,7 +21,7 @@ void afr_radix_sort16(rec16_t *a, rec16_t *tmp, size_t n)
 	}
 	rec16_t *src = a, *dst = tmp;
 	for (int d = 0; d < 8; d++) {
-		/* Все ключи с одинаковой цифрой — проход не нужен. */
+		/* All keys share the same digit; this pass is not needed. */
 		uint64_t k0 = (uint64_t)src[0].key ^ SIGN;
 		if (cnt[d][(k0 >> (d * 8)) & 0xFF] == n)
 			continue;
@@ -43,7 +43,7 @@ void afr_radix_sort16(rec16_t *a, rec16_t *tmp, size_t n)
 		memcpy(a, src, n * sizeof(*a));
 }
 
-/* ---------- Нормализация ---------- */
+/* ---------- Normalization ---------- */
 
 #define IS_SKIP(i) (shard && shard[i] == SHARD_SKIP)
 #define BIT_GET(bm, i) ((bm)[(i) >> 3] & (1u << ((i) & 7)))
@@ -68,7 +68,7 @@ static int64_t abs64(int64_t v)
 	return v < 0 ? -v : v;
 }
 
-/* Поиск выбросов. Возвращает битовую карту (или NULL, если выбросов нет / нет памяти). */
+/* Outlier detection. Returns a bitmap (or NULL if there are no outliers / out of memory). */
 static uint8_t *find_outliers(const int64_t *ts, const uint16_t *shard, size_t n,
                               const ts_cfg_t *cfg, ts_result_t *res, int *oom)
 {
@@ -104,7 +104,7 @@ static uint8_t *find_outliers(const int64_t *ts, const uint16_t *shard, size_t n
 			if (IS_SKIP(i) || (bm && BIT_GET(bm, i)))
 				continue;
 			if (prev != SIZE_MAX && abs64(ts[i] - ts[prev]) > cfg->outlier_jump) {
-				/* Скачок. Если через несколько пакетов время вернулось — это выброс. */
+				/* A jump. If time comes back within a few packets, these are outliers. */
 				size_t j = i + 1;
 				int seen = 0, back = 0;
 				for (; j < n && seen < TS_SPIKE_LOOKAHEAD; j++) {
@@ -138,10 +138,10 @@ static uint8_t *find_outliers(const int64_t *ts, const uint16_t *shard, size_t n
 	return bm;
 }
 
-/* Список сжимаемых пауз: E(x) = суммарно вырезанное время до момента x. */
+/* List of compressed gaps: E(x) = total time cut out before point x. */
 typedef struct {
-	int64_t *b;   /* верхняя граница паузы */
-	int64_t *cum; /* накопленное вырезанное время */
+	int64_t *b;   /* upper bound of the gap */
+	int64_t *cum; /* cumulative time cut out */
 	size_t n, cap;
 } gap_list_t;
 
@@ -167,7 +167,7 @@ static int gap_list_push(gap_list_t *g, int64_t b, int64_t cum)
 
 static int64_t gap_list_excess(const gap_list_t *g, int64_t x)
 {
-	/* последний k с b[k] <= x */
+	/* last k with b[k] <= x */
 	size_t lo = 0, hi = g->n;
 	while (lo < hi) {
 		size_t mid = (lo + hi) / 2;
@@ -184,7 +184,7 @@ int afr_ts_normalize(int64_t *ts, const uint16_t *shard, size_t n, const ts_cfg_
 {
 	memset(res, 0, sizeof(*res));
 
-	/* 1. Выбросы. */
+	/* 1. Outliers. */
 	int oom;
 	uint8_t *outl = find_outliers(ts, shard, n, cfg, res, &oom);
 	if (oom)
@@ -208,7 +208,7 @@ int afr_ts_normalize(int64_t *ts, const uint16_t *shard, size_t n, const ts_cfg_
 	}
 	free(outl);
 
-	/* 2. Границы, немонотонность, clamp. */
+	/* 2. Bounds, non-monotonicity, clamp. */
 	int have = 0;
 	int64_t rm = 0;
 	for (size_t i = 0; i < n; i++) {
@@ -246,7 +246,7 @@ int afr_ts_normalize(int64_t *ts, const uint16_t *shard, size_t n, const ts_cfg_
 	res->base_abs = (cfg->order == TS_ORDER_SORT) ? res->min_abs : res->first_abs;
 	const int64_t base = res->base_abs;
 
-	/* 3. Паузы и отображение на шкалу. */
+	/* 3. Gaps and mapping onto the timeline. */
 	int64_t maxmapped = INT64_MIN;
 	if (res->monotone) {
 		int64_t prev = 0, excess = 0, last_mapped = 0;
@@ -320,24 +320,24 @@ int afr_ts_normalize(int64_t *ts, const uint16_t *shard, size_t n, const ts_cfg_
 		free(gl.cum);
 	}
 	res->duration = maxmapped > 0 ? maxmapped : 0;
-	/* Круг длиннее файла на средний интервал, чтобы последний пакет круга и
-	 * первый пакет следующего не совпали по времени. */
+	/* A lap is longer than the file by the mean interval, so that the last packet of a lap and
+	 * the first packet of the next one do not coincide in time. */
 	res->lap_len = res->duration + (res->n > 1 ? res->duration / (int64_t)(res->n - 1) : 0);
 	if (res->lap_len <= 0)
 		res->lap_len = 1000;
 	return 0;
 }
 
-/* ---------- Профиль скорости ---------- */
+/* ---------- Rate profile ---------- */
 
 const int64_t afr_rate_windows_ns[RATE_WINDOWS] = {NS_PER_MS, 10 * NS_PER_MS, NS_PER_SEC};
-const char *const afr_rate_window_names[RATE_WINDOWS] = {"1 мс", "10 мс", "1 с"};
+const char *const afr_rate_window_names[RATE_WINDOWS] = {"1 ms", "10 ms", "1 s"};
 
 typedef struct {
 	const int64_t *t;
 	const uint64_t *ol;
 	const uint16_t *sh;
-	const rec16_t *s; /* отсортированное представление или NULL */
+	const rec16_t *s; /* sorted view or NULL */
 	size_t n;
 } view_t;
 
@@ -474,7 +474,7 @@ int afr_rate_profile(const int64_t *sched, const uint64_t *offlen, const uint16_
 	return 0;
 }
 
-/* ---------- Гистограмма ---------- */
+/* ---------- Histogram ---------- */
 
 uint64_t afr_lh_upper(unsigned b)
 {
@@ -493,7 +493,7 @@ uint64_t afr_lh_quantile(const uint64_t *hist, double q)
 		total += hist[b];
 	if (total == 0)
 		return 0;
-	/* Ранговое определение: наименьшее значение, не меньше которого q*N элементов. */
+	/* Rank definition: the smallest value such that at least q*N elements are <= it. */
 	uint64_t want = (uint64_t)ceil(q * (double)total);
 	if (want > 0)
 		want--;

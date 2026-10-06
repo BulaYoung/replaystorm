@@ -21,7 +21,7 @@ atomic_int g_stop;
 #define PUB(field, v) atomic_store_explicit(&(field), (v), RLX)
 #define STOP_REQUESTED() atomic_load_explicit(&g_stop, RLX)
 
-/* Ядро может выставлять в статусе флаги метки времени (коммит 171c3b151118). */
+/* The kernel may set timestamp flags in the status (commit 171c3b151118). */
 static inline uint32_t status_mask(uint32_t s)
 {
 	return s & ~(uint32_t)(TP_STATUS_TS_SOFTWARE | TP_STATUS_TS_RAW_HARDWARE);
@@ -33,10 +33,10 @@ static int tx_open(tx_ring_t *t, const char *iface, unsigned frames, unsigned ma
                    int bypass, int loss, char *err, size_t errlen)
 {
 	memset(t, 0, sizeof(*t));
-	t->fd = socket(AF_PACKET, SOCK_RAW, 0); /* протокол 0: сокет ничего не принимает */
+	t->fd = socket(AF_PACKET, SOCK_RAW, 0); /* protocol 0: the socket receives nothing */
 	if (t->fd < 0) {
 		snprintf(err, errlen, "socket(AF_PACKET): %s%s", strerror(errno),
-		         errno == EPERM ? " (нужен root или CAP_NET_RAW)" : "");
+		         errno == EPERM ? " (requires root or CAP_NET_RAW)" : "");
 		return -1;
 	}
 	int v = TPACKET_V2;
@@ -67,7 +67,7 @@ static int tx_open(tx_ring_t *t, const char *iface, unsigned frames, unsigned ma
 	unsigned nblocks = (frames + per_block - 1) / per_block;
 	t->frame_size = fs;
 	t->frame_nr = nblocks * per_block;
-	/* Буфер отправки должен вмещать всё кольцо, иначе send() упирается в EAGAIN. */
+	/* The send buffer must hold the whole ring, otherwise send() hits EAGAIN. */
 	int sndbuf = (int)((size_t)t->frame_nr * fs * 2 > (1u << 30) ? (1u << 30)
 	                                                               : (size_t)t->frame_nr * fs * 2);
 	if (setsockopt(t->fd, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf)) < 0)
@@ -79,7 +79,7 @@ static int tx_open(tx_ring_t *t, const char *iface, unsigned frames, unsigned ma
 	    .tp_frame_nr = t->frame_nr,
 	};
 	if (setsockopt(t->fd, SOL_PACKET, PACKET_TX_RING, &req, sizeof(req)) < 0) {
-		snprintf(err, errlen, "PACKET_TX_RING (%u кадров по %u байт): %s", t->frame_nr, fs,
+		snprintf(err, errlen, "PACKET_TX_RING (%u frames of %u bytes): %s", t->frame_nr, fs,
 		         strerror(errno));
 		goto fail;
 	}
@@ -96,7 +96,7 @@ static int tx_open(tx_ring_t *t, const char *iface, unsigned frames, unsigned ma
 	    .sll_ifindex = (int)if_nametoindex(iface),
 	};
 	if (ll.sll_ifindex == 0) {
-		snprintf(err, errlen, "интерфейс %s не найден", iface);
+		snprintf(err, errlen, "interface %s not found", iface);
 		goto fail;
 	}
 	if (bind(t->fd, (struct sockaddr *)&ll, sizeof(ll)) < 0) {
@@ -128,7 +128,7 @@ static inline struct tpacket2_hdr *frame_at(const tx_ring_t *t, unsigned i)
 	return (struct tpacket2_hdr *)(t->ring + (size_t)i * t->frame_size);
 }
 
-/* ---------- Отправка ---------- */
+/* ---------- Sending ---------- */
 
 static void publish(worker_t *w)
 {
@@ -142,17 +142,38 @@ static void publish(worker_t *w)
 static void fatal(worker_t *w, const char *what, int e)
 {
 	if (!w->err[0])
-		snprintf(w->err, sizeof(w->err), "поток %u: %s: %s%s", w->id, what, strerror(e),
+		snprintf(w->err, sizeof(w->err), "thread %u: %s: %s%s", w->id, what, strerror(e),
 		         (e == EMSGSIZE || e == EINVAL) && !w->c->o->packet_loss
-		             ? " (ядро отвергло кадр; --packet-loss позволит его пропустить)"
+		             ? " (kernel rejected the frame; --packet-loss lets it be skipped)"
 		             : "");
 	atomic_store(&w->sh->failed, 1);
 	atomic_store(&g_stop, 1);
 }
 
-/* Пакетный send(): ядро отправляет все кадры со статусом SEND_REQUEST. */
+/* Batched send(): the kernel transmits all frames with status SEND_REQUEST. */
+/*
+ * Back off after the device queue rejected frames (ENOBUFS/EAGAIN). Hammering send()
+ * in a tight loop only burns the CPU: the queue frees up at line rate anyway. The
+ * first few attempts spin briefly, then the thread sleeps for 5..100 us.
+ */
+static void backoff(unsigned fails)
+{
+	if (fails <= 4) {
+		for (unsigned i = 0; i < (64u << fails); i++)
+			afr_cpu_relax();
+		return;
+	}
+	unsigned sh = fails - 5 < 5 ? fails - 5 : 5;
+	long ns = 5000L << sh;
+	if (ns > 100000)
+		ns = 100000;
+	struct timespec ts = {0, ns};
+	nanosleep(&ts, NULL);
+}
+
 static void flush(worker_t *w)
 {
+	unsigned fails = 0;
 	w->pending = 0;
 	for (;;) {
 		w->l_sends++;
@@ -161,19 +182,18 @@ static void flush(worker_t *w)
 			break;
 		int e = errno;
 		if (e == ENOBUFS) {
-			/* Очередь устройства/qdisc полна. Кадр остаётся SEND_REQUEST, ядро
-			 * повторит его при следующем send(). */
+			/* Device/qdisc queue is full. The frame stays SEND_REQUEST; the kernel
+			 * retries it on the next send(). */
 			w->l_enobufs++;
 		} else if (e == EAGAIN || e == EWOULDBLOCK) {
-			w->l_eagain++; /* исчерпан буфер сокета */
+			w->l_eagain++; /* socket buffer exhausted */
 		} else if (e != EINTR) {
 			fatal(w, "send", e);
 			break;
 		}
 		if (STOP_REQUESTED())
 			break;
-		for (int i = 0; i < 64; i++)
-			afr_cpu_relax();
+		backoff(++fails);
 	}
 	publish(w);
 	w->now = afr_clock_ns();
@@ -187,14 +207,19 @@ static struct tpacket2_hdr *acquire_slow(worker_t *w, struct tpacket2_hdr *h)
 		if (s == TP_STATUS_AVAILABLE)
 			return h;
 		if (s & TP_STATUS_WRONG_FORMAT) {
-			fatal(w, "кадр отвергнут ядром (TP_STATUS_WRONG_FORMAT)", EINVAL);
+			fatal(w, "frame rejected by kernel (TP_STATUS_WRONG_FORMAT)", EINVAL);
 			return NULL;
 		}
 		if (w->pending) {
 			flush(w);
 		} else if (s == TP_STATUS_SEND_REQUEST && (++spins & 255) == 0) {
-			/* Кадр не забран после ENOBUFS/EAGAIN — подтолкнуть. */
+			/* Frame not picked up after ENOBUFS/EAGAIN: kick it. */
 			flush(w);
+		} else if (++spins > 4096) {
+			/* The ring is full of frames still in the driver: wait for completions
+			 * without burning the CPU. */
+			struct timespec ts = {0, 10000};
+			nanosleep(&ts, NULL);
 		} else {
 			afr_cpu_relax();
 		}
@@ -212,7 +237,7 @@ static inline struct tpacket2_hdr *acquire(worker_t *w)
 	return acquire_slow(w, h);
 }
 
-/* Подождать, пока все кадры кольца не будут отправлены (не дольше timeout). */
+/* Wait until all ring frames have been sent (no longer than timeout). */
 static void drain(worker_t *w, int64_t timeout)
 {
 	if (w->pending)
@@ -235,7 +260,7 @@ static void drain(worker_t *w, int64_t timeout)
 	publish(w);
 }
 
-/* Скопировать пакет в кольцо и пометить к отправке. */
+/* Copy a packet into the ring and mark it for sending. */
 static inline int emit(worker_t *w, const pkt_t *p, uint64_t lap)
 {
 	struct tpacket2_hdr *h = acquire(w);
@@ -246,7 +271,7 @@ static inline int emit(worker_t *w, const pkt_t *p, uint64_t lap)
 	const uint8_t *src = w->c->pf.base + OFFLEN_OFF(p->offlen);
 	uint32_t flen = len;
 	if (w->c->pf.raw_ip) {
-		/* Синтетический Ethernet-заголовок для RAW IP. */
+		/* Synthetic Ethernet header for RAW IP. */
 		memcpy(dst, w->c->o->dmac, 6);
 		memcpy(dst + 6, w->c->o->smac, 6);
 		int v6 = w->c->pf.raw_ip == 6 || (w->c->pf.raw_ip == 1 && (src[0] >> 4) == 6);
@@ -270,22 +295,22 @@ static inline int emit(worker_t *w, const pkt_t *p, uint64_t lap)
 	return 0;
 }
 
-/* Гибридное ожидание: nanosleep для длинных пауз, busy-spin в конце. */
+/* Hybrid wait: nanosleep for long pauses, busy-spin at the end. */
 static int64_t wait_until(int64_t target, int64_t spin_ns)
 {
 	int64_t now = afr_clock_ns();
 	while (now < target) {
 		int64_t d = target - now;
 		if (d > spin_ns) {
-			/* Перед сном сверяем TSC с CLOCK_MONOTONIC (чтение часов здесь ничего не стоит). */
+			/* Before sleeping, check TSC against CLOCK_MONOTONIC (reading the clock is free here). */
 			if (afr_clock_resync()) {
 				now = afr_clock_ns();
 				continue;
 			}
 			int64_t sl = d - spin_ns;
 			if (sl > 50 * NS_PER_MS)
-				sl = 50 * NS_PER_MS; /* чтобы вовремя заметить остановку */
-			/* Наши часы откалиброваны по CLOCK_MONOTONIC, поэтому годятся для него. */
+				sl = 50 * NS_PER_MS; /* to notice a stop request in time */
+			/* Our clock is calibrated against CLOCK_MONOTONIC, so it is valid for it. */
 			int64_t wake = now + sl;
 			struct timespec ts = {.tv_sec = wake / NS_PER_SEC, .tv_nsec = wake % NS_PER_SEC};
 			clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
@@ -300,10 +325,10 @@ static int64_t wait_until(int64_t target, int64_t spin_ns)
 }
 
 /*
- * Дождаться момента target и вернуть текущее время. Если пакет заведомо уже
- * наступил (target <= время последнего чтения часов), часы не читаются: при
- * отставании это экономит вызов на каждый пакет, а опоздание занижается не
- * больше чем на длительность одной пачки (часы обновляются после каждого send).
+ * Wait until target and return the current time. If the packet is already
+ * known to be due (target <= last clock reading), the clock is not read: when
+ * lagging, this saves a call per packet, and lateness is underestimated by at
+ * most the duration of one batch (the clock is updated after every send).
  */
 static inline int64_t pace(worker_t *w, int64_t target, int64_t spin)
 {
@@ -312,7 +337,7 @@ static inline int64_t pace(worker_t *w, int64_t target, int64_t spin)
 		return now;
 	now = afr_clock_ns();
 	if (now < target) {
-		/* Пакет ещё не наступил: отправить накопленное досрочно. */
+		/* Packet not yet due: flush what has accumulated early. */
 		if (w->pending) {
 			flush(w);
 			now = w->now;
@@ -354,14 +379,14 @@ static void run(worker_t *w)
 	const int64_t lag_thr = o->lag_threshold;
 	const double inv_mult = 1.0 / c->mult;
 	const uint32_t l2_extra = c->pf.raw_ip ? 14 : 0;
-	double ns_per_unit = 0; /* для --mbps: нс на байт, для --pps: нс на пакет */
+	double ns_per_unit = 0; /* for --mbps: ns per byte, for --pps: ns per packet */
 	if (mode == MODE_MBPS)
 		ns_per_unit = 8e9 / (o->mbps * 1e6 * w->rate_share);
 	else if (mode == MODE_PPS)
 		ns_per_unit = 1e9 / (o->pps * w->rate_share);
 	double cum = 0;
 
-	/* Все режимы стартуют одновременно в общей точке T0. */
+	/* All modes start simultaneously at the common point T0. */
 	w->now = wait_until(t0, spin);
 	for (uint64_t lap = 0; loops == 0 || lap < loops; lap++) {
 		int64_t max_sched = INT64_MIN;
@@ -371,7 +396,7 @@ static void run(worker_t *w)
 			const pkt_t *p = &w->pk[i];
 			if (mode == MODE_TIMED) {
 				if (asis && p->ts < max_sched) {
-					/* «Назад во времени» при asis: без ожидания, без учёта опоздания. */
+					/* "Backward in time" under asis: no wait, lateness not counted. */
 					w->st.asis_back++;
 				} else {
 					max_sched = p->ts;
@@ -380,7 +405,7 @@ static void run(worker_t *w)
 					int64_t late = pace(w, target, spin) - target;
 					hist_add(w, late);
 					if (rebase && late > lag_thr) {
-						/* Сдвинуть общую T0 вперёд, чтобы этот пакет оказался вовремя. */
+						/* Shift the common T0 forward so this packet is on time. */
 						int64_t want = shift + late;
 						int64_t cur = shift;
 						while (cur < want &&
@@ -407,7 +432,7 @@ static int build_shard(worker_t *w)
 	size_t cnt = ix->shard_pkts[sid];
 	w->pk = malloc((cnt ? cnt : 1) * sizeof(pkt_t));
 	if (!w->pk) {
-		snprintf(w->err, sizeof(w->err), "поток %u: нет памяти под шард", w->id);
+		snprintf(w->err, sizeof(w->err), "thread %u: out of memory for shard", w->id);
 		return -1;
 	}
 	size_t k = 0;
@@ -417,17 +442,29 @@ static int build_shard(worker_t *w)
 	}
 	w->n = k;
 	if (w->c->o->ts_order == TS_ORDER_SORT && !w->c->tsr.monotone) {
-		/* Стабильная сортировка индекса шарда по метке; данные не трогаются. */
+		/* Stable sort of the shard index by timestamp; data is not touched. */
 		rec16_t *tmp = malloc((k ? k : 1) * sizeof(rec16_t));
 		if (!tmp) {
-			snprintf(w->err, sizeof(w->err), "поток %u: нет памяти для сортировки", w->id);
+			snprintf(w->err, sizeof(w->err), "thread %u: out of memory for sorting", w->id);
 			return -1;
 		}
-		_Static_assert(sizeof(pkt_t) == sizeof(rec16_t), "pkt_t и rec16_t должны совпадать");
+		_Static_assert(sizeof(pkt_t) == sizeof(rec16_t), "pkt_t and rec16_t must match");
 		afr_radix_sort16((rec16_t *)w->pk, tmp, k);
 		free(tmp);
 	}
 	return 0;
+}
+
+/*
+ * Ring slot size: the largest frame actually present in the file, not the MTU. With
+ * MTU 9000 and ordinary traffic this gives 2 KB slots instead of 16 KB, which keeps
+ * the ring compact in cache and TLB.
+ */
+static unsigned ring_frame_len(const afr_ctx_t *c)
+{
+	unsigned mtu_max = c->mtu + 14 + 4;
+	unsigned m = c->ix.st.max_frame;
+	return (m > 0 && m < mtu_max) ? m : mtu_max;
 }
 
 void *afr_worker_main(void *arg)
@@ -441,7 +478,7 @@ void *afr_worker_main(void *arg)
 		CPU_ZERO(&set);
 		CPU_SET(w->cpu, &set);
 		if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0)
-			fprintf(stderr, "ПРЕДУПРЕЖДЕНИЕ: поток %u: не удалось привязать к CPU %d\n", w->id,
+			fprintf(stderr, "WARNING: thread %u: failed to pin to CPU %d\n", w->id,
 			        w->cpu);
 	}
 	prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
@@ -450,20 +487,20 @@ void *afr_worker_main(void *arg)
 	snprintf(name, sizeof(name), w->is_l2 ? "afr-l2" : "afr-tx%u", w->id);
 	pthread_setname_np(pthread_self(), name);
 
-	/* Память шарда и кольцо выделяются после привязки — на «своём» узле NUMA. */
+	/* Shard memory and the ring are allocated after pinning, on the thread's own NUMA node. */
 	w->tx.fd = -1;
 	char terr[200] = "";
 	if (build_shard(w) < 0) {
 		atomic_store(&w->sh->failed, 1);
 		ok = 0;
-	} else if (tx_open(&w->tx, c->o->iface, c->o->ring_frames, c->mtu + 14 + 4, c->o->qdisc_bypass,
+	} else if (tx_open(&w->tx, c->o->iface, c->o->ring_frames, ring_frame_len(c), c->o->qdisc_bypass,
 	                   c->o->packet_loss, terr, sizeof(terr)) < 0) {
-		snprintf(w->err, sizeof(w->err), "поток %u: %s", w->id, terr);
+		snprintf(w->err, sizeof(w->err), "thread %u: %s", w->id, terr);
 		atomic_store(&w->sh->failed, 1);
 		ok = 0;
 	}
-	pthread_barrier_wait(&w->sh->bar); /* 1: всё подготовлено */
-	pthread_barrier_wait(&w->sh->bar); /* 2: T0 назначено */
+	pthread_barrier_wait(&w->sh->bar); /* 1: everything is prepared */
+	pthread_barrier_wait(&w->sh->bar); /* 2: T0 is set */
 	if (ok && !atomic_load(&w->sh->failed)) {
 		run(w);
 		drain(w, 3 * NS_PER_SEC);

@@ -11,7 +11,7 @@ __thread uint64_t afr_clk_base_tick;
 __thread int64_t afr_clk_base_ns;
 
 #if AFR_HAVE_TSC
-/* Пара (tsc, monotonic) с минимальной неопределённостью. */
+/* A (tsc, monotonic) pair with minimal uncertainty. */
 static void sample(uint64_t *tick, int64_t *ns)
 {
 	uint64_t best = UINT64_MAX;
@@ -69,7 +69,7 @@ const char *afr_clock_init(int mode)
 	else if (mode == CLOCK_MODE_AUTO)
 		want = strcmp(cs, "tsc") != 0 && cpu_has_invariant_tsc();
 	if (want) {
-		/* Калибруем на одном ядре: TSC разных ядер могут быть не синхронизированы. */
+		/* Calibrate on a single core: TSCs of different cores may be unsynchronized. */
 		cpu_set_t saved, one;
 		int pinned = sched_getaffinity(0, sizeof(saved), &saved) == 0;
 		if (pinned) {
@@ -93,19 +93,19 @@ const char *afr_clock_init(int mode)
 		if (k[0] > 0 && k[1] > 0 && fabs(k[0] - k[1]) / k[0] < 1e-3) {
 			afr_clk_ns_per_tick = (k[0] + k[1]) / 2;
 			afr_clk_use_tsc = 1;
-			snprintf(desc, sizeof(desc), "TSC %.3f ГГц (clocksource ядра: %s)",
+			snprintf(desc, sizeof(desc), "TSC %.3f GHz (kernel clocksource: %s)",
 			         1.0 / afr_clk_ns_per_tick, cs);
 			afr_clock_thread_init();
 			return desc;
 		}
 		snprintf(desc, sizeof(desc),
-		         "CLOCK_MONOTONIC (clocksource ядра: %s; калибровка TSC нестабильна)", cs);
+		         "CLOCK_MONOTONIC (kernel clocksource: %s; TSC calibration unstable)", cs);
 		return desc;
 	}
 #else
 	(void)mode;
 #endif
-	snprintf(desc, sizeof(desc), "CLOCK_MONOTONIC (clocksource ядра: %s)", cs);
+	snprintf(desc, sizeof(desc), "CLOCK_MONOTONIC (kernel clocksource: %s)", cs);
 	return desc;
 }
 

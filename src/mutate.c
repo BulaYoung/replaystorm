@@ -24,7 +24,7 @@ static inline void wr32(uint8_t *p, uint32_t v)
 	wr16(p + 2, (uint16_t)v);
 }
 
-/* Учесть замену 32-битного слова old -> new в контрольной сумме по адресу csum. */
+/* Account for replacing 32-bit word old -> new in the checksum at csum. */
 static inline void csum_fix32(uint8_t *csum, uint32_t old, uint32_t new_)
 {
 	uint16_t c = rd16(csum);
@@ -35,14 +35,14 @@ static inline void csum_fix32(uint8_t *csum, uint32_t old, uint32_t new_)
 
 static inline uint16_t shift_port(uint16_t p, uint64_t lap, uint32_t step)
 {
-	/* Порты < 1024 (сервисы) не трогаем; остальные сдвигаем внутри 1024..65535. */
+	/* Ports < 1024 (services) are left alone; others are shifted within 1024..65535. */
 	if (p < 1024)
 		return p;
 	uint64_t r = ((uint64_t)(p - 1024) + lap * step) % 64512u;
 	return (uint16_t)(1024 + r);
 }
 
-/* Где лежит контрольная сумма L4, охватывающая псевдозаголовок (NULL — нет). */
+/* Location of the L4 checksum covering the pseudo-header (NULL if none). */
 static uint8_t *l4_csum(uint8_t *f, uint32_t len, const dis_t *d, int *is_udp)
 {
 	*is_udp = 0;
@@ -65,7 +65,7 @@ static uint8_t *l4_csum(uint8_t *f, uint32_t len, const dis_t *d, int *is_udp)
 	if ((uint32_t)d->l4_off + off + 2 > len)
 		return NULL;
 	uint8_t *c = f + d->l4_off + off;
-	/* UDP по IPv4 с нулевой суммой — сумма не используется. */
+	/* UDP over IPv4 with a zero checksum: the checksum is not used. */
 	if (*is_udp && rd16(c) == 0)
 		return NULL;
 	return c;
@@ -96,7 +96,7 @@ int afr_mutate(uint8_t *f, uint32_t len, uint64_t lap, const mutate_cfg_t *cfg)
 					csum_fix32(l4c, old, nw);
 			}
 		} else {
-			/* IPv6: сдвигаем слово 8..11 адреса (старшая часть идентификатора интерфейса). */
+			/* IPv6: shift address bytes 8..11 (upper part of the interface identifier). */
 			uint8_t *ip = f + d.l3_off;
 			for (int k = 0; k < 2; k++) {
 				uint8_t *a = ip + 8 + 16 * k + 8;
@@ -123,7 +123,7 @@ int afr_mutate(uint8_t *f, uint32_t len, uint64_t lap, const mutate_cfg_t *cfg)
 			changed = 1;
 		}
 	}
-	/* В UDP ноль означает «нет суммы»; вычисленный ноль передаётся как 0xFFFF. */
+	/* In UDP zero means "no checksum"; a computed zero is sent as 0xFFFF. */
 	if (l4c && is_udp && rd16(l4c) == 0)
 		wr16(l4c, 0xFFFF);
 	return changed;

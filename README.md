@@ -1,397 +1,433 @@
 # afreplay
 
-Многопоточный реплеер pcap через `AF_PACKET` (TX_RING), рассчитанный на большие файлы (50+ ГБ)
-и многоядерные машины со слабым одним ядром. Кадры уходят **байт в байт, вместе с L2**: MAC,
-VLAN/QinQ, MPLS, ARP, STP, LLDP и любые не-IP кадры. Скорость можно задать четырьмя способами:
-максимальная, фиксированная (Мбит/с или pps), по тайм-стампам pcap с множителем или под
-заданную длительность. Поддерживается зацикливание, в том числе с модификацией адресов и портов.
+A multithreaded pcap replayer over `AF_PACKET` (TX_RING), built for large files (50+ GB) and
+multicore machines with weak single cores. Frames are sent **byte for byte, including L2**: MAC,
+VLAN/QinQ, MPLS, ARP, STP, LLDP and any non-IP frames. The rate can be set in four ways:
+maximum, fixed (Mbit/s or pps), by pcap timestamps with a multiplier, or to fit a given
+duration. Looping is supported, including with modification of addresses and ports.
 
-Используется только `AF_PACKET`, без DPDK, AF_XDP, netmap и libpcap. Язык C11, зависимости
-только pthread и libm.
+Only `AF_PACKET` is used, no DPDK, AF_XDP, netmap or libpcap. The language is C11, the only
+dependencies are pthread and libm.
 
-## Сборка
+Program output (messages, statistics, `--help`) and code comments are in English.
+
+## Building
 
 ```sh
-make                # бинарник ./afreplay
-make unit-test      # юнит-тесты
-make test           # юнит-тесты + генерация тестовых pcap + функциональные тесты на veth
-make sanitize       # юнит-тесты в сборке с UBSan (trap) и FORTIFY; SAN=-fsanitize=address, если есть libasan
+make                # the ./afreplay binary
+make unit-test      # unit tests
+make test           # unit tests + test pcap generation + functional tests on veth
+make sanitize       # unit tests built with UBSan (trap) and FORTIFY; SAN=-fsanitize=address if libasan is available
 ```
 
-Нужны gcc или clang с C11 и Linux 3.14+ (для `PACKET_QDISC_BYPASS`). Для тестов нужен python3
-без сторонних модулей, а также `ip` и `ethtool`. Сборка идёт с `-Wall -Wextra -Werror`.
+Requires gcc or clang with C11 and Linux 3.14+ (for `PACKET_QDISC_BYPASS`). The tests need
+python3 without third-party modules, plus `ip` and `ethtool`. The build uses
+`-Wall -Wextra -Werror`.
 
-Для запуска нужен root или `CAP_NET_RAW`. Если есть `CAP_NET_ADMIN`, увеличивается буфер сокета
-(`SO_SNDBUFFORCE`); без него берётся то, что разрешает `net.core.wmem_max`.
+Running requires root or `CAP_NET_RAW`. With `CAP_NET_ADMIN` the socket buffer is enlarged
+(`SO_SNDBUFFORCE`); without it, whatever `net.core.wmem_max` allows is used.
 
-## Быстрый старт
+## Quick start
 
 ```sh
-# Что внутри файла: аномалии меток, пики скорости, состав трафика, шарды
+# What is inside the file: timestamp anomalies, rate peaks, traffic mix, shards
 afreplay --analyze big.pcap
 afreplay --analyze --multiplier 10 --link-speed 25G big.pcap
 
-# Максимальная скорость, 12 потоков, мимо qdisc
+# Maximum rate, 12 threads, bypassing qdisc
 afreplay -i ens1f0 --topspeed --qdisc-bypass -t 12 big.pcap
 
-# Фиксированные 20 Гбит/с, бесконечно (Ctrl-C печатает итог)
+# Fixed 20 Gbit/s, forever (Ctrl-C prints the summary)
 afreplay -i ens1f0 --mbps 20000 --loop 0 big.pcap
 
-# По тайм-стампам вдвое быстрее, паузы длиннее 1 с сжать, метки отсортировать
+# Saturate a 25G link at 99% on the wire, forever, with new sessions every lap
+afreplay -i ens1f0 --mbps 99% --loop 0 --loop-mutate ip,port --qdisc-bypass --preload big.pcap
+
+# By timestamps at double speed, compress pauses longer than 1 s, sort timestamps
 afreplay -i ens1f0 --multiplier 2 --max-gap 1s --ts-order sort big.pcap
 
-# Проиграть файл ровно за 10 минут, статистику записать в JSON
+# Replay the file in exactly 10 minutes, write statistics to JSON
 afreplay -i ens1f0 --duration 10m --stats-json run.json big.pcap
 
-# 5 кругов, на каждом сенсор видит новые сессии
+# 5 laps, the sensor sees new sessions on each one
 afreplay -i ens1f0 --loop 5 --loop-mutate ip,port big.pcap
 
-# RAW IP (linktype 101/228/229): Ethernet-заголовок подставляется
+# RAW IP (linktype 101/228/229): an Ethernet header is prepended
 afreplay -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap
 ```
 
-Полный список опций выводит `afreplay --help`.
+`afreplay --help` prints the full list of options.
 
-## Как это устроено
+## How it works
 
-1. **Файл** отображается в память (`mmap`, только чтение) и в heap не копируется. Флаг
-   `--preload` делает `MAP_POPULATE`, то есть читает файл целиком до старта. Если файл больше
-   доступной памяти, программа предупредит. Без `--preload` поток статистики раз в секунду
-   делает `madvise(MADV_WILLNEED)` на 512 МБ вперёд от самой отстающей позиции потоков.
-2. **Индекс** строится за один последовательный проход по записям (цепочку записей pcap иначе
-   не пройти). Параллельно с проходом N потоков классифицируют и хешируют уже прочитанные
-   пакеты блоками по 64K. На пакет хранится 8 байт (смещение 48 бит + длина 16 бит), метка
-   времени 8 байт и номер шарда 2 байта.
-3. **Шкала времени** нормализуется по метке каждого пакета: обрабатываются выбросы, clamp,
-   max-gap (см. ниже). Это чистые функции, они покрыты юнит-тестами (`src/sched.c`).
-4. **Шардирование** идёт симметричным хешем 5-tuple, поэтому A→B и B→A попадают в один поток и
-   порядок внутри сессии сохраняется. Парсер проходит VLAN/QinQ (0x8100, 0x88a8, 0x9100,
-   0x9200), стек MPLS (в том числе псевдопровод с control word и внутренним Ethernet), PPPoE и
-   заголовки расширения IPv6. У IP-фрагментов (IPv4 и IPv6) порты не используются, поэтому все
-   фрагменты датаграммы идут в один поток. VLAN ID в хеш намеренно не входит: при маршрутизации
-   между VLAN две стороны сессии бывают в разных VLAN. Туннели (GRE, VXLAN) хешируются по
-   внешнему заголовку. Не-IP кадры идут в отдельный шард, который обслуживает отдельный поток.
-5. **Потоки отправки.** На каждый непустой шард создаётся поток. Он привязывается к ядру и уже
-   после этого выделяет свою копию индекса шарда и TX_RING. Так память оказывается на нужном
-   узле NUMA. По умолчанию берутся ядра из `/sys/class/net/<if>/device/local_cpulist`;
-   `--cpus` переопределяет список. IP-потоков по умолчанию на один меньше, чем ядер, а поток
-   не-IP садится на оставшееся ядро. После построения шардов глобальный индекс освобождается.
-6. **Отправка.** У каждого потока свой сокет `AF_PACKET`/`SOCK_RAW` с protocol = 0 (сокет
-   ничего не принимает), `TPACKET_V2`, `PACKET_TX_RING`. Кадр копируется из mmap прямо в
-   кольцо, и после пачки (`--batch`, по умолчанию 64) один раз вызывается
-   `send(MSG_DONTWAIT)`. Опции `PACKET_QDISC_BYPASS` и `PACKET_LOSS` включаются флагами.
-7. **Горячий цикл** обходится без блокировок и malloc. Из системных вызовов в нём только
-   пакетный `send()` и `clock_nanosleep` в режимах с ожиданием. Счётчики хранятся на каждом
-   потоке, выровнены по кэш-линии и публикуются relaxed-записями. Поток статистики их только
-   читает.
+1. **The file** is mapped into memory (`mmap`, read-only) and is not copied to the heap. The
+   `--preload` flag uses `MAP_POPULATE`, i.e. reads the whole file before starting. If the file
+   is larger than available memory, the program warns. Without `--preload` the statistics
+   thread calls `madvise(MADV_WILLNEED)` once a second on 512 MB ahead of the position of the
+   slowest thread.
+2. **The index** is built in a single sequential pass over the records (the pcap record chain
+   cannot be walked any other way). In parallel with the pass, N threads classify and hash
+   already-read packets in blocks of 64K. Per packet, 8 bytes are stored (48-bit offset +
+   16-bit length), plus an 8-byte timestamp and a 2-byte shard number.
+3. **The timeline** is normalized from each packet's timestamp: outliers, clamp and max-gap are
+   handled (see below). These are pure functions covered by unit tests (`src/sched.c`).
+4. **Sharding** uses a symmetric 5-tuple hash, so A→B and B→A land in the same thread and order
+   within a session is preserved. The parser walks VLAN/QinQ (0x8100, 0x88a8, 0x9100, 0x9200),
+   the MPLS stack (including a pseudowire with control word and inner Ethernet), PPPoE and IPv6
+   extension headers. Ports are not used for IP fragments (IPv4 and IPv6), so all fragments of
+   a datagram go to the same thread. The VLAN ID is deliberately excluded from the hash: with
+   inter-VLAN routing the two sides of a session may be in different VLANs. Tunnels (GRE,
+   VXLAN) are hashed by the outer header. Non-IP frames go to a separate shard served by its
+   own thread.
+5. **Sender threads.** A thread is created for each non-empty shard. It is pinned to a core and
+   only then allocates its own copy of the shard index and its TX_RING, so the memory ends up
+   on the right NUMA node. By default cores are taken from
+   `/sys/class/net/<if>/device/local_cpulist`; `--cpus` overrides the list. By default there
+   is one IP thread fewer than cores, and the non-IP thread takes the remaining core. Once the
+   shards are built, the global index is freed.
+6. **Sending.** Each thread has its own `AF_PACKET`/`SOCK_RAW` socket with protocol = 0 (the
+   socket receives nothing), `TPACKET_V2`, `PACKET_TX_RING`. A frame is copied from the mmap
+   straight into the ring, and after a batch (`--batch`, 64 by default) `send(MSG_DONTWAIT)` is
+   called once. `PACKET_QDISC_BYPASS` and `PACKET_LOSS` are enabled by flags. Ring slots are
+   sized by the largest frame actually present in the file (capped by MTU+18), not by the MTU:
+   with MTU 9000 and ordinary traffic that is 2 KB per slot instead of 16 KB.
+   When the device queue is full (ENOBUFS/EAGAIN), the thread backs off instead of retrying
+   `send()` in a tight loop: a few short spins, then 5..100 us sleeps. When the ring itself is
+   full of frames still in the driver, the thread also sleeps 10 us between checks.
+7. **The hot loop** has no locks and no malloc. Its only system calls are the batched `send()`
+   and `clock_nanosleep` in waiting modes. Counters are per thread, cache-line aligned and
+   published with relaxed stores. The statistics thread only reads them.
 
-Память: при построении индекса нужно около 18 байт на пакет, при раздаче шардов в пике около
-34 байт на пакет, во время отправки 16 байт на пакет. Для 70 млн пакетов это примерно 2.4 ГБ в
-пике и 1.1 ГБ во время работы. При `--ts-order sort` или `asis` на немонотонных метках на время
-расчёта шкалы добавляется ещё 32 байта на пакет.
+Memory: building the index needs about 18 bytes per packet, distributing shards peaks at about
+34 bytes per packet, and sending uses 16 bytes per packet. For 70 million packets that is
+roughly 2.4 GB at peak and 1.1 GB while running. With `--ts-order sort` or `asis` on
+non-monotonic timestamps, another 32 bytes per packet is added while the timeline is computed.
 
-## Режимы скорости
+## Rate modes
 
-| Режим | Что делает |
+| Mode | What it does |
 |---|---|
-| `--topspeed` | Максимально быстро. Потоки не ждут ничего, кроме свободных кадров в кольце. |
-| `--mbps X` | Общая скорость X Мбит/с по длине кадра L2 (без FCS, преамбулы и IFG). Она делится между потоками **пропорционально объёму их шардов в байтах**, поэтому все потоки заканчивают одновременно и сумма равна X. |
-| `--pps X` | То же, но в пакетах в секунду; делится пропорционально числу пакетов в шардах. |
-| `--multiplier X` | Реплей по тайм-стампам (режим по умолчанию, X = 1). 2.0 — вдвое быстрее, 0.5 — вдвое медленнее. |
-| `--duration T` | Множитель подбирается так, чтобы весь файл (один круг) проигрался за T. Суффиксы: `ns`, `us`, `ms`, `s`, `m`, `h`. |
+| `--topspeed` | As fast as possible. Threads wait for nothing but free frames in the ring. |
+| `--mbps X` | Total rate of X Mbit/s by L2 frame length (without FCS, preamble and IFG). It is split between threads **in proportion to the byte volume of their shards**, so all threads finish at the same time and the sum equals X. |
+| `--mbps line`, `--mbps N%` | Rate as a share of the link speed **on the wire** (preamble, IFG, FCS and the 60-byte minimum included): `line` = 100%, e.g. `99%`. The link speed comes from ethtool or `--link-speed`. It is converted to an L2 rate with the file's own ratio of L2 bytes to on-the-wire bytes and then paced like `--mbps X`. If an explicit `--mbps X` exceeds the link on the wire, afreplay warns before start. |
+| `--pps X` | The same, but in packets per second; split in proportion to the packet count of the shards. |
+| `--multiplier X` | Replay by timestamps (the default mode, X = 1). 2.0 is twice as fast, 0.5 twice as slow. |
+| `--duration T` | The multiplier is chosen so that the whole file (one lap) plays in T. Suffixes: `ns`, `us`, `ms`, `s`, `m`, `h`. |
 
-В режимах `--mbps` и `--pps` время отправки тоже считается от общей точки:
-`T0 + накоплено_байт × нс_на_байт`. Поэтому ошибка не накапливается, а после паузы (например,
-при заполненном кольце) поток догоняет расписание.
+In the `--mbps` and `--pps` modes the send time is also computed from a common origin:
+`T0 + bytes_so_far × ns_per_byte`. So the error does not accumulate, and after a stall (for
+example, when the ring is full) the thread catches up with the schedule.
 
-Все режимы стартуют одновременно: потоки проходят барьер и ждут общую точку T0.
+All modes start simultaneously: threads pass a barrier and wait for the common point T0.
 
-`--loop N` проигрывает файл N раз; `--loop 0` крутит бесконечно, до SIGINT/SIGTERM.
+`--loop N` plays the file N times; `--loop 0` loops forever, until SIGINT/SIGTERM.
 
-## Реплей по тайм-стампам
+## Timestamp replay
 
-**Расписание.** Время отправки пакета считается от общей точки, а не от предыдущего пакета:
+**Schedule.** A packet's send time is computed from a common origin, not from the previous
+packet:
 
 ```
-t_send = T0 + (номер_круга × длина_круга + ts_pkt − ts_first) / multiplier
+t_send = T0 + (lap_number × lap_length + ts_pkt − ts_first) / multiplier
 ```
 
-Поэтому ошибка не накапливается и потоки между собой не расходятся. T0 общий для всех потоков:
-он назначается после барьера, когда все сокеты и кольца готовы. Длина круга равна длительности
-шкалы плюс средний интервал между пакетами. Так последний пакет круга и первый пакет следующего
-не сливаются, а при зацикливании шкала продолжается, а не начинается заново.
+So the error does not accumulate and threads do not drift apart. T0 is shared by all threads:
+it is assigned after the barrier, once all sockets and rings are ready. The lap length equals
+the timeline duration plus the mean inter-packet interval. This way the last packet of a lap
+and the first packet of the next do not merge, and when looping the timeline continues rather
+than starting over.
 
-**Ожидание** гибридное. Длинные паузы проходят в `clock_nanosleep(TIMER_ABSTIME)` кусками не
-длиннее 50 мс, чтобы вовремя заметить остановку. Последние `--spin-us` мкс (по умолчанию 50)
-отрабатываются busy-spin на часах. Таймер-слак потока выставлен в 1 нс.
+**Waiting** is hybrid. Long pauses are spent in `clock_nanosleep(TIMER_ABSTIME)` in chunks of
+at most 50 ms, so a stop is noticed in time. The last `--spin-us` us (50 by default) are
+busy-spun on the clock. The thread's timer slack is set to 1 ns.
 
-**Пачки не ломают тайминг.** Если очередной пакет ещё не наступил, накопленная пачка
-отправляется досрочно, и только потом поток засыпает. Если пакет уже наступил, часы повторно не
-читаются: при отставании это экономит вызов часов на каждый пакет. Часы обновляются после
-каждого `send()`.
+**Batches do not break timing.** If the next packet is not yet due, the accumulated batch is
+sent early, and only then does the thread sleep. If the packet is already due, the clock is not
+read again: when lagging, this saves a clock call per packet. The clock is refreshed after
+every `send()`.
 
-**Часы** (`--clock auto|tsc|monotonic`). Обычно `CLOCK_MONOTONIC` через vDSO стоит около 20 нс.
-Но если ядро переключилось на clocksource `hpet` или `acpi_pm` (TSC отбракован; бывает на
-ноутбуках и в ВМ), каждый вызов стоит около 1 мкс, и один поток в режиме по тайм-стампам теряет
-половину скорости. В режиме `auto` в такой ситуации, если у CPU есть invariant TSC
-(`constant_tsc` и `nonstop_tsc`), используется `rdtsc`. Частота калибруется по
-`CLOCK_MONOTONIC` дважды по 100 мс на одном ядре; если две оценки расходятся больше чем на
-0.1%, используется `CLOCK_MONOTONIC`. Смещение калибруется в каждом потоке отдельно, после
-привязки к ядру. Это важно: на тестовом ноутбуке TSC у CPU 0 сдвинут относительно остальных
-ядер на 2.09 с, из-за чего ядро и отбраковало TSC. Перед каждым `nanosleep` поток сверяет TSC с
-`CLOCK_MONOTONIC` и при расхождении больше 50 мкс пересинхронизируется. Какие часы выбраны,
-видно в строке «Часы:» при старте.
+**Clock** (`--clock auto|tsc|monotonic`). Normally `CLOCK_MONOTONIC` via vDSO costs about 20 ns.
+But if the kernel has switched to the `hpet` or `acpi_pm` clocksource (TSC rejected; happens on
+laptops and in VMs), each call costs about 1 us, and a single thread in timestamp mode loses
+half its rate. In `auto` mode in this situation, if the CPU has an invariant TSC (`constant_tsc`
+and `nonstop_tsc`), `rdtsc` is used. The frequency is calibrated against `CLOCK_MONOTONIC`
+twice for 100 ms on one core; if the two estimates differ by more than 0.1%,
+`CLOCK_MONOTONIC` is used. The offset is calibrated in each thread separately, after pinning
+to a core. This matters: on the test laptop the TSC of CPU 0 is offset from the other cores by
+2.09 s, which is why the kernel rejected the TSC. Before each `nanosleep` a thread checks the
+TSC against `CLOCK_MONOTONIC` and resynchronizes if they diverge by more than 50 us. The
+selected clock is shown in the "Clock: ..." line at startup.
 
-**Отставание.** Если пакет уже опоздал, поток не спит и отправляет сразу. Опоздание (lateness)
-= фактическое время постановки в кольцо − время по расписанию. Оно попадает в гистограмму на
-потоке: p50, p99 и max за каждую секунду, а в итоге ещё p99.9. Что делать при большом
-отставании, задаёт `--lag-policy`:
+**Lag.** If a packet is already late, the thread does not sleep and sends it immediately.
+Lateness = actual time the frame is placed in the ring − scheduled time. It is recorded in a
+per-thread histogram: p50, p99 and max for each second, plus p99.9 in the summary. What to do
+on large lag is set by `--lag-policy`:
 
-- `catchup` (по умолчанию) — догонять: опоздавшие пакеты уходят подряд, пока поток не вернётся
-  в график. Абсолютные моменты сохраняются, но после затора будет всплеск.
-- `rebase` — если опоздание больше `--lag-threshold` (по умолчанию 10 мс), общая T0 сдвигается
-  вперёд на величину опоздания. Сдвиг общий для всех потоков (атомарная переменная без
-  блокировок), поэтому взаимное расположение потоков сохраняется. Интервалы между пакетами
-  остаются верными, а вся шкала «растягивается». Число сдвигов и итоговый сдвиг выводятся в
-  итоге.
+- `catchup` (default) — catch up: late packets are sent back to back until the thread is back
+  on schedule. Absolute times are preserved, but there will be a burst after a stall.
+- `rebase` — if lateness exceeds `--lag-threshold` (10 ms by default), the shared T0 is shifted
+  forward by the lateness. The shift is common to all threads (a lock-free atomic variable),
+  so the relative position of threads is preserved. Inter-packet intervals stay correct, and
+  the whole timeline is "stretched". The number of shifts and the total shift are printed in
+  the summary.
 
-### Проблемные тайм-стампы
+### Problematic timestamps
 
-| Проблема | Что делает afreplay |
+| Problem | What afreplay does |
 |---|---|
-| Немонотонные метки (склеенные или многоочередные захваты) | `--ts-order`: **`clamp`** (по умолчанию) заменяет метку «назад во времени» на предыдущую (точнее, на накопленный максимум). **`sort`** стабильно сортирует индекс по метке; данные не трогаются, сортируется только индекс внутри шарда (порядок между потоками и так задаёт шкала). **`asis`** отправляет как есть: пакет «назад во времени» уходит без ожидания и без учёта в lateness, такие пакеты считаются отдельно. В `--analyze` видно количество и максимальный скачок назад. |
-| Большие паузы | `--max-gap X` сжимает каждую паузу длиннее X до X. Паузы ищутся по упорядоченной шкале, так что это работает и с `asis`/`sort`. `--analyze` показывает топ-10 пауз с метками и номерами пакетов. |
-| Выбросы | Ищутся всегда: ts = 0, метки до 1990 года, метки в будущем (позже текущего времени + сутки) и кратковременный скачок часов. Скачком считается пакет (или серия до 16 пакетов), который ушёл дальше `--outlier-jump` (по умолчанию 60 с) от предыдущего нормального, после чего время вернулось. По умолчанию выбросы только показываются (`--ts-outliers report`) с предупреждением перед стартом. С `--ts-outliers exclude` они исключаются из шкалы: пакет получает метку соседнего нормального пакета и уходит рядом с ним. Если шкала с выбросами получается длиннее суток, тоже будет предупреждение. |
-| Ускорение сверх возможностей линка | До старта считаются пиковые скорости в окнах 1 мс, 10 мс и 1 с **с учётом множителя**, в двух вариантах: L2 и «на линии» (с преамбулой 8 Б, IFG 12 Б, FCS 4 Б и минимальным кадром 60 Б). Если пик на линии выше скорости линка (из ethtool, то есть из `/sys/class/net/<if>/speed`, или из `--link-speed`), выводится предупреждение. Пример: «на x10 пик за 1 мс — 38.42 Гбит/с (с преамбулой и IFG), это больше линка 25.00 Гбит/с; тайминг будет нарушен». |
-| Слишком мелкие интервалы | После множителя считается распределение интервалов между соседними пакетами **внутри шарда** (< 1 мкс, < 10 мкс, < 100 мкс). Доля интервалов короче `--timing-res` (по умолчанию 2 мкс) показывается как доля пакетов, которые фактически уйдут пачками. Если она не меньше 1%, выводится предупреждение. |
+| Non-monotonic timestamps (merged or multi-queue captures) | `--ts-order`: **`clamp`** (default) replaces a "backwards in time" timestamp with the previous one (more precisely, with the running maximum). **`sort`** stably sorts the index by timestamp; the data is untouched, only the index within a shard is sorted (order between threads is set by the timeline anyway). **`asis`** sends as is: a "backwards in time" packet is sent without waiting and without being counted in lateness; such packets are counted separately. `--analyze` shows the count and the largest backward jump. |
+| Long pauses | `--max-gap X` compresses every pause longer than X down to X. Pauses are found on the ordered timeline, so this also works with `asis`/`sort`. `--analyze` shows the top 10 pauses with timestamps and packet numbers. |
+| Outliers | Always detected: ts = 0, timestamps before 1990, timestamps in the future (later than the current time + one day), and a short clock spike. A spike is a packet (or a run of up to 16 packets) that jumped further than `--outlier-jump` (60 s by default) from the previous normal one, after which time returned. By default outliers are only reported (`--ts-outliers report`) with a warning before start. With `--ts-outliers exclude` they are excluded from the timeline: the packet gets the timestamp of a neighbouring normal packet and is sent next to it. If the timeline with outliers would be longer than a day, there is also a warning. |
+| Speedup beyond link capacity | Before start, peak rates in 1 ms, 10 ms and 1 s windows are computed **taking the multiplier into account**, in two variants: L2 and "on the wire" (with an 8 B preamble, 12 B IFG, 4 B FCS and a 60 B minimum frame). If the on-the-wire peak exceeds the link speed (from ethtool, i.e. from `/sys/class/net/<if>/speed`, or from `--link-speed`), a warning is printed. Example: "on x10 the 1 ms peak is 38.42 Gbit/s (with preamble and IFG), above the 25.00 Gbit/s link; timing will be violated". |
+| Intervals too small | After applying the multiplier, the distribution of intervals between adjacent packets **within a shard** is computed (< 1 us, < 10 us, < 100 us). The share of intervals shorter than `--timing-res` (2 us by default) is shown as the share of packets that will effectively be sent in batches. If it is at least 1%, a warning is printed. |
 
-## Зацикливание с модификацией
+## Looping with modification
 
-`--loop-mutate ip|port|ip,port`: на круге k > 0 кадры изменяются прямо в TX-кольце. mmap
-файла остаётся только для чтения. L2 (MAC, VLAN, MPLS) не меняется.
+`--loop-mutate ip|port|ip,port`: on lap k > 0 frames are modified directly in the TX ring. The
+file mmap stays read-only. L2 (MAC, VLAN, MPLS) is not changed.
 
-- **ip.** К каждому IPv4-адресу (и источнику, и получателю) прибавляется
-  `k × --mutate-ip-offset` (по умолчанию 0.1.0.0: 10.0.0.1 → 10.1.0.1 → 10.2.0.1).
-  У IPv6 сдвигается 32-битное слово в байтах 8–11 адреса (старшая часть идентификатора
-  интерфейса); префикс /64 остаётся прежним.
-- **port.** Порты не меньше 1024 сдвигаются на `k × --mutate-port-step` по кругу внутри
-  1024..65535. Порты сервисов (< 1024) не меняются, чтобы не ломать определение протоколов.
-  Порты меняются только у TCP и UDP и только у нефрагментированных пакетов: иначе первый
-  фрагмент разошёлся бы с остальными.
+- **ip.** `k × --mutate-ip-offset` is added to every IPv4 address (both source and destination)
+  (0.1.0.0 by default: 10.0.0.1 → 10.1.0.1 → 10.2.0.1). For IPv6 the 32-bit word in bytes 8–11
+  of the address (the high part of the interface identifier) is shifted; the /64 prefix stays
+  the same.
+- **port.** Ports of 1024 and above are shifted by `k × --mutate-port-step`, wrapping within
+  1024..65535. Service ports (< 1024) are not changed, so protocol detection is not broken.
+  Ports are changed only for TCP and UDP and only in unfragmented packets: otherwise the first
+  fragment would diverge from the rest.
 
-Преобразование детерминировано и одинаково для обеих сторон, поэтому A→B и B→A после сдвига
-остаются одной сессией (и попадают в тот же шард). Контрольные суммы пересчитываются
-инкрементально (RFC 1624, ур. 3): у IPv4 — сумма заголовка, у TCP, UDP и ICMPv6 — сумма с
-псевдозаголовком. UDP с нулевой суммой (IPv4) остаётся без суммы, вычисленный ноль
-записывается как 0xFFFF. У первого фрагмента L4-сумма тоже обновляется: она покрывает всю
-датаграмму, а псевдозаголовок меняется на ту же величину.
+The transformation is deterministic and identical for both sides, so A→B and B→A remain one
+session after the shift (and land in the same shard). Checksums are updated incrementally
+(RFC 1624, eq. 3): for IPv4 the header checksum, for TCP, UDP and ICMPv6 the checksum with the
+pseudo-header. UDP with a zero checksum (IPv4) stays without a checksum; a computed zero is
+written as 0xFFFF. For the first fragment the L4 checksum is updated as well: it covers the
+whole datagram, and the pseudo-header changes by the same amount.
 
-## Режим анализа
+## Analysis mode
 
-`--analyze` ничего не отправляет. Он печатает:
+`--analyze` sends nothing. It prints:
 
-- формат файла, число пакетов и байт, время построения индекса;
-- диапазон меток, длительность шкалы реплея (с учётом `--ts-order`, `--max-gap`, `--ts-outliers`);
-- среднюю и пиковую скорость в окнах 1 мс, 10 мс и 1 с (с учётом `--multiplier` или `--duration`);
-- распределение интервалов внутри шардов и долю, которая уйдёт пачками;
-- аномалии меток: число пакетов «назад во времени» и максимальный скачок назад, выбросы по
-  видам, топ-10 пауз;
-- состав трафика: IPv4, IPv6, не-IP (ARP, 802.3/LLC с STP, LLDP, прочие), VLAN, QinQ, MPLS,
-  PPPoE, IP-фрагменты;
-- пропущенные кадры по причинам и обрезанные при захвате;
-- распределение пакетов и байт по шардам и дисбаланс самого загруженного шарда.
+- file format, number of packets and bytes, index build time;
+- timestamp range, replay timeline duration (taking `--ts-order`, `--max-gap`, `--ts-outliers`
+  into account);
+- mean and peak rate in 1 ms, 10 ms and 1 s windows (taking `--multiplier` or `--duration` into
+  account);
+- the distribution of intervals within shards and the share that will be sent in batches;
+- timestamp anomalies: number of "backwards in time" packets and the largest backward jump,
+  outliers by kind, top 10 pauses;
+- traffic mix: IPv4, IPv6, non-IP (ARP, 802.3/LLC with STP, LLDP, other), VLAN, QinQ, MPLS,
+  PPPoE, IP fragments;
+- skipped frames by reason, and frames truncated at capture;
+- the distribution of packets and bytes across shards and the imbalance of the most loaded
+  shard.
 
-Шардов столько, сколько задано через `-t` (по умолчанию CPU − 1), поэтому распределение
-совпадает с тем, что будет при отправке с теми же опциями.
+There are as many shards as set by `-t` (CPU − 1 by default), so the distribution matches what
+sending with the same options will produce.
 
-## Входные файлы
+## Input files
 
-- Классический pcap: микро- и наносекундный, обе endianness. На pcapng программа выдаёт ошибку
-  с подсказкой `editcap -F pcap in.pcapng out.pcap` (для наносекунд — `-F nsecpcap`).
-- Linktype 1 (Ethernet); 101 и 12 (RAW IP, версия берётся из пакета), 228 (IPv4), 229 (IPv6).
-  Для RAW IP подставляется Ethernet-заголовок `--dmac`/`--smac` с ethertype 0x0800 или 0x86dd.
-- Пакет с caplen < origlen отправляется длиной caplen и учитывается в статистике.
-- Кадр длиннее MTU+14 пропускается и учитывается. Для кадра с внешним тегом 802.1Q (0x8100)
-  предел MTU+18. Ядро проверяет так же: исключение делается только для 0x8100, поэтому кадр
-  802.1ad той же длины ядро отвергло бы. Кадры короче 14 байт тоже пропускаются.
-- Если файл обрезан или повреждён посреди записи, будет предупреждение, а отправится всё, что
-  было до этого места.
+- Classic pcap: microsecond and nanosecond, both endiannesses. For pcapng the program reports
+  an error with the hint `editcap -F pcap in.pcapng out.pcap` (for nanoseconds, `-F nsecpcap`).
+- Linktype 1 (Ethernet); 101 and 12 (RAW IP, the version is taken from the packet), 228 (IPv4),
+  229 (IPv6). For RAW IP an Ethernet header `--dmac`/`--smac` with ethertype 0x0800 or 0x86dd
+  is prepended.
+- A packet with caplen < origlen is sent with length caplen and counted in the statistics.
+- A frame longer than MTU+14 is skipped and counted. For a frame with an outer 802.1Q tag
+  (0x8100) the limit is MTU+18. The kernel checks the same way: the exception is made only for
+  0x8100, so an 802.1ad frame of the same length would be rejected by the kernel. Frames shorter
+  than 14 bytes are skipped too.
+- If the file is truncated or corrupted in the middle of a record, there will be a warning, and
+  everything up to that point is sent.
 
-## Статистика
+## Statistics
 
-Раз в секунду печатается строка:
+Once a second a line is printed:
 
 ```
-[    3.0 с]    3.590 Гбит/с    0.499 Mpps | ушло (sysfs) 0.499 Mpps, tx_dropped +0 | ENOBUFS +0 EAGAIN +0 | опоздание p50 1.28 мкс p99 20.48 мкс max 425.98 мкс | pcap +3.000 с из 9.387 с
+[    3.0 s]    3.590 Gbit/s    0.499 Mpps | sent (sysfs) 0.499 Mpps, tx_dropped +0 | ENOBUFS +0 EAGAIN +0 | lateness p50 1.28 us p99 20.48 us max 425.98 us | pcap +3.000 s of 9.387 s
 ```
 
-- **Гбит/с, Mpps** — сколько кадров поставлено в кольцо и отдано ядру (`send()`).
-- **ушло (sysfs)** — прирост `/sys/class/net/<if>/statistics/tx_packets`; **tx_dropped** —
-  прирост `tx_dropped`. Это счётчики всего интерфейса, другой трафик в них тоже попадает.
-- **ENOBUFS / EAGAIN** — сколько раз `send()` вернул эти ошибки (см. ниже).
-- **опоздание p50/p99/max** — lateness за секунду (только в режиме по тайм-стампам). Квантили
-  берутся из лог-линейной гистограммы, точность ±12.5%. Максимум за весь прогон в итоге точный.
-- **pcap +X с из Y** — позиция на шкале pcap у самого отстающего потока; при `--loop` ещё номер
-  круга.
+- **Gbit/s, Mpps** — how many frames were placed in the ring and handed to the kernel
+  (`send()`).
+- **sent (sysfs)** — the increment of `/sys/class/net/<if>/statistics/tx_packets`;
+  **tx_dropped** — the increment of `tx_dropped`. These are whole-interface counters, so other
+  traffic is included too.
+- **ENOBUFS / EAGAIN** — how many times `send()` returned these errors (see below).
+- **lateness p50/p99/max** — lateness over the second (timestamp mode only). Quantiles come
+  from a log-linear histogram with ±12.5% accuracy. The maximum over the whole run in the
+  summary is exact.
+- **pcap +X s of Y** — the position on the pcap timeline of the slowest thread; with `--loop`
+  also the lap number.
 
-В конце выводится итог: всего пакетов и байт, средняя скорость, разница с sysfs, число
-`send()` и среднее число кадров на вызов, ENOBUFS и EAGAIN, пропущенные кадры, lateness p50,
-p99, p99.9 и max, сдвиги T0 (rebase) и разбивка по потокам. По SIGINT/SIGTERM итог тоже
-печатается, код выхода 0.
+At the end a summary is printed: total packets and bytes, mean rate, difference from sysfs,
+number of `send()` calls and mean frames per call, ENOBUFS and EAGAIN, skipped frames, lateness
+p50, p99, p99.9 and max, T0 shifts (rebase) and a per-thread breakdown. On SIGINT/SIGTERM the
+summary is printed too, with exit code 0.
 
-`--stats-json FILE` пишет то же в JSON: шапку (файл, режим, множитель, потоки, длительность
-шкалы и круга), массив `intervals` (по записи в секунду; файл дописывается по мере работы) и
-`summary` с разбивкой по потокам.
+`--stats-json FILE` writes the same in JSON: a header (file, mode, multiplier, threads,
+timeline and lap duration), an `intervals` array (one entry per second; the file is appended to
+while running) and a `summary` with a per-thread breakdown.
 
-Коды выхода: 0 — успех или остановка по сигналу, 1 — ошибка выполнения, 2 — ошибка в аргументах.
+Exit codes: 0 — success or stopped by signal, 1 — runtime error, 2 — argument error.
 
-### Как понимать ENOBUFS
+### Interpreting ENOBUFS
 
-`send()` возвращает `ENOBUFS`, когда qdisc или очередь драйвера не приняла очередной кадр. На
-современных ядрах (проверялось на 6.19) **сам кадр при этом не теряется**: ядро возвращает его
-в кольцо со статусом `SEND_REQUEST`, а `send()` останавливается на нём. afreplay повторяет
-`send()`, и кадр уходит со следующей попытки. Поэтому ENOBUFS означает обратное давление
-(«линк или очередь не успевают»), а не число потерь. Большое значение ENOBUFS при
-`--topspeed` нормально.
+`send()` returns `ENOBUFS` when the qdisc or the driver queue did not accept the next frame. On
+modern kernels (checked on 6.19) **the frame itself is not lost**: the kernel returns it to the
+ring with status `SEND_REQUEST`, and `send()` stops at it. afreplay repeats `send()`, and the
+frame goes out on the next attempt. So ENOBUFS signals backpressure ("the link or the queue
+cannot keep up"), not a loss count. A large ENOBUFS value with `--topspeed` is normal.
 
-Проверка на veth с tbf-qdisc (20 Мбит/с, 2 потока): 219 515 ENOBUFS, но из 6000 кадров
-потеряно 211.
+If ENOBUFS is high with `--mbps`, the requested rate is above what the link can carry on the
+wire. Each ENOBUFS triggers a short backoff (see "How it works"), so CPU usage stays reasonable,
+but the cleaner fix is `--mbps line` or `--mbps 99%`.
 
-**Реальные потери** нужно смотреть в разнице между «отправлено в ядро» и `tx_packets` в sysfs,
-а также в `tx_dropped` и `tc -s qdisc show dev <if>`. Не каждая потеря сопровождается
-ENOBUFS: в эксперименте выше 211 кадров отброшены qdisc без ошибки в `send()`. Похоже, это
-путь, где skb при конкуренции за qdisc ставится в отложенную очередь, а `send()` уже вернул
-успех. Это вывод по исходникам ядра, отдельно не подтверждён.
+Test on veth with a tbf qdisc (20 Mbit/s, 2 threads): 219 515 ENOBUFS, but 211 of 6000 frames
+were lost.
 
-С `--qdisc-bypass` кадр идёт прямо в драйвер. Если очередь драйвера остановлена, ядро
-увеличивает `tx_dropped` и возвращает ENOBUFS, но кадр в кольце так же возвращается в
-`SEND_REQUEST` и уходит повторно. Значит, при bypass `tx_dropped` может **завышать** потери:
-он считает попытки, а не кадры. На veth это воспроизвести не удалось (veth не останавливает
-очередь); вывод сделан по исходникам ядра 6.x. На реальной карте ориентируйтесь на разницу
-отправленного и `tx_packets`, а также на счётчики карты (`ethtool -S`).
+**Real losses** should be read from the difference between "handed to the kernel" and
+`tx_packets` in sysfs, as well as from `tx_dropped` and `tc -s qdisc show dev <if>`. Not every
+loss comes with ENOBUFS: in the experiment above 211 frames were dropped by the qdisc without
+an error from `send()`. This appears to be the path where, under qdisc contention, the skb is
+put on a deferred queue while `send()` has already returned success. This conclusion is drawn
+from the kernel sources and has not been confirmed separately.
 
-`EAGAIN` значит, что исчерпан буфер отправки сокета (`SO_SNDBUF`). afreplay пытается выставить
-его по размеру кольца через `SO_SNDBUFFORCE`, а без `CAP_NET_ADMIN` упирается в
-`net.core.wmem_max`. Частые EAGAIN — повод увеличить `wmem_max` или запустить от root.
+With `--qdisc-bypass` the frame goes straight to the driver. If the driver queue is stopped,
+the kernel increments `tx_dropped` and returns ENOBUFS, but the frame in the ring is likewise
+returned to `SEND_REQUEST` and resent. So with bypass `tx_dropped` may **overstate** losses: it
+counts attempts, not frames. This could not be reproduced on veth (veth does not stop its
+queue); the conclusion is drawn from the 6.x kernel sources. On a real NIC, rely on the
+difference between sent and `tx_packets`, and on the NIC counters (`ethtool -S`).
 
-### Как понимать lateness
+`EAGAIN` means the socket send buffer (`SO_SNDBUF`) is exhausted. afreplay tries to size it to
+the ring via `SO_SNDBUFFORCE`, and without `CAP_NET_ADMIN` is capped by `net.core.wmem_max`.
+Frequent EAGAIN is a reason to raise `wmem_max` or run as root.
 
-Lateness — насколько позже расписания кадр поставлен в кольцо. Это задержка отправителя: сюда
-не входит время в qdisc, драйвере и на линии.
+### Interpreting lateness
 
-- **p50 в единицах микросекунд** — норма.
-- **Высокий p99 при низком p50** — редкие задержки: вытеснение потока планировщиком, позднее
-  пробуждение из глубокого C-state, прерывания на том же ядре. Помогают: больше `--spin-us`
-  (busy-spin перекрывает промах `nanosleep`), выделенные ядра (`isolcpus`, `nohz_full`), запрет
-  глубоких C-states (`cpupower idle-set -D 10`, `tuned-adm profile network-latency`), запуск с
-  реальным приоритетом (`chrt -f 50 afreplay ...`; потоки наследуют политику).
-- **Растущий p50 и позиция pcap, отстающая от реального времени** — поток не тянет скорость:
-  пик выше линка (см. предупреждения до старта), не хватает ядер (увеличьте `-t`), диск не
-  успевает (`--preload`), ядро не успевает (ENOBUFS растёт). При `catchup` поток потом
-  «выстрелит» накопленным, при `rebase` шкала сдвинется.
+Lateness is how much later than scheduled a frame was placed in the ring. This is sender-side
+delay: time in the qdisc, the driver and on the wire is not included.
 
-На тестовом ноутбуке (Ryzen 5 7535HS, clocksource hpet) `nanosleep` изредка просыпается на 1–4
-мс позже. Функциональный тест показал, что lateness, которую сообщает afreplay, совпадает с
-ошибкой интервалов, измеренной на приёме, с точностью до единиц микросекунд. Так что метрика
-честная.
+- **p50 in single-digit microseconds** — normal.
+- **High p99 with low p50** — rare delays: thread preemption by the scheduler, late wakeup from
+  a deep C-state, interrupts on the same core. What helps: a larger `--spin-us` (busy-spin
+  covers `nanosleep` misses), dedicated cores (`isolcpus`, `nohz_full`), disabling deep
+  C-states (`cpupower idle-set -D 10`, `tuned-adm profile network-latency`), running with
+  real-time priority (`chrt -f 50 afreplay ...`; threads inherit the policy).
+- **Growing p50 and a pcap position falling behind real time** — the thread cannot sustain the
+  rate: the peak exceeds the link (see the warnings before start), not enough cores (increase
+  `-t`), the disk cannot keep up (`--preload`), the kernel cannot keep up (ENOBUFS grows). With
+  `catchup` the thread will later "fire" the backlog; with `rebase` the timeline will shift.
 
-## Тесты
+On the test laptop (Ryzen 5 7535HS, clocksource hpet) `nanosleep` occasionally wakes up 1–4 ms
+late. The functional test showed that the lateness reported by afreplay matches the interval
+error measured at the receiver to within a few microseconds. So the metric is honest.
 
-- `make unit-test` — юнит-тесты (`tests/test_*.c`):
-  - **парсер**: us и ns, LE и BE, обрезанный файл (в данных и в заголовке записи), «безумный»
-    caplen, pcapng, неизвестные сигнатуры и linktype, биты FCS в linktype, построение индекса и
-    причины пропуска;
-  - **хеш**: симметрия A→B/B→A для IPv4, VLAN (с разным VLAN ID в двух направлениях), QinQ,
-    MPLS, IPv6, IPv6 с заголовком расширения, PPPoE; фрагменты IPv4 и IPv6 в одном шарде;
-    не-IP в отдельном шарде; RAW IP; равномерность распределения; пределы MTU;
-  - **расписание** как чистая функция: clamp, asis, sort, max-gap (в том числе на немонотонной
-    шкале), выбросы (ts=0, до 1990, будущее, скачок часов, настоящий долгий скачок), пропуски,
-    формула `t_send` при разных множителях и кругах, длина круга, стабильность сортировки,
-    пики скорости, гистограмма;
-  - **модификация**: пример из RFC 1624, IPv4 TCP/UDP с VLAN и без, сравнение с полным
-    пересчётом сумм, UDP без суммы, перенос через 65535 и через октет, симметрия,
-    фрагменты, IPv6, только порты, не-IP.
-- `tests/gen_pcaps.py` — генератор тестовых pcap без сторонних модулей: смесь L2 (ARP, STP,
-  LLDP, VLAN, QinQ, MPLS и псевдопровод, PPPoE, IPv6 с заголовками расширения, фрагменты,
-  сессии в обе стороны, обрезанный кадр, кадр больше MTU, кадры ровно MTU+14 и MTU+18), её же
-  в ns/BE, RAW IP, файлы с аномалиями (скачки назад, большие паузы, ts = 0 и будущее, скачок
-  часов), файл для тайминга, обрезанный файл и pcapng.
-- `make func-test` (или `tests/func_veth.sh`) — функциональные тесты на паре veth в отдельном
-  network namespace. Без root используется `unshare -rn` (user namespace), поэтому root не
-  нужен. Если user namespaces отключены и root нет, тесты пропускаются. Что проверяется:
-  - все кадры дошли **байт в байт**; VLAN-тег, который снимает ядро на приёме, возвращается по
-    `PACKET_AUXDATA`; лишних кадров нет; порядок внутри сессий сохранён (режимы `--pps`,
-    `--topspeed --qdisc-bypass`, `--mbps --ts-order sort`, RAW IP);
-  - интервалы при **x1, x2 и x0.5**, захват с наносекундными метками (`SO_TIMESTAMPNS`): p95
-    ошибки < 100 мкс, общая длительность ±0.2%; редкий большой выброс допускается, только если
-    afreplay сам сообщил такое же опоздание;
-  - `--duration`, `--max-gap`, `--loop` (общая шкала кругов), `--ts-outliers exclude`,
+## Tests
+
+- `make unit-test` — unit tests (`tests/test_*.c`):
+  - **parser**: us and ns, LE and BE, truncated file (in the data and in the record header),
+    "insane" caplen, pcapng, unknown magic numbers and linktypes, FCS bits in the linktype,
+    index building and skip reasons;
+  - **hash**: A→B/B→A symmetry for IPv4, VLAN (with different VLAN IDs in the two
+    directions), QinQ, MPLS, IPv6, IPv6 with an extension header, PPPoE; IPv4 and IPv6
+    fragments in the same shard; non-IP in a separate shard; RAW IP; distribution uniformity;
+    MTU limits;
+  - **schedule** as a pure function: clamp, asis, sort, max-gap (including on a non-monotonic
+    timeline), outliers (ts=0, before 1990, future, clock spike, a genuine long jump), gaps,
+    the `t_send` formula with different multipliers and laps, lap length, sort stability, rate
+    peaks, histogram;
+  - **modification**: the RFC 1624 example, IPv4 TCP/UDP with and without VLAN, comparison with
+    full checksum recomputation, UDP without a checksum, carry across 65535 and across an
+    octet, symmetry, fragments, IPv6, ports only, non-IP.
+- `tests/gen_pcaps.py` — a test pcap generator without third-party modules: an L2 mix (ARP,
+  STP, LLDP, VLAN, QinQ, MPLS and pseudowire, PPPoE, IPv6 with extension headers, fragments,
+  sessions in both directions, a truncated frame, a frame larger than MTU, frames of exactly
+  MTU+14 and MTU+18), the same mix in ns/BE, RAW IP, files with anomalies (backward jumps, long
+  pauses, ts = 0 and future, clock spike), a timing file, a truncated file and a pcapng.
+- `make func-test` (or `tests/func_veth.sh`) — functional tests on a veth pair in a separate
+  network namespace. Without root `unshare -rn` (user namespace) is used, so root is not
+  required. If user namespaces are disabled and there is no root, the tests are skipped. What
+  is checked:
+  - all frames arrived **byte for byte**; the VLAN tag stripped by the kernel on receive is
+    restored from `PACKET_AUXDATA`; there are no extra frames; order within sessions is
+    preserved (modes `--pps`, `--topspeed --qdisc-bypass`, `--mbps --ts-order sort`, RAW IP);
+  - intervals at **x1, x2 and x0.5**, captured with nanosecond timestamps (`SO_TIMESTAMPNS`):
+    p95 error < 100 us, total duration ±0.2%; a rare large outlier is allowed only if afreplay
+    itself reported the same lateness;
+  - `--duration`, `--max-gap`, `--loop` (common timeline across laps), `--ts-outliers exclude`,
     `--ts-order sort/clamp/asis`;
-  - `--loop-mutate`: круг 0 не изменён, на остальных кругах изменены все IP-кадры, суммы верны,
-    не-IP и MAC не тронуты;
-  - CLI: pcapng (код 1 и подсказка), неизвестная опция (код 2), `--help`, несуществующий
-    интерфейс, SIGINT при `--loop 0` (итог и код 0), обрезанный файл.
+  - `--loop-mutate`: lap 0 is unchanged, on the other laps all IP frames are changed, checksums
+    are correct, non-IP and MAC are untouched;
+  - CLI: pcapng (code 1 and hint), unknown option (code 2), `--help`, nonexistent interface,
+    SIGINT with `--loop 0` (summary and code 0), truncated file.
 
-  Допуски тайминга настраиваются: `tests/func_veth.sh build/pcaps --tol-p95-us 200 --spin-us 3000`.
-- `tests/gen_big.py out.pcap 4` — большой синтетический файл (4 ГБ) для замеров производительности.
+  Timing tolerances are configurable: `tests/func_veth.sh build/pcaps --tol-p95-us 200 --spin-us 3000`.
+- `tests/gen_big.py out.pcap 4` — a large synthetic file (4 GB) for performance measurements.
 
-## Результаты на тестовой машине
+## Results on the test machine
 
-Ноутбук, Ryzen 5 7535HS (12 потоков), veth в netns. На veth тот же CPU ещё и принимает кадры,
-так что на реальной карте цифры будут другими.
+Laptop, Ryzen 5 7535HS (12 threads), veth in a netns. On veth the same CPU also receives the
+frames, so the numbers on a real NIC will differ.
 
-| Что | Результат |
+| What | Result |
 |---|---|
-| Индекс 4.2 ГБ, 4.7 млн пакетов (файл в page cache) | 0.69 с |
-| `--topspeed --qdisc-bypass`, 1 / 4 / 8 потоков | 4.4 / 12.8 / 24.2 Гбит/с (0.61 / 1.78 / 3.36 Mpps) |
-| `--mbps 5000` | 5.000 Гбит/с |
+| Index of 4.2 GB, 4.7 million packets (file in page cache) | 0.69 s |
+| `--topspeed --qdisc-bypass`, 1 / 4 / 8 threads | 4.4 / 12.8 / 24.2 Gbit/s (0.61 / 1.78 / 3.36 Mpps) |
+| `--mbps 5000` | 5.000 Gbit/s |
 | `--pps 300000` | 0.300 Mpps |
-| x1, 0.5 Mpps, 4 потока | lateness p50 14 нс, p99 13 мкс |
+| x1, 0.5 Mpps, 4 threads | lateness p50 14 ns, p99 13 us |
 
-## Известные ограничения
+Real NIC (mendel17, 25G, 11 threads, `--mbps 32000 --qdisc-bypass --preload`, 53.7 GB file):
+24.3-24.4 Gbit/s L2, about 25.0 Gbit/s on the wire (line rate), 3.3 Mpps, `tx_dropped` 0, the
+receiving sensor saw 25 Gbps with 0 RX drops. That run requested more than the link and showed
+about 1.2 M ENOBUFS/s with all threads at 100% CPU; it predates the ENOBUFS backoff and
+`--mbps line`.
 
-- Порядок сохраняется **внутри сессии**: все её пакеты идут через один поток. Порядок между
-  разными сессиями задаёт только шкала времени. При `--topspeed`, `--mbps` и `--pps` пакеты
-  разных потоков перемешиваются, а у не-IP кадров свой поток.
-- Шардирование по сессиям даёт неравные шарды: одна «слоновья» сессия упирается в скорость
-  одного ядра. Дисбаланс видно в `--analyze`.
-- Пакеты одной сессии, у которой часть пакетов фрагментирована, а часть нет, могут оказаться в
-  разных потоках (у фрагментов порты не учитываются).
-- Туннели (GRE, VXLAN, IP-in-IP) хешируются и модифицируются по внешнему заголовку. Заголовки
-  внутри ICMP-ошибок при `--loop-mutate` не меняются. SCTP, DCCP и UDP-Lite при
-  `--loop-mutate=port` не трогаются (у SCTP CRC32c, инкрементально её не обновить).
-- При модификации MPLS-псевдопровода с внутренним Ethernet меняется внутренний IP; MAC и
-  метки остаются прежними.
-- Размер кадра TX_RING выбирается по MTU интерфейса. Кадры длиннее MTU+14 (MTU+18 с 802.1Q)
-  пропускаются: на линию их без смены MTU не отправить.
-- `--mbps` считает L2-байты без FCS, преамбулы и IFG. Скорость «на линии» выше примерно на
-  24 байта на кадр.
-- Пиковая скорость в окне 1 с для файла короче секунды (после множителя) — это весь объём,
-  делённый на секунду. Отчёт это помечает.
-- Квантили lateness за секунду имеют погрешность ±12.5% (лог-линейная гистограмма).
-- Когда поток отстаёт, время повторно не читается, пока очередной пакет не окажется в будущем.
-  Lateness таких пакетов занижена не больше чем на длительность одной пачки.
-- Если включён `PACKET_LOSS`, ядро молча пропускает кадр с неверным форматом. Без него такой
-  кадр останавливает поток с ошибкой (кадр оставался бы в кольце навсегда). Благодаря
-  предфильтру по длине это практически не встречается.
-- Статистика sysfs — это счётчики всего интерфейса, а не только трафик afreplay. Внутри
-  network namespace без своего смонтированного sysfs она недоступна, о чём программа сообщит.
-- Нужен Linux. Часы TSC работают только на x86; на остальных архитектурах используется
+## Known limitations
+
+- Order is preserved **within a session**: all its packets go through one thread. Order
+  between different sessions is set only by the timeline. With `--topspeed`, `--mbps` and
+  `--pps` packets of different threads are interleaved, and non-IP frames have their own
+  thread.
+- Sharding by session yields unequal shards: a single "elephant" session is capped by the speed
+  of one core. The imbalance is visible in `--analyze`.
+- Packets of one session in which some packets are fragmented and others are not may end up in
+  different threads (ports are not used for fragments).
+- Tunnels (GRE, VXLAN, IP-in-IP) are hashed and modified by the outer header. Headers inside
+  ICMP errors are not changed by `--loop-mutate`. SCTP, DCCP and UDP-Lite are not touched by
+  `--loop-mutate=port` (SCTP uses CRC32c, which cannot be updated incrementally).
+- When modifying an MPLS pseudowire with inner Ethernet, the inner IP is changed; MAC and
+  labels stay the same.
+- Frames longer than MTU+14 (MTU+18
+  with 802.1Q) are skipped: they cannot be put on the wire without changing the MTU.
+- `--mbps` counts L2 bytes without FCS, preamble and IFG. The on-the-wire rate is higher by
+  about 24 bytes per frame.
+- The peak rate in the 1 s window for a file shorter than a second (after the multiplier) is
+  the whole volume divided by one second. The report marks this.
+- Per-second lateness quantiles have ±12.5% error (log-linear histogram).
+- When a thread is lagging, the time is not re-read until the next packet is in the future.
+  The lateness of such packets is understated by at most the duration of one batch.
+- With `PACKET_LOSS` enabled, the kernel silently skips a malformed frame. Without it, such a
+  frame stops the thread with an error (the frame would otherwise stay in the ring forever).
+  Thanks to the length pre-filter this practically never happens.
+- sysfs statistics are whole-interface counters, not just afreplay traffic. Inside a network
+  namespace without its own mounted sysfs they are unavailable, and the program reports this.
+- Linux is required. The TSC clock works only on x86; other architectures use
   `CLOCK_MONOTONIC`.
 
-## Структура исходников
+## Source layout
 
 ```
-src/pcap.[ch]      разбор pcap, mmap, preload
-src/dissect.[ch]   разбор L2/L3/L4, симметричный хеш
-src/index.[ch]     индекс: последовательный проход + параллельное хеширование
-src/sched.[ch]     нормализация шкалы, t_send, профиль скорости, гистограмма (чистые функции)
-src/clock.[ch]     быстрые часы (TSC или CLOCK_MONOTONIC)
-src/worker.[ch]    поток отправки: TX_RING, горячий цикл, ожидание, пачки
-src/mutate.[ch]    --loop-mutate и инкрементальные контрольные суммы
-src/replay.c       запуск потоков, барьер и T0, статистика, JSON, сигналы
-src/report.c       отчёт --analyze и предупреждения перед стартом
-src/cli.[ch]       опции и --help
-src/main.c         подготовка: CPU, MTU, файл, индекс, шкала, профиль
-tests/             юнит-тесты, генератор pcap, функциональные тесты на veth
+src/pcap.[ch]      pcap parsing, mmap, preload
+src/dissect.[ch]   L2/L3/L4 parsing, symmetric hash
+src/index.[ch]     index: sequential pass + parallel hashing
+src/sched.[ch]     timeline normalization, t_send, rate profile, histogram (pure functions)
+src/clock.[ch]     fast clock (TSC or CLOCK_MONOTONIC)
+src/worker.[ch]    sender thread: TX_RING, hot loop, waiting, batches
+src/mutate.[ch]    --loop-mutate and incremental checksums
+src/replay.c       thread startup, barrier and T0, statistics, JSON, signals
+src/report.c       --analyze report and pre-start warnings
+src/cli.[ch]       options and --help
+src/main.c         setup: CPU, MTU, file, index, timeline, profile
+tests/             unit tests, pcap generator, functional tests on veth
 ```

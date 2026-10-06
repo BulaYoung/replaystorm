@@ -47,7 +47,7 @@ static void orders(void)
 		CHECK(!r.monotone);
 	}
 	{
-		/* sort: точка отсчёта — минимум, даже если он не первый */
+		/* sort: the origin is the minimum, even if it is not first */
 		int64_t ts[] = {T0 + 10, T0, T0 + 30};
 		c = cfg_of(TS_ORDER_SORT, 0);
 		afr_ts_normalize(ts, NULL, 3, &c, &r);
@@ -56,7 +56,7 @@ static void orders(void)
 		CHECK_EQ(r.duration, 30);
 	}
 	{
-		/* asis: первый по файлу — точка отсчёта, более ранние уходят в минус */
+		/* asis: the first in file order is the origin, earlier ones go negative */
 		int64_t ts[] = {T0 + 10, T0, T0 + 30};
 		c = cfg_of(TS_ORDER_ASIS, 0);
 		afr_ts_normalize(ts, NULL, 3, &c, &r);
@@ -81,7 +81,7 @@ static void max_gap(void)
 		CHECK_EQ(r.duration, 16);
 	}
 	{
-		/* Немонотонный случай: паузы считаются по отсортированной шкале */
+		/* Non-monotonic case: gaps are computed on the sorted timeline */
 		int64_t ts[] = {T0, T0 + 100, T0 + 50, T0 + 101};
 		c.order = TS_ORDER_ASIS;
 		afr_ts_normalize(ts, NULL, 4, &c, &r);
@@ -90,7 +90,7 @@ static void max_gap(void)
 		CHECK_EQ(r.gap_removed, 80);
 	}
 	{
-		/* Пауза ровно max_gap не сжимается */
+		/* A gap of exactly max_gap is not compressed */
 		int64_t ts[] = {T0, T0 + 10, T0 + 20};
 		c.order = TS_ORDER_CLAMP;
 		afr_ts_normalize(ts, NULL, 3, &c, &r);
@@ -118,13 +118,13 @@ static void outliers(void)
 	c.exclude_outliers = 1;
 	afr_ts_normalize(ts, NULL, 7, &c, &r);
 	CHECK(r.excluded);
-	/* выбросы получают метку соседа, ведущий — первую нормальную */
+	/* outliers get their neighbour's timestamp, leading ones get the first normal one */
 	int64_t e[] = {0, 0, 1000, 1000, 3000, 3000, 5000};
 	check_arr(ts, e, 7);
 	CHECK_EQ(r.duration, 5000);
 	CHECK_EQ(r.backward, 0);
 
-	/* Кратковременный скачок часов на час вперёд */
+	/* Short-lived clock jump one hour forward */
 	int64_t s[] = {T0, T0 + 1000, T0 + 3600 * NS_PER_SEC, T0 + 3600 * NS_PER_SEC + 1, T0 + 2000,
 	               T0 + 3000};
 	afr_ts_normalize(s, NULL, 6, &c, &r);
@@ -132,7 +132,7 @@ static void outliers(void)
 	int64_t es[] = {0, 1000, 1000, 1000, 2000, 3000};
 	check_arr(s, es, 6);
 
-	/* Настоящий долгий скачок (без возврата) — не выброс */
+	/* A real long jump (no return) is not an outlier */
 	int64_t j[] = {T0, T0 + 1000, T0 + 3600 * NS_PER_SEC, T0 + 3600 * NS_PER_SEC + 1000};
 	afr_ts_normalize(j, NULL, 4, &c, &r);
 	CHECK_EQ(r.outl_spike, 0);
@@ -155,23 +155,23 @@ static void skips(void)
 
 static void targets(void)
 {
-	/* t_send = T0 + (круг * длина_круга + ts) / множитель */
+	/* t_send = T0 + (lap * lap_len + ts) / multiplier */
 	CHECK_EQ(afr_target(1000, 0, 100, 10, 1.0), 1010);
 	CHECK_EQ(afr_target(1000, 0, 100, 10, 0.5), 1005);  /* x2 */
 	CHECK_EQ(afr_target(1000, 0, 100, 10, 2.0), 1020);  /* x0.5 */
-	CHECK_EQ(afr_target(1000, 2, 100, 10, 0.5), 1105);  /* третий круг, x2 */
-	/* Большие значения: сутки шкалы, точность до наносекунды */
+	CHECK_EQ(afr_target(1000, 2, 100, 10, 0.5), 1105);  /* third lap, x2 */
+	/* Large values: a day-long timeline, nanosecond precision */
 	int64_t day = 86400LL * NS_PER_SEC;
 	CHECK_EQ(afr_target(0, 3, day, 123456789, 1.0), 3 * day + 123456789);
-	/* Длина круга = длительность + средний интервал */
+	/* Lap length = duration + mean interval */
 	ts_result_t r;
 	ts_cfg_t c = cfg_of(TS_ORDER_CLAMP, 0);
 	int64_t ts[] = {T0, T0 + 10, T0 + 20, T0 + 30};
 	afr_ts_normalize(ts, NULL, 4, &c, &r);
 	CHECK_EQ(r.duration, 30);
 	CHECK_EQ(r.lap_len, 40);
-	/* Шкала второго круга продолжает первую: последний пакет круга 0
-	 * раньше первого пакета круга 1 */
+	/* The second lap timeline continues the first: the last packet of lap 0
+	 * is earlier than the first packet of lap 1 */
 	CHECK(afr_target(0, 0, r.lap_len, ts[3], 1.0) < afr_target(0, 1, r.lap_len, ts[0], 1.0));
 }
 
@@ -188,7 +188,7 @@ static void radix(void)
 		if (a[i - 1].key > a[i].key)
 			ok = 0;
 		if (a[i - 1].key == a[i].key && a[i - 1].val > a[i].val)
-			ok = 0; /* стабильность */
+			ok = 0; /* stability */
 	}
 	CHECK(ok);
 	free(a);
@@ -197,7 +197,7 @@ static void radix(void)
 
 static void rate(void)
 {
-	/* 10 кадров по 1000 байт в пределах 1 мс, затем пауза 1 с */
+	/* 10 frames of 1000 bytes within 1 ms, then a 1 s gap */
 	int64_t t[11];
 	uint64_t ol[11];
 	uint16_t sh[11];
@@ -213,20 +213,20 @@ static void rate(void)
 	rate_result_t r;
 	CHECK_EQ(afr_rate_profile(t, ol, sh, 11, 1, &c, &r), 0);
 	CHECK_EQ(r.pkts, 11);
-	CHECK_EQ((int64_t)r.peak_bps[0], 80000000);         /* 10*1000*8 бит / 1 мс */
-	CHECK_EQ((int64_t)r.peak_l1_bps[0], 81920000);      /* (1000+24)*8*10 / 1 мс */
-	CHECK_EQ((int64_t)r.peak_bps[2], 80000);            /* окно 1 с */
-	CHECK_EQ(r.gaps_total, 9);                          /* шард 1 из одного пакета */
+	CHECK_EQ((int64_t)r.peak_bps[0], 80000000);         /* 10*1000*8 bits / 1 ms */
+	CHECK_EQ((int64_t)r.peak_l1_bps[0], 81920000);      /* (1000+24)*8*10 / 1 ms */
+	CHECK_EQ((int64_t)r.peak_bps[2], 80000);            /* 1 s window */
+	CHECK_EQ(r.gaps_total, 9);                          /* shard 1 has a single packet */
 	CHECK_EQ(r.gaps_below_res, 0);
 	CHECK_EQ(r.gaps_lt[2], 0);
-	/* x100: интервалы 1 мкс < 2 мкс, пик за 1 мс вырастает */
+	/* x100: intervals 1 us < 2 us, the 1 ms peak grows */
 	c.mult = 100;
 	CHECK_EQ(afr_rate_profile(t, ol, sh, 11, 1, &c, &r), 0);
 	CHECK_EQ(r.gaps_below_res, 9);
 	CHECK_EQ(r.gaps_lt[1], 9);
 	CHECK_EQ((int64_t)r.peak_bps[0], 80000000);
-	CHECK_EQ((int64_t)r.peak_bps[2], 88000); /* окно 1 с = 100 с шкалы, все 11 кадров */
-	/* Немонотонный порядок даёт тот же результат */
+	CHECK_EQ((int64_t)r.peak_bps[2], 88000); /* 1 s window = 100 s of timeline, all 11 frames */
+	/* Non-monotonic order gives the same result */
 	int64_t t2[11];
 	uint64_t ol2[11];
 	uint16_t sh2[11];

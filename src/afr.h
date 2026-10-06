@@ -1,6 +1,6 @@
 /*
- * afreplay — многопоточный реплеер pcap через AF_PACKET.
- * Общие определения.
+ * afreplay - multithreaded pcap replayer over AF_PACKET.
+ * Common definitions.
  */
 #ifndef AFR_H
 #define AFR_H
@@ -21,25 +21,25 @@
 #define NS_PER_MS 1000000LL
 #define NS_PER_US 1000LL
 
-/* Смещение в файле (48 бит) и длина кадра (16 бит) упакованы в одно слово. */
+/* File offset (48 bits) and frame length (16 bits) packed into one word. */
 #define OFFLEN_MAKE(off, len) (((uint64_t)(len) << 48) | ((uint64_t)(off) & 0xFFFFFFFFFFFFULL))
 #define OFFLEN_OFF(v) ((v) & 0xFFFFFFFFFFFFULL)
 #define OFFLEN_LEN(v) ((uint32_t)((v) >> 48))
 
-/* Запись индекса шарда: 16 байт. ts — время по шкале расписания (нс от начала). */
+/* Shard index entry: 16 bytes. ts is the time on the schedule timeline (ns from start). */
 typedef struct {
 	int64_t ts;
 	uint64_t offlen;
 } pkt_t;
 
-/* Специальные значения номера шарда в глобальном индексе. */
+/* Special shard number values in the global index. */
 #define SHARD_SKIP 0xFFFFu
 
-/* Причины пропуска кадров. */
+/* Frame skip reasons. */
 enum {
-	SKIP_TOO_BIG = 0, /* больше MTU + заголовок */
-	SKIP_TOO_SMALL,   /* меньше заголовка Ethernet */
-	SKIP_BAD_RAW,     /* RAW IP без версии 4/6 */
+	SKIP_TOO_BIG = 0, /* larger than MTU + header */
+	SKIP_TOO_SMALL,   /* smaller than an Ethernet header */
+	SKIP_BAD_RAW,     /* RAW IP without version 4/6 */
 	SKIP_REASONS
 };
 

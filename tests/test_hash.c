@@ -4,7 +4,7 @@
 
 #include <string.h>
 
-/* Сборщик кадров для тестов. */
+/* Frame builder for tests. */
 typedef struct {
 	uint8_t b[256];
 	size_t n;
@@ -53,7 +53,7 @@ static void b_v4(fr_t *f, int rev)
 
 static void b_vlan(fr_t *f, int rev)
 {
-	/* VLAN ID разный в двух направлениях — в хеш он не входит */
+	/* VLAN ID differs between directions; it is not part of the hash */
 	eth(f, 0x8100);
 	p16(f, rev ? 20 : 10); p16(f, 0x0800);
 	ip4(f, rev ? 0xc0a80002 : 0xc0a80001, rev ? 0xc0a80001 : 0xc0a80002, 17, 0);
@@ -87,7 +87,7 @@ static void b_v6ext(fr_t *f, int rev)
 {
 	eth(f, 0x86dd);
 	ip6(f, rev ? 2 : 1, rev ? 1 : 2, 0);
-	p8(f, 17); p8(f, 0); p16(f, 0); p32(f, 0); /* hop-by-hop, 8 байт */
+	p8(f, 17); p8(f, 0); p16(f, 0); p32(f, 0); /* hop-by-hop, 8 bytes */
 	ports(f, rev ? 53 : 4000, rev ? 4000 : 53);
 }
 
@@ -113,7 +113,7 @@ static void sym_case(build_fn fn, const char *name, uint8_t l3, int ports_expect
 		CHECK(da.sport != 0 && da.dport != 0);
 	uint64_t ha = afr_flow_hash(&da), hb = afr_flow_hash(&db);
 	if (ha != hb)
-		fprintf(stderr, "  несимметричный хеш: %s\n", name);
+		fprintf(stderr, "  asymmetric hash: %s\n", name);
 	CHECK(ha == hb);
 	idx_cfg_t cfg = {.ip_shards = 7, .max_frame = 1514};
 	int r1 = 0, r2 = 0;
@@ -123,7 +123,7 @@ static void sym_case(build_fn fn, const char *name, uint8_t l3, int ports_expect
 
 static void fragments(void)
 {
-	/* Фрагменты одной датаграммы: порты не учитываются, шард один. */
+	/* Fragments of one datagram: ports are ignored, same shard. */
 	fr_t f1, f2, f3;
 	eth(&f1, 0x0800);
 	ip4(&f1, 0x0a000001, 0x0a000002, 17, 0x2000); /* MF, offset 0 */
@@ -132,7 +132,7 @@ static void fragments(void)
 	ip4(&f2, 0x0a000001, 0x0a000002, 17, 0x2000 | 125);
 	p32(&f2, 0xdeadbeef); p32(&f2, 0x12345678);
 	eth(&f3, 0x0800);
-	ip4(&f3, 0x0a000002, 0x0a000001, 17, 250); /* последний фрагмент, обратное направление */
+	ip4(&f3, 0x0a000002, 0x0a000001, 17, 250); /* last fragment, reverse direction */
 	p32(&f3, 0xcafebabe); p32(&f3, 0);
 	dis_t d1, d2, d3;
 	afr_dissect(f1.b, (uint32_t)f1.n, 0, &d1);
@@ -141,12 +141,12 @@ static void fragments(void)
 	CHECK(d1.frag && d2.frag && d3.frag);
 	CHECK(d1.frag_first && !d2.frag_first && !d3.frag_first);
 	CHECK_EQ(d1.sport, 0);
-	CHECK_EQ(d1.l4_off, 34); /* у первого фрагмента L4 есть (для контрольных сумм) */
+	CHECK_EQ(d1.l4_off, 34); /* the first fragment has L4 (for checksums) */
 	CHECK_EQ(d2.l4_off, 0);
 	CHECK(afr_flow_hash(&d1) == afr_flow_hash(&d2));
 	CHECK(afr_flow_hash(&d1) == afr_flow_hash(&d3));
 
-	/* IPv6-фрагменты */
+	/* IPv6 fragments */
 	fr_t g1, g2;
 	eth(&g1, 0x86dd);
 	ip6(&g1, 1, 2, 44);
@@ -183,7 +183,7 @@ static void non_ip(void)
 		p8(&f, 0);
 	CHECK_EQ(afr_classify(f.b, (uint32_t)f.n, 0, &cfg, &d, &r), 5);
 	CHECK_EQ(d.l2kind, L2K_LLC);
-	/* LLDP в VLAN */
+	/* LLDP in VLAN */
 	eth(&f, 0x8100);
 	p16(&f, 5); p16(&f, 0x88cc);
 	for (int i = 0; i < 30; i++)
@@ -211,14 +211,14 @@ static void raw_ip(void)
 	CHECK_EQ(d.dport, 20);
 	idx_cfg_t cfg = {.ip_shards = 3, .max_frame = 1514};
 	int r = -1;
-	f.b[0] = 0x50; /* не IP */
+	f.b[0] = 0x50; /* not IP */
 	CHECK_EQ(afr_classify(f.b, (uint32_t)f.n, 1, &cfg, &d, &r), SHARD_SKIP);
 	CHECK_EQ(r, SKIP_BAD_RAW);
 }
 
 static void distribution(void)
 {
-	/* Разные потоки расходятся по шардам примерно равномерно. */
+	/* Different flows spread across shards roughly evenly. */
 	idx_cfg_t cfg = {.ip_shards = 8, .max_frame = 1514};
 	unsigned cnt[9] = {0};
 	for (unsigned i = 0; i < 8000; i++) {
@@ -245,14 +245,14 @@ static void mtu_limits(void)
 	int r;
 	CHECK(afr_classify(big, 1514, 0, &cfg, &d, &r) != SHARD_SKIP);
 	CHECK(afr_classify(big, 1515, 0, &cfg, &d, &r) == SHARD_SKIP);
-	big[12] = 0x81; /* 802.1Q даёт ещё 4 байта */
+	big[12] = 0x81; /* 802.1Q allows 4 more bytes */
 	big[13] = 0x00;
 	big[16] = 0x08;
 	big[17] = 0x00;
 	big[18] = 0x45;
 	CHECK(afr_classify(big, 1518, 0, &cfg, &d, &r) != SHARD_SKIP);
 	CHECK(afr_classify(big, 1519, 0, &cfg, &d, &r) == SHARD_SKIP);
-	big[12] = 0x88; /* 802.1ad — ядро не делает для него исключения */
+	big[12] = 0x88; /* 802.1ad: the kernel makes no exception for it */
 	big[13] = 0xa8;
 	CHECK(afr_classify(big, 1518, 0, &cfg, &d, &r) == SHARD_SKIP);
 }

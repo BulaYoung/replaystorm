@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Генератор тестовых pcap для afreplay (без внешних зависимостей).
+"""Test pcap generator for afreplay (no external dependencies).
 
-Создаёт в каталоге OUT:
+Creates in directory OUT:
   l2mix.pcap          — ARP, STP, LLDP, VLAN, QinQ, MPLS (+PW), PPPoE, IPv6 (+ext hdr),
-                        IPv4/IPv6 фрагменты, TCP/UDP-сессии в обе стороны,
-                        обрезанный при захвате кадр, кадр больше MTU (us, little-endian)
-  l2mix_ns_be.pcap    — то же, наносекунды, big-endian
-  raw_ip.pcap         — linktype 101 (RAW IP), IPv4 и IPv6
-  ts_backward.pcap    — тайм-стампы со скачками назад
-  ts_gaps.pcap        — большие паузы
-  ts_zero.pcap        — ts = 0 и далёкое будущее
-  ts_spike.pcap       — кратковременный скачок часов
-  timing.pcap         — для проверки тайминга: несколько потоков, интервалы 0.5..6 мс
-  truncated_file.pcap — файл обрезан посреди записи
-  fake.pcapng         — заголовок pcapng
+                        IPv4/IPv6 fragments, TCP/UDP sessions in both directions,
+                        a frame truncated at capture, a frame larger than MTU (us, little-endian)
+  l2mix_ns_be.pcap    — the same, nanoseconds, big-endian
+  raw_ip.pcap         — linktype 101 (RAW IP), IPv4 and IPv6
+  ts_backward.pcap    — timestamps jumping backwards
+  ts_gaps.pcap        — long pauses
+  ts_zero.pcap        — ts = 0 and the far future
+  ts_spike.pcap       — a short clock spike
+  timing.pcap         — for timing checks: several flows, intervals 0.5..6 ms
+  truncated_file.pcap — file truncated in the middle of a record
+  fake.pcapng         — pcapng header
 """
 import os
 import random
@@ -47,7 +47,7 @@ def eth(dst, src, et, payload):
 
 
 def vlan(tpid, vid, et):
-    """Возвращает тег: TCI + следующий ethertype (TPID кладётся предыдущим уровнем)."""
+    """Returns a tag: TCI + next ethertype (the TPID is written by the previous level)."""
     return struct.pack("!HH", vid, et)
 
 
@@ -117,9 +117,9 @@ B = "66:77:88:99:aa:bb"
 
 
 def frames_l2mix():
-    """Список (кадр, origlen или None)."""
+    """List of (frame, origlen or None)."""
     fr = []
-    # ARP запрос/ответ
+    # ARP request/reply
     arp_req = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1) + mac(A) + ip4("10.0.0.1") + bytes(6) + ip4("10.0.0.2")
     arp_rep = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 2) + mac(B) + ip4("10.0.0.2") + mac(A) + ip4("10.0.0.1")
     fr.append(eth("ff:ff:ff:ff:ff:ff", A, 0x0806, arp_req))
@@ -130,9 +130,9 @@ def frames_l2mix():
     # LLDP
     lldp = bytes([0x02, 0x07, 0x04]) + mac(A) + bytes([0x04, 0x02, 0x07, 0x31, 0x06, 0x02, 0x00, 0x78, 0x00, 0x00])
     fr.append(eth("01:80:c2:00:00:0e", A, 0x88CC, lldp))
-    # Неизвестный ethertype
+    # Unknown ethertype
     fr.append(eth(B, A, 0x88B5, b"local experimental" + bytes(30)))
-    # Несколько TCP-сессий в обе стороны, в т.ч. в VLAN
+    # Several TCP sessions in both directions, including in VLAN
     rnd = random.Random(1)
     for s in range(12):
         cli = "10.1.%d.%d" % (s, 10 + s)
@@ -149,23 +149,23 @@ def frames_l2mix():
             if s % 3 == 1:
                 fr.append(eth(d, sm, 0x8100, vlan(0x8100, 100 + s, 0x0800) + l3))
             elif s % 3 == 2:
-                # QinQ: 802.1ad снаружи, 802.1Q внутри
+                # QinQ: 802.1ad outer, 802.1Q inner
                 fr.append(eth(d, sm, 0x88A8, vlan(0x88A8, 10, 0x8100) + vlan(0x8100, 200 + s, 0x0800) + l3))
             else:
                 fr.append(eth(d, sm, 0x0800, l3))
-    # MPLS: два лейбла, внутри IPv4 UDP
+    # MPLS: two labels, IPv4 UDP inside
     for k in range(4):
         l3 = ipv4_udp("172.16.0.1", "172.16.0.2", 5000, 53, b"q" * (20 + k)) if k % 2 == 0 else \
             ipv4_udp("172.16.0.2", "172.16.0.1", 53, 5000, b"r" * (40 + k))
         labels = struct.pack("!I", (16 << 12) | (0 << 9) | (0 << 8) | 64) + struct.pack("!I", (17 << 12) | (1 << 8) | 64)
         fr.append(eth(B, A, 0x8847, labels + l3))
-    # MPLS псевдопровод с control word и внутренним Ethernet
+    # MPLS pseudowire with control word and inner Ethernet
     inner = eth("02:00:00:00:00:aa", "02:00:00:00:00:bb", 0x0800, ipv4_udp("10.9.9.1", "10.9.9.2", 1111, 2222, b"pw"))
     fr.append(eth(B, A, 0x8847, struct.pack("!I", (30 << 12) | (1 << 8) | 64) + bytes(4) + inner))
-    # PPPoE session с IPv4
+    # PPPoE session with IPv4
     l3 = ipv4_udp("100.64.0.1", "8.8.8.8", 33333, 53, b"pppoe")
     fr.append(eth(B, A, 0x8864, struct.pack("!BBHH", 0x11, 0, 0x1234, len(l3) + 2) + struct.pack("!H", 0x0021) + l3))
-    # IPv6 TCP в обе стороны и с заголовком расширения
+    # IPv6 TCP in both directions and with an extension header
     a6, b6 = ip6(1), ip6(2)
     for k in range(4):
         if k % 2 == 0:
@@ -175,13 +175,13 @@ def frames_l2mix():
     seg = with_csum6(a6, b6, 17, udp(7000, 7001, b"hbh"))
     hbh = bytes([17, 0, 1, 4, 0, 0, 0, 0])
     fr.append(eth(B, A, 0x86DD, ipv6(a6, b6, 0, hbh + seg)))
-    # IPv4 фрагменты одной UDP-датаграммы
+    # IPv4 fragments of one UDP datagram
     big = with_csum4("10.2.0.1", "10.2.0.2", 17, udp(9999, 8888, bytes(range(256)) * 10))
     chunks = [big[i:i + 1000] for i in range(0, len(big), 1000)]
     for i, ch in enumerate(chunks):
         mf = 0x2000 if i < len(chunks) - 1 else 0
         fr.append(eth(B, A, 0x0800, ipv4("10.2.0.1", "10.2.0.2", 17, ch, ident=77, flags_off=mf | (i * 1000 // 8))))
-    # IPv6 фрагменты
+    # IPv6 fragments
     big6 = with_csum6(a6, b6, 17, udp(9999, 8888, bytes(range(256)) * 6))
     chunks = [big6[i:i + 800] for i in range(0, len(big6), 800)]
     for i, ch in enumerate(chunks):
@@ -193,19 +193,19 @@ def frames_l2mix():
     icmp = icmp[:2] + struct.pack("!H", csum(icmp)) + icmp[4:]
     fr.append(eth(B, A, 0x0800, ipv4("10.3.0.1", "10.3.0.2", 1, icmp)))
     out = [(f, None) for f in fr]
-    # Обрезанный при захвате кадр: origlen больше caplen
+    # Frame truncated at capture: origlen greater than caplen
     full = eth(B, A, 0x0800, ipv4_udp("10.4.0.1", "10.4.0.2", 1234, 4321, bytes(600)))
     out.append((full[:128], len(full)))
-    # Кадр больше MTU 1500 (будет пропущен)
+    # Frame larger than MTU 1500 (will be skipped)
     out.append((eth(B, A, 0x0800, ipv4_udp("10.5.0.1", "10.5.0.2", 1, 2, bytes(1600))), None))
-    # Кадр ровно MTU+14 и 802.1Q ровно MTU+18 (должны пройти)
+    # Frame of exactly MTU+14 and 802.1Q of exactly MTU+18 (must pass)
     out.append((eth(B, A, 0x0800, ipv4_udp("10.6.0.1", "10.6.0.2", 1, 2, bytes(1500 - 28))), None))
     out.append((eth(B, A, 0x8100, vlan(0x8100, 5, 0x0800) + ipv4_udp("10.6.0.1", "10.6.0.2", 1, 2, bytes(1500 - 28))), None))
     return out
 
 
 def write_pcap(path, recs, nsec=False, big_endian=False, linktype=1):
-    """recs: список (ts_ns, кадр, origlen или None)."""
+    """recs: list of (ts_ns, frame, origlen or None)."""
     e = ">" if big_endian else "<"
     magic = 0xA1B23C4D if nsec else 0xA1B2C3D4
     with open(path, "wb") as f:
@@ -242,7 +242,7 @@ def main():
                linktype=101)
 
     def flow_frames(n, seed):
-        """UDP в обе стороны, 8 потоков; первые 4 байта нагрузки — номер пакета."""
+        """UDP in both directions, 8 flows; the first 4 payload bytes are the packet number."""
         r = random.Random(seed)
         fr = []
         for i in range(n):
@@ -254,7 +254,7 @@ def main():
                 fr.append(eth(A, B, 0x0800, ipv4_udp("10.8.1.1", "10.8.0.%d" % s, 9000, 2000 + s, pl)))
         return fr
 
-    # Скачки назад: каждый 10-й пакет на 3 мс раньше
+    # Backward jumps: every 10th packet is 3 ms earlier
     fr = flow_frames(100, 2)
     recs = []
     for i, f in enumerate(fr):
@@ -264,7 +264,7 @@ def main():
         recs.append((ts, f, None))
     write_pcap(os.path.join(out, "ts_backward.pcap"), recs)
 
-    # Большие паузы: 2 с после 30-го пакета и 5 с после 60-го
+    # Long pauses: 2 s after the 30th packet and 5 s after the 60th
     fr = flow_frames(90, 3)
     recs, t = [], BASE
     for i, f in enumerate(fr):
@@ -276,7 +276,7 @@ def main():
         t += 1_000_000
     write_pcap(os.path.join(out, "ts_gaps.pcap"), recs)
 
-    # ts=0 и будущее
+    # ts=0 and the future
     fr = flow_frames(50, 4)
     recs = []
     for i, f in enumerate(fr):
@@ -284,11 +284,11 @@ def main():
         if i in (0, 20):
             ts = 0
         if i == 35:
-            ts = 4_000_000_000 * 1_000_000_000 // 1  # ~2096 год
+            ts = 4_000_000_000 * 1_000_000_000 // 1  # ~year 2096
         recs.append((ts, f, None))
     write_pcap(os.path.join(out, "ts_zero.pcap"), recs)
 
-    # Кратковременный скачок часов: пакеты 20..22 на час вперёд
+    # Short clock spike: packets 20..22 one hour ahead
     fr = flow_frames(50, 5)
     recs = []
     for i, f in enumerate(fr):
@@ -298,7 +298,7 @@ def main():
         recs.append((ts, f, None))
     write_pcap(os.path.join(out, "ts_spike.pcap"), recs)
 
-    # Тайминг: 8 потоков, интервалы 0.5..6 мс, ~1 с
+    # Timing: 8 flows, intervals 0.5..6 ms, ~1 s
     r = random.Random(6)
     fr = flow_frames(300, 6)
     recs, t = [], BASE
@@ -307,7 +307,7 @@ def main():
         t += r.randrange(500_000, 6_000_000)
     write_pcap(os.path.join(out, "timing.pcap"), recs, nsec=True)
 
-    # Обрезанный файл
+    # Truncated file
     p = os.path.join(out, "truncated_file.pcap")
     write_pcap(p, [(BASE + i * 1_000_000, f, o) for i, (f, o) in enumerate(mix[:20])])
     sz = os.path.getsize(p)
@@ -317,7 +317,7 @@ def main():
     with open(os.path.join(out, "fake.pcapng"), "wb") as f:
         f.write(struct.pack("<IIIHHq", 0x0A0D0D0A, 28, 0x1A2B3C4D, 1, 0, -1) + struct.pack("<I", 28))
 
-    print("тестовые pcap записаны в", out)
+    print("test pcaps written to", out)
 
 
 if __name__ == "__main__":

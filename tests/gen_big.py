@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Большой синтетический pcap для замеров производительности.
+"""Large synthetic pcap for performance measurements.
 
-Использование: gen_big.py ВЫХОД.pcap РАЗМЕР_ГБ
-4096 TCP/UDP-сессий, кадры 64..1400 байт, ~2 мкс между пакетами.
+Usage: gen_big.py OUTPUT.pcap SIZE_GB
+4096 TCP/UDP sessions, frames of 64..1400 bytes, ~2 us between packets.
 """
 import os
 import random
@@ -41,7 +41,7 @@ def main():
                 out.write(b"".join(buf))
                 buf = []
         out.write(b"".join(buf))
-    print("пакетов:", n)
+    print("packets:", n)
 
 
 if __name__ == "__main__":

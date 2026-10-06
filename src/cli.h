@@ -11,14 +11,15 @@ enum { LAG_CATCHUP = 0, LAG_REBASE };
 typedef struct {
 	const char *iface;
 	const char *file;
-	unsigned threads;     /* 0 — по умолчанию */
+	unsigned threads;     /* 0 means default */
 	const char *cpus;
 
 	int mode;
-	double multiplier;    /* для MODE_TIMED */
-	int64_t duration_ns;  /* --duration: множитель подбирается */
+	double multiplier;    /* for MODE_TIMED */
+	int64_t duration_ns;  /* --duration: multiplier is derived */
 	double mbps, pps;
-	uint64_t loops;       /* 0 — бесконечно */
+	double line_frac;     /* --mbps line / N%: fraction of the link on the wire (0 = off) */
+	uint64_t loops;       /* 0 means infinite */
 
 	int ts_order;
 	int64_t max_gap;
@@ -28,14 +29,14 @@ typedef struct {
 	int64_t lag_threshold;
 	int64_t spin_ns;
 	int64_t timing_res;
-	int clock_mode;       /* CLOCK_MODE_* из clock.h */
+	int clock_mode;       /* CLOCK_MODE_* from clock.h */
 
 	unsigned batch;
 	unsigned ring_frames;
 	int qdisc_bypass;
 	int packet_loss;
-	double link_speed_bps; /* 0 — определить автоматически */
-	unsigned mtu;          /* 0 — с интерфейса */
+	double link_speed_bps; /* 0 means auto-detect */
+	unsigned mtu;          /* 0 means from interface */
 
 	int preload;
 	uint8_t smac[6], dmac[6];
@@ -45,11 +46,11 @@ typedef struct {
 	int quiet;
 
 	int mutate_ip, mutate_port;
-	uint32_t mutate_ip_offset; /* в порядке хоста */
+	uint32_t mutate_ip_offset; /* host byte order */
 	uint32_t mutate_port_step;
 } opts_t;
 
-/* 0 — продолжать, 1 — была напечатана справка (выход 0), -1 — ошибка (выход 2). */
+/* 0: continue, 1: help was printed (exit 0), -1: error (exit 2). */
 int afr_parse_args(int argc, char **argv, opts_t *o);
 void afr_usage(FILE *f);
 

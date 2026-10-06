@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Функциональные тесты afreplay на паре veth.
+"""afreplay functional tests on a veth pair.
 
-Запускается внутри отдельного network namespace (см. func_veth.sh): afreplay
-шлёт в va, приёмник слушает vb через AF_PACKET с PACKET_AUXDATA (чтобы
-вернуть снятый ядром VLAN-тег) и SO_TIMESTAMPNS (наносекундные метки приёма).
+Runs inside a separate network namespace (see func_veth.sh): afreplay
+sends to va, the receiver listens on vb via AF_PACKET with PACKET_AUXDATA (to
+restore the VLAN tag stripped by the kernel) and SO_TIMESTAMPNS (nanosecond receive timestamps).
 """
 import argparse
 import collections
@@ -39,7 +39,7 @@ def check(cond, msg):
 
 
 def read_pcap(path):
-    """Возвращает (linktype, [(ts_ns, данные)])."""
+    """Returns (linktype, [(ts_ns, data)])."""
     with open(path, "rb") as f:
         data = f.read()
     magic = struct.unpack("<I", data[:4])[0]
@@ -140,7 +140,7 @@ def replay(pcap, extra, json_path=None):
 
 
 def flow_key(fr):
-    """Симметричный ключ IPv4 TCP/UDP (с учётом VLAN), иначе None."""
+    """Symmetric IPv4 TCP/UDP key (VLAN-aware), otherwise None."""
     off, et = 12, struct.unpack("!H", fr[12:14])[0]
     while et in (0x8100, 0x88A8):
         off += 4
@@ -163,9 +163,9 @@ def compare_frames(expected, got, label):
     ce, cg = collections.Counter(expected), collections.Counter(got)
     missing = ce - cg
     extra = cg - ce
-    check(not missing, "%s: все %d кадров дошли байт в байт (не дошло: %d)" % (label, len(expected), sum(missing.values())))
-    check(not extra, "%s: лишних кадров нет (лишних: %d)" % (label, sum(extra.values())))
-    # Порядок внутри сессий
+    check(not missing, "%s: all %d frames arrived byte for byte (missing: %d)" % (label, len(expected), sum(missing.values())))
+    check(not extra, "%s: no extra frames (extra: %d)" % (label, sum(extra.values())))
+    # Order within sessions
     pos = collections.defaultdict(list)
     for i, f in enumerate(expected):
         pos[f].append(i)
@@ -181,7 +181,7 @@ def compare_frames(expected, got, label):
         if k:
             per_flow[k].append(idx)
     bad = [k for k, v in per_flow.items() if v != sorted(v)]
-    check(not bad and per_flow, "%s: порядок внутри %d сессий сохранён" % (label, len(per_flow)))
+    check(not bad and per_flow, "%s: order within %d sessions preserved" % (label, len(per_flow)))
 
 
 def expected_frames(pcap, mtu=1500, smac=None, dmac=None):
@@ -200,24 +200,24 @@ def expected_frames(pcap, mtu=1500, smac=None, dmac=None):
 
 
 def t_bytes(pcaps):
-    print("== Кадры байт в байт (L2: ARP, STP, LLDP, VLAN, QinQ, MPLS, PPPoE, IPv6, фрагменты)")
+    print("== Frames byte for byte (L2: ARP, STP, LLDP, VLAN, QinQ, MPLS, PPPoE, IPv6, fragments)")
     for name, extra in (("l2mix.pcap", ["--pps", "3000", "-t", "3"]),
                         ("l2mix_ns_be.pcap", ["--topspeed", "-t", "2", "--qdisc-bypass"]),
                         ("l2mix.pcap", ["--mbps", "20", "-t", "4", "--ts-order", "sort"])):
         p = os.path.join(pcaps, name)
         rc, out, frames, js = replay(p, extra, "/tmp/afr_func.json")
-        check(rc == 0, "%s %s: код выхода 0 (%d)" % (name, " ".join(extra), rc))
+        check(rc == 0, "%s %s: exit code 0 (%d)" % (name, " ".join(extra), rc))
         if rc:
             print(out)
         compare_frames(expected_frames(p), [f for _, f in frames], name)
-        check(js and js["summary"]["skipped"] == 1, "%s: пропущен 1 кадр больше MTU (JSON)" % name)
-        check(js and js["summary"]["truncated_caplen"] == 1, "%s: 1 обрезанный кадр учтён (JSON)" % name)
+        check(js and js["summary"]["skipped"] == 1, "%s: 1 frame larger than MTU skipped (JSON)" % name)
+        check(js and js["summary"]["truncated_caplen"] == 1, "%s: 1 truncated frame counted (JSON)" % name)
 
-    print("== RAW IP с синтетическим Ethernet")
+    print("== RAW IP with synthetic Ethernet")
     p = os.path.join(pcaps, "raw_ip.pcap")
     sm, dm = "02:aa:00:00:00:01", "02:bb:00:00:00:02"
     rc, out, frames, _ = replay(p, ["--topspeed", "--smac", sm, "--dmac", dm])
-    check(rc == 0, "raw_ip: код выхода 0")
+    check(rc == 0, "raw_ip: exit code 0")
     compare_frames(expected_frames(p, smac=sm, dmac=dm), [f for _, f in frames], "raw_ip")
 
 
@@ -251,84 +251,97 @@ def timing_errors(pcap, frames, mult, laps=1, lap_len=None):
 
 
 def t_timing(pcaps, spin):
-    print("== Тайминг по тайм-стампам (x0.5, x1, x2), захват с наносекундными метками")
+    print("== Timestamp-based timing (x0.5, x1, x2), capture with nanosecond timestamps")
     p = os.path.join(pcaps, "timing.pcap")
     for mult in (1.0, 2.0, 0.5):
         rc, out, frames, js = replay(p, ["--multiplier", str(mult), "-t", "3", "--spin-us", str(spin)],
                                      "/tmp/afr_func.json")
-        check(rc == 0, "x%g: код выхода 0" % mult)
+        check(rc == 0, "x%g: exit code 0" % mult)
         n, errs, real, want = timing_errors(p, frames, mult)
         p50 = errs[len(errs) // 2]
         p95 = errs[int(len(errs) * 0.95)]
         mx = errs[-1]
-        print("      x%g: пакетов %d, |ошибка| p50 %.1f мкс, p95 %.1f мкс, max %.1f мкс; длительность %.4f с (ожидалась %.4f с)"
+        print("      x%g: packets %d, |error| p50 %.1f us, p95 %.1f us, max %.1f us; duration %.4f s (expected %.4f s)"
               % (mult, n, p50 / 1e3, p95 / 1e3, mx / 1e3, real / 1e9, want / 1e9))
-        check(n == 300, "x%g: получены все 300 пакетов" % mult)
-        check(p95 < TOL_P95, "x%g: p95 ошибки интервалов < %d мкс" % (mult, TOL_P95 // 1000))
+        check(n == 300, "x%g: all 300 packets received" % mult)
+        check(p95 < TOL_P95, "x%g: p95 interval error < %d us" % (mult, TOL_P95 // 1000))
         late_max = js["summary"].get("late_max_ns", 0) if js else 0
-        # Редкий большой выброс (вытеснение потока, позднее пробуждение) допустим,
-        # только если реплеер сам сообщил о таком опоздании.
+        # A rare large outlier (thread preemption, late wakeup) is acceptable
+        # only if the replayer itself reported such lateness.
         check(mx < TOL_MAX or mx <= late_max + 200_000,
-              "x%g: max ошибки < %d мкс или объяснён опозданием, которое видит реплеер (%.1f мкс)"
+              "x%g: max error < %d us or explained by lateness seen by the replayer (%.1f us)"
               % (mult, TOL_MAX // 1000, late_max / 1e3))
-        check(abs(real - want) < 0.002 * want + 300_000, "x%g: общая длительность совпадает (±0.2%%)" % mult)
-        check(js and "late_p99_ns" in js["summary"], "x%g: lateness p50/p99/max в JSON" % mult)
+        check(abs(real - want) < 0.002 * want + 300_000, "x%g: total duration matches (±0.2%%)" % mult)
+        check(js and "late_p99_ns" in js["summary"], "x%g: lateness p50/p99/max in JSON" % mult)
 
-    print("== --duration подбирает множитель")
+    print("== --duration picks the multiplier")
     p = os.path.join(pcaps, "timing.pcap")
     rc, out, frames, _ = replay(p, ["--duration", "500ms", "--spin-us", str(spin)])
     ts = sorted(t for t, _ in frames)
     dur = (ts[-1] - ts[0]) / 1e9
-    check(rc == 0 and len(frames) == 300 and abs(dur - 0.5) < 0.005, "--duration 500ms: проиграно за %.4f с" % dur)
+    check(rc == 0 and len(frames) == 300 and abs(dur - 0.5) < 0.005, "--duration 500ms: replayed in %.4f s" % dur)
 
-    print("== --ts-order: sort/clamp/asis на метках со скачками назад")
+    print("== --ts-order: sort/clamp/asis on timestamps jumping backwards")
     p = os.path.join(pcaps, "ts_backward.pcap")
     _, recs = read_pcap(p)
     for order in ("sort", "clamp", "asis"):
         rc, out, frames, js = replay(p, ["--ts-order", order, "-t", "3", "--spin-us", str(spin)], "/tmp/afr_func.json")
-        check(rc == 0 and len(frames) == 100, "%s: все 100 пакетов" % order)
+        check(rc == 0 and len(frames) == 100, "%s: all 100 packets" % order)
         per_flow = collections.defaultdict(list)
         for t, f in sorted(frames):
             per_flow[flow_key(f)].append(recs[seq_of(f)][0])
         if order == "sort":
             ok = all(v == sorted(v) for v in per_flow.values())
-            check(ok, "sort: внутри сессий пакеты уходят по возрастанию меток pcap")
+            check(ok, "sort: within sessions packets are sent in ascending pcap timestamp order")
         else:
             seqs = collections.defaultdict(list)
             for t, f in sorted(frames):
                 seqs[flow_key(f)].append(seq_of(f))
-            check(all(v == sorted(v) for v in seqs.values()), "%s: внутри сессий сохранён порядок файла" % order)
+            check(all(v == sorted(v) for v in seqs.values()), "%s: file order preserved within sessions" % order)
         if order == "asis":
             check(js and js["summary"].get("asis_backward", 0) > 0,
-                  "asis: пакеты «назад во времени» учтены отдельно (%s)" % (js and js["summary"].get("asis_backward")))
+                  "asis: \"backwards in time\" packets counted separately (%s)" % (js and js["summary"].get("asis_backward")))
 
-    print("== --max-gap сжимает паузы")
+    print("== --mbps N%: rate as a share of the link on the wire")
+    p = os.path.join(pcaps, "timing.pcap")
+    _, recs = read_pcap(p)
+    l2 = [len(d) for _, d in recs]
+    l1 = sum(max(x, 60) + 24 for x in l2)
+    rate_l2 = 2e6 * 0.5 * sum(l2) / l1  # 50% of a 2 Mbit/s link, converted to L2
+    want = (sum(l2) - l2[-1]) * 8 / rate_l2
+    rc, out, frames, _ = replay(p, ["--mbps", "50%", "--link-speed", "2M", "-t", "1"])
+    ts = sorted(t for t, _ in frames)
+    dur = (ts[-1] - ts[0]) / 1e9
+    check(rc == 0 and len(frames) == 300 and abs(dur - want) < 0.02 * want,
+          "--mbps 50%% of 2M: played in %.3f s, expected %.3f s" % (dur, want))
+
+    print("== --max-gap compresses pauses")
     p = os.path.join(pcaps, "ts_gaps.pcap")
     rc, out, frames, _ = replay(p, ["--max-gap", "100ms", "--spin-us", str(spin)])
     ts = sorted(t for t, _ in frames)
     dur = (ts[-1] - ts[0]) / 1e9
-    check(rc == 0 and len(frames) == 90, "ts_gaps: все 90 пакетов")
-    check(abs(dur - 0.287) < 0.005, "ts_gaps: длительность %.3f с ≈ 0.287 с (паузы 2 с и 5 с сжаты до 100 мс)" % dur)
+    check(rc == 0 and len(frames) == 90, "ts_gaps: all 90 packets")
+    check(abs(dur - 0.287) < 0.005, "ts_gaps: duration %.3f s ≈ 0.287 s (2 s and 5 s pauses compressed to 100 ms)" % dur)
 
-    print("== --loop продолжает шкалу")
+    print("== --loop continues the timeline")
     p = os.path.join(pcaps, "timing.pcap")
     rc, out, frames, js = replay(p, ["--loop", "3", "--multiplier", "2", "--spin-us", str(spin)], "/tmp/afr_func.json")
-    check(rc == 0, "loop: код выхода 0")
+    check(rc == 0, "loop: exit code 0")
     lap_len = js["lap_ns"] if js else 0
     n, errs, real, want = timing_errors(p, frames, 2.0, laps=3, lap_len=lap_len)
-    check(n == 900, "loop: 3 круга по 300 пакетов (%d)" % n)
-    check(errs[int(len(errs) * 0.95)] < TOL_P95, "loop: круги идут по общей шкале (p95 < %d мкс)" % (TOL_P95 // 1000))
+    check(n == 900, "loop: 3 laps of 300 packets (%d)" % n)
+    check(errs[int(len(errs) * 0.95)] < TOL_P95, "loop: laps follow a common timeline (p95 < %d us)" % (TOL_P95 // 1000))
 
-    print("== Выбросы тайм-стампов")
+    print("== Timestamp outliers")
     p = os.path.join(pcaps, "ts_spike.pcap")
     rc, out, frames, _ = replay(p, ["--ts-outliers", "exclude", "--spin-us", str(spin)])
     ts = sorted(t for t, _ in frames)
-    check(rc == 0 and len(frames) == 50, "ts_spike: все 50 пакетов")
-    check((ts[-1] - ts[0]) / 1e9 < 0.1, "ts_spike: скачок часов на час исключён из шкалы")
+    check(rc == 0 and len(frames) == 50, "ts_spike: all 50 packets")
+    check((ts[-1] - ts[0]) / 1e9 < 0.1, "ts_spike: one-hour clock spike excluded from the timeline")
 
 
 def ip_l4_sums_ok(fr):
-    """Проверка IPv4-суммы и суммы TCP/UDP (IPv4, с VLAN). None — кадр не проверяется."""
+    """Checks the IPv4 checksum and the TCP/UDP checksum (IPv4, with VLAN). None means the frame is not checked."""
     off, et = 12, struct.unpack("!H", fr[12:14])[0]
     while et in (0x8100, 0x88A8):
         off += 4
@@ -354,7 +367,7 @@ def ip_l4_sums_ok(fr):
         return True
     seg = fr[off + ihl:off + total]
     if len(seg) < total - ihl:
-        return True  # обрезан при захвате
+        return True  # truncated at capture
     if proto == 17 and seg[6:8] == b"\0\0":
         return True
     ph = fr[off + 12:off + 20] + struct.pack("!BBH", 0, proto, len(seg))
@@ -362,14 +375,14 @@ def ip_l4_sums_ok(fr):
 
 
 def t_mutate(pcaps):
-    print("== --loop-mutate: новые сессии на каждом круге, суммы пересчитаны, L2 не тронут")
+    print("== --loop-mutate: new sessions on every lap, checksums recomputed, L2 untouched")
     p = os.path.join(pcaps, "l2mix.pcap")
     exp = expected_frames(p)
-    # Один IP-поток: его кадры приходят строго по кругам. Не-IP кадры идут
-    # отдельным потоком и перемежаются с ними, поэтому разбираем их отдельно.
+    # One IP flow: its frames arrive strictly lap by lap. Non-IP frames go in
+    # a separate flow and are interleaved with them, so they are checked separately.
     rc, out, frames, _ = replay(p, ["--loop", "3", "--pps", "20000", "-t", "1", "--loop-mutate", "ip,port"])
     got = [f for _, f in frames]
-    check(rc == 0 and len(got) == 3 * len(exp), "3 круга: %d кадров из %d" % (len(got), 3 * len(exp)))
+    check(rc == 0 and len(got) == 3 * len(exp), "3 laps: %d frames of %d" % (len(got), 3 * len(exp)))
     is_ip = lambda f: ip_l4_sums_ok(f) is not None or flow_key(f) is not None or \
         struct.unpack("!H", f[12:14])[0] in (0x86DD, 0x8847, 0x8864, 0x0800) or \
         (struct.unpack("!H", f[12:14])[0] in (0x8100, 0x88A8) and f[16:18] != b"\x88\xcc")
@@ -378,40 +391,40 @@ def t_mutate(pcaps):
     got_ip = [f for f in got if is_ip(f)]
     got_l2 = [f for f in got if not is_ip(f)]
     n = len(exp_ip)
-    check(collections.Counter(got_ip[:n]) == collections.Counter(exp_ip), "круг 0 без изменений")
+    check(collections.Counter(got_ip[:n]) == collections.Counter(exp_ip), "lap 0 unchanged")
     check(collections.Counter(got_l2) == collections.Counter(exp_l2 * 3),
-          "не-IP кадры (ARP, STP, LLDP, ...) на всех кругах без изменений (%d)" % len(got_l2))
+          "non-IP frames (ARP, STP, LLDP, ...) unchanged on all laps (%d)" % len(got_l2))
     expset = set(exp_ip)
     bad = [f for f in got_ip if ip_l4_sums_ok(f) is False]
     checked = [f for f in got_ip if ip_l4_sums_ok(f) is True]
-    check(not bad and checked, "контрольные суммы IPv4/TCP/UDP верны (%d кадров, ошибок %d)" % (len(checked), len(bad)))
+    check(not bad and checked, "IPv4/TCP/UDP checksums are correct (%d frames, %d errors)" % (len(checked), len(bad)))
     changed1 = sum(1 for f in got_ip[n:2 * n] if f not in expset)
     changed2 = sum(1 for f in got_ip[2 * n:] if f not in expset)
-    check(changed1 == n and changed2 == n, "все IP-кадры кругов 1 и 2 изменены (%d, %d из %d)" % (changed1, changed2, n))
-    check(not (set(got_ip[n:2 * n]) & set(got_ip[2 * n:])), "круги 1 и 2 дают разные кадры")
+    check(changed1 == n and changed2 == n, "all IP frames of laps 1 and 2 changed (%d, %d of %d)" % (changed1, changed2, n))
+    check(not (set(got_ip[n:2 * n]) & set(got_ip[2 * n:])), "laps 1 and 2 produce different frames")
     l2_ok = all(a[:12] == b[:12] for a, b in zip(got_ip[n:2 * n], got_ip[:n]))
-    check(l2_ok, "MAC-адреса на изменённых кругах те же")
+    check(l2_ok, "MAC addresses on changed laps are the same")
 
 
 def t_cli(pcaps):
-    print("== CLI и ошибки")
+    print("== CLI and errors")
     rc, out = run_afr(["--analyze", os.path.join(pcaps, "fake.pcapng")])
-    check(rc == 1 and "editcap -F pcap" in out, "pcapng: код 1 и подсказка editcap")
+    check(rc == 1 and "editcap -F pcap" in out, "pcapng: code 1 and editcap hint")
     rc, out = run_afr(["--bogus"])
-    check(rc == 2, "неизвестная опция: код 2")
+    check(rc == 2, "unknown option: code 2")
     rc, out = run_afr(["--help"])
-    check(rc == 0 and "Примеры" in out, "--help с примерами")
+    check(rc == 0 and "Examples" in out, "--help with examples")
     rc, out = run_afr(["-i", "nonexistent0", "--topspeed", os.path.join(pcaps, "l2mix.pcap")])
-    check(rc == 1, "несуществующий интерфейс: код 1")
-    # SIGINT при бесконечном цикле
+    check(rc == 1, "nonexistent interface: code 1")
+    # SIGINT during an infinite loop
     p = subprocess.Popen([BIN, "-i", TX, "--pps", "2000", "--loop", "0", os.path.join(pcaps, "timing.pcap")],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     time.sleep(1.5)
     p.send_signal(signal.SIGINT)
     out = p.communicate(timeout=10)[0].decode()
-    check(p.returncode == 0 and "Итог" in out and "остановлено" in out, "SIGINT: итоговая статистика и код 0")
+    check(p.returncode == 0 and "Summary" in out and "stopped" in out, "SIGINT: final statistics and code 0")
     rc, out = run_afr(["-i", TX, "-q", "--topspeed", os.path.join(pcaps, "truncated_file.pcap")])
-    check(rc == 0 and "обрезан" in out, "обрезанный файл: предупреждение, отправка того, что есть")
+    check(rc == 0 and "truncated" in out, "truncated file: warning, sends what is available")
 
 
 def main():
@@ -434,9 +447,9 @@ def main():
         if not a.only or name in a.only.split(","):
             fn()
     if FAILED:
-        print("\nНЕ ПРОЙДЕНО: %d" % len(FAILED))
+        print("\nFAILED: %d" % len(FAILED))
         sys.exit(1)
-    print("\nФункциональные тесты пройдены")
+    print("\nFunctional tests passed")
 
 
 if __name__ == "__main__":

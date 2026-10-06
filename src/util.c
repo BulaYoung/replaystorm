@@ -15,7 +15,7 @@ void afr_log_err(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
-	fputs("afreplay: ошибка: ", stderr);
+	fputs("afreplay: error: ", stderr);
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
 	va_end(ap);
@@ -25,7 +25,7 @@ void afr_log_warn(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
-	fputs("ПРЕДУПРЕЖДЕНИЕ: ", stderr);
+	fputs("WARNING: ", stderr);
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
 	va_end(ap);
@@ -247,7 +247,7 @@ int afr_iface_mtu(const char *iface, unsigned *mtu)
 
 int afr_iface_speed(const char *iface, double *bps)
 {
-	/* /sys/.../speed отдаёт то же значение, что ethtool (Мбит/с). */
+	/* /sys/.../speed reports the same value as ethtool (Mbit/s). */
 	uint64_t v;
 	if (afr_sysfs_read_u64(iface, "speed", &v) < 0 || v == 0 || v >= 0xFFFFFFFFull)
 		return -1;
@@ -258,30 +258,30 @@ int afr_iface_speed(const char *iface, double *bps)
 void afr_fmt_bps(char *buf, size_t n, double bps)
 {
 	if (bps >= 1e9)
-		snprintf(buf, n, "%.2f Гбит/с", bps / 1e9);
+		snprintf(buf, n, "%.2f Gbit/s", bps / 1e9);
 	else if (bps >= 1e6)
-		snprintf(buf, n, "%.2f Мбит/с", bps / 1e6);
+		snprintf(buf, n, "%.2f Mbit/s", bps / 1e6);
 	else if (bps >= 1e3)
-		snprintf(buf, n, "%.2f Кбит/с", bps / 1e3);
+		snprintf(buf, n, "%.2f Kbit/s", bps / 1e3);
 	else
-		snprintf(buf, n, "%.0f бит/с", bps);
+		snprintf(buf, n, "%.0f bit/s", bps);
 }
 
 void afr_fmt_ns(char *buf, size_t n, double ns)
 {
 	double a = fabs(ns);
 	if (a >= 86400e9)
-		snprintf(buf, n, "%.2f сут", ns / 86400e9);
+		snprintf(buf, n, "%.2f days", ns / 86400e9);
 	else if (a >= 3600e9)
-		snprintf(buf, n, "%.2f ч", ns / 3600e9);
+		snprintf(buf, n, "%.2f h", ns / 3600e9);
 	else if (a >= 1e9)
-		snprintf(buf, n, "%.3f с", ns / 1e9);
+		snprintf(buf, n, "%.3f s", ns / 1e9);
 	else if (a >= 1e6)
-		snprintf(buf, n, "%.2f мс", ns / 1e6);
+		snprintf(buf, n, "%.2f ms", ns / 1e6);
 	else if (a >= 1e3)
-		snprintf(buf, n, "%.2f мкс", ns / 1e3);
+		snprintf(buf, n, "%.2f us", ns / 1e3);
 	else
-		snprintf(buf, n, "%.0f нс", ns);
+		snprintf(buf, n, "%.0f ns", ns);
 }
 
 void afr_fmt_count(char *buf, size_t n, double v)
@@ -306,7 +306,7 @@ void afr_fmt_abs_ts(char *buf, size_t n, int64_t ns)
 	}
 	struct tm tm;
 	if (!gmtime_r(&sec, &tm)) {
-		snprintf(buf, n, "%lld нс", (long long)ns);
+		snprintf(buf, n, "%lld ns", (long long)ns);
 		return;
 	}
 	char d[64];

@@ -99,25 +99,25 @@ static void truncated(void)
 	uint64_t off;
 	pcap_rec_t r = {0};
 
-	/* Обрезаны данные последней записи */
+	/* Data of the last record truncated */
 	w.len = full - 10;
 	CHECK_EQ(open_mem(&pf, &w, err), 0);
 	off = PCAP_FILE_HDR_LEN;
 	CHECK_EQ(pcap_next(&pf, &off, &r), PCAP_REC_OK);
 	CHECK_EQ(pcap_next(&pf, &off, &r), PCAP_REC_TRUNCATED);
 
-	/* Обрезан заголовок записи */
+	/* Record header truncated */
 	w.len = PCAP_FILE_HDR_LEN + 16 + 60 + 7;
 	CHECK_EQ(open_mem(&pf, &w, err), 0);
 	off = PCAP_FILE_HDR_LEN;
 	CHECK_EQ(pcap_next(&pf, &off, &r), PCAP_REC_OK);
 	CHECK_EQ(pcap_next(&pf, &off, &r), PCAP_REC_TRUNCATED);
 
-	/* Обрезан заголовок файла */
+	/* File header truncated */
 	w.len = 10;
 	CHECK(open_mem(&pf, &w, err) < 0);
 
-	/* Безумный caplen */
+	/* Insane caplen */
 	file_hdr(&w, 0, 0, 1);
 	put32(&w, 1);
 	put32(&w, 0);
@@ -143,16 +143,16 @@ static void bad_headers(void)
 		put32(&w, 0);
 	CHECK(open_mem(&pf, &w, err) < 0);
 	CHECK(strstr(err, "editcap -F pcap") != NULL);
-	/* неизвестная сигнатура */
+	/* unknown magic */
 	w.len = 0;
 	put32(&w, 0xdeadbeef);
 	for (int i = 0; i < 5; i++)
 		put32(&w, 0);
 	CHECK(open_mem(&pf, &w, err) < 0);
-	/* неподдерживаемый linktype */
+	/* unsupported linktype */
 	file_hdr(&w, 0, 0, 105);
 	CHECK(open_mem(&pf, &w, err) < 0);
-	/* RAW и FCS-биты в linktype */
+	/* RAW and FCS bits in linktype */
 	file_hdr(&w, 0, 0, 101);
 	CHECK_EQ(open_mem(&pf, &w, err), 0);
 	CHECK_EQ(pf.raw_ip, 1);
@@ -169,9 +169,9 @@ static void index_build(void)
 	wbuf_t w;
 	file_hdr(&w, 0, 0, 1);
 	rec(&w, 1700000000, 0, 60, 60);
-	rec(&w, 1700000000, 10, 2000, 2000); /* больше MTU */
-	rec(&w, 1700000000, 20, 10, 10);     /* короче Ethernet */
-	rec(&w, 1700000000, 30, 64, 9000);   /* обрезан при захвате */
+	rec(&w, 1700000000, 10, 2000, 2000); /* larger than MTU */
+	rec(&w, 1700000000, 20, 10, 10);     /* shorter than Ethernet */
+	rec(&w, 1700000000, 30, 64, 9000);   /* truncated at capture */
 	pcap_file_t pf;
 	char err[256];
 	CHECK_EQ(open_mem(&pf, &w, err), 0);
@@ -182,7 +182,7 @@ static void index_build(void)
 	CHECK_EQ(ix.st.skipped[SKIP_TOO_BIG], 1);
 	CHECK_EQ(ix.st.skipped[SKIP_TOO_SMALL], 1);
 	CHECK_EQ(ix.st.truncated_caplen, 1);
-	CHECK_EQ(ix.shard[0], 4); /* не-IP шард */
+	CHECK_EQ(ix.shard[0], 4); /* non-IP shard */
 	CHECK_EQ(ix.shard[1], SHARD_SKIP);
 	CHECK_EQ(ix.shard[2], SHARD_SKIP);
 	CHECK_EQ(OFFLEN_LEN(ix.offlen[3]), 64);

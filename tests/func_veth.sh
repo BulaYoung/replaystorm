@@ -1,7 +1,7 @@
 #!/bin/bash
-# Функциональные тесты на паре veth в отдельном network namespace.
-# Под root используется unshare -n, без root — unshare -rn (user namespace).
-# Если namespace создать нельзя, тест пропускается (код 0, сообщение SKIP).
+# Functional tests on a veth pair in a separate network namespace.
+# As root, unshare -n is used; without root, unshare -rn (user namespace).
+# If a namespace cannot be created, the test is skipped (exit code 0, SKIP message).
 set -u
 DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$DIR/.." && pwd)
@@ -15,15 +15,15 @@ if [ -z "${AFR_IN_NS:-}" ]; then
 		NS="unshare -rnm"
 	fi
 	if ! $NS true 2>/dev/null; then
-		echo "SKIP: нет root и недоступны user namespaces — функциональные тесты пропущены"
+		echo "SKIP: not root and user namespaces are unavailable — functional tests skipped"
 		exit 0
 	fi
 	exec env AFR_IN_NS=1 $NS "$0" "$PCAPS" "$@"
 fi
 
-# Свой sysfs, чтобы видеть интерфейсы этого namespace
-mount -t sysfs sysfs /sys 2>/dev/null || echo "sysfs не смонтирован: статистика интерфейса будет недоступна"
-ip link add name va type veth peer name vb || { echo "SKIP: не удалось создать veth"; exit 0; }
+# Own sysfs to see this namespace's interfaces
+mount -t sysfs sysfs /sys 2>/dev/null || echo "sysfs not mounted: interface statistics will be unavailable"
+ip link add name va type veth peer name vb || { echo "SKIP: failed to create veth"; exit 0; }
 for i in va vb; do
 	echo 1 >/proc/sys/net/ipv6/conf/$i/disable_ipv6 2>/dev/null
 	ip link set $i mtu 1500 up

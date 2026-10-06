@@ -8,16 +8,16 @@ int main(void)
 		const char *name;
 		void (*fn)(void);
 	} suites[] = {
-	    {"парсер pcap", test_pcap},
-	    {"хеш и шардирование", test_hash},
-	    {"расписание", test_sched},
-	    {"модификация на круге", test_mutate},
+	    {"pcap parser", test_pcap},
+	    {"hash and sharding", test_hash},
+	    {"schedule", test_sched},
+	    {"loop mutation", test_mutate},
 	};
 	for (size_t i = 0; i < sizeof(suites) / sizeof(suites[0]); i++) {
 		int before = t_failed;
 		suites[i].fn();
-		printf("%s: %s\n", suites[i].name, t_failed == before ? "OK" : "ОШИБКИ");
+		printf("%s: %s\n", suites[i].name, t_failed == before ? "OK" : "FAILED");
 	}
-	printf("проверок: %d, не пройдено: %d\n", t_checks, t_failed);
+	printf("checks: %d, failed: %d\n", t_checks, t_failed);
 	return t_failed ? 1 : 0;
 }

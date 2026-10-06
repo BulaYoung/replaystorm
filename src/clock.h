@@ -1,12 +1,12 @@
 /*
- * Быстрые часы для горячего цикла.
+ * Fast clock for the hot loop.
  *
- * Обычно CLOCK_MONOTONIC через vDSO стоит ~20 нс. Но если ядро перешло на
- * clocksource hpet/acpi_pm (TSC отбракован, бывает на ноутбуках и в ВМ), каждый
- * вызов стоит ~1 мкс. Тогда используем rdtsc: частота калибруется один раз по
- * CLOCK_MONOTONIC, смещение — в каждом потоке отдельно (на случай, если TSC
- * разных ядер не синхронизированы). Результат — наносекунды в той же шкале,
- * что CLOCK_MONOTONIC.
+ * CLOCK_MONOTONIC via vDSO normally costs ~20 ns. But if the kernel has fallen
+ * back to the hpet/acpi_pm clocksource (TSC marked unstable, which happens on
+ * laptops and VMs), each call costs ~1 us. In that case we use rdtsc: the
+ * frequency is calibrated once against CLOCK_MONOTONIC, and the offset is set per
+ * thread (in case TSCs of different cores are not synchronized). The result is
+ * nanoseconds on the same timeline as CLOCK_MONOTONIC.
  */
 #ifndef AFR_CLOCK_H
 #define AFR_CLOCK_H
@@ -27,13 +27,13 @@ extern double afr_clk_ns_per_tick;
 extern __thread uint64_t afr_clk_base_tick;
 extern __thread int64_t afr_clk_base_ns;
 
-/* Выбрать часы и откалибровать частоту TSC. Возвращает описание для лога. */
+/* Choose the clock and calibrate the TSC frequency. Returns a description for the log. */
 const char *afr_clock_init(int mode);
-/* Привязать смещение TSC текущего потока к CLOCK_MONOTONIC. */
+/* Align the current thread's TSC offset to CLOCK_MONOTONIC. */
 void afr_clock_thread_init(void);
 
-/* Сверить TSC с CLOCK_MONOTONIC и пересинхронизировать при расхождении (вызывать
- * там, где поток всё равно собирается спать). Возвращает 1, если была пересинхронизация. */
+/* Check TSC against CLOCK_MONOTONIC and resync on drift (call where the thread
+ * is about to sleep anyway). Returns 1 if a resync happened. */
 #define AFR_CLOCK_RESYNC_NS (50 * NS_PER_US)
 int afr_clock_resync(void);
 

@@ -1,4 +1,4 @@
-/* Минимальный фреймворк юнит-тестов. */
+/* Minimal unit test framework. */
 #ifndef AFR_T_H
 #define AFR_T_H
 
@@ -12,7 +12,7 @@ extern int t_failed, t_checks;
 		t_checks++;                                                                    \
 		if (!(cond)) {                                                                 \
 			t_failed++;                                                                \
-			fprintf(stderr, "  НЕ ПРОЙДЕНО %s:%d: %s\n", __FILE__, __LINE__, #cond);   \
+			fprintf(stderr, "  FAILED %s:%d: %s\n", __FILE__, __LINE__, #cond);   \
 		}                                                                              \
 	} while (0)
 
@@ -22,7 +22,7 @@ extern int t_failed, t_checks;
 		t_checks++;                                                                    \
 		if (_a != _b) {                                                                \
 			t_failed++;                                                                \
-			fprintf(stderr, "  НЕ ПРОЙДЕНО %s:%d: %s == %s (%lld != %lld)\n", __FILE__, \
+			fprintf(stderr, "  FAILED %s:%d: %s == %s (%lld != %lld)\n", __FILE__, \
 			        __LINE__, #a, #b, _a, _b);                                         \
 		}                                                                              \
 	} while (0)

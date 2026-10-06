@@ -13,32 +13,32 @@ static int prepare(afr_ctx_t *c)
 	opts_t *o = c->o;
 	char err[512];
 
-	/* Ядра и число потоков. */
+	/* CPUs and thread count. */
 	if (o->cpus) {
 		c->ncpus = afr_parse_cpulist(o->cpus, c->cpus, MAX_CPUS);
 		if (c->ncpus <= 0) {
-			afr_log_err("неверный список --cpus '%s'", o->cpus);
+			afr_log_err("invalid --cpus list '%s'", o->cpus);
 			return 2;
 		}
 	} else {
 		c->ncpus = afr_iface_cpus(o->iface, c->cpus, MAX_CPUS, &c->cpus_from_numa);
 		if (c->ncpus <= 0) {
-			afr_log_err("не удалось определить доступные CPU");
+			afr_log_err("failed to determine available CPUs");
 			return 1;
 		}
 	}
 	c->ip_threads = o->threads ? o->threads : (c->ncpus > 1 ? (unsigned)c->ncpus - 1 : 1);
 	if (c->ip_threads >= SHARD_SKIP) {
-		afr_log_err("слишком много потоков");
+		afr_log_err("too many threads");
 		return 2;
 	}
 
-	/* MTU и скорость линка. */
+	/* MTU and link speed. */
 	c->mtu = o->mtu;
 	if (!c->mtu && o->iface) {
 		if (afr_iface_mtu(o->iface, &c->mtu) < 0) {
 			if (!o->analyze) {
-				afr_log_warn("не удалось прочитать MTU %s из sysfs, считаю 1500 (задайте --mtu)",
+				afr_log_warn("failed to read MTU of %s from sysfs, assuming 1500 (set --mtu)",
 				             o->iface);
 			}
 			c->mtu = 1500;
@@ -52,10 +52,10 @@ static int prepare(afr_ctx_t *c)
 		c->link_src = "ethtool";
 	if (c->link_bps <= 0) {
 		c->link_bps = 0;
-		c->link_src = "неизвестна";
+		c->link_src = "unknown";
 	}
 
-	/* Файл. */
+	/* File. */
 	if (o->preload) {
 		struct stat st;
 		uint64_t avail = 0;
@@ -68,17 +68,17 @@ static int prepare(afr_ctx_t *c)
 			fclose(mi);
 		}
 		if (stat(o->file, &st) == 0 && avail && (uint64_t)st.st_size > avail * 1024 * 9 / 10)
-			afr_log_warn("--preload: файл %.1f ГБ, а доступно %.1f ГБ памяти — страницы будут "
-			             "вытесняться, и предзагрузка не поможет",
+			afr_log_warn("--preload: file is %.1f GB but only %.1f GB of memory is available; pages will be "
+			             "evicted and preloading will not help",
 			             (double)st.st_size / 1e9, (double)avail * 1024 / 1e9);
-		afr_log_info("Загружаю файл в память целиком (--preload)...");
+		afr_log_info("Loading the whole file into memory (--preload)...");
 	}
 	if (pcap_open(&c->pf, o->file, o->preload, err, sizeof(err)) < 0) {
 		afr_log_err("%s", err);
 		return 1;
 	}
 
-	/* Индекс. */
+	/* Index. */
 	int64_t t0 = afr_now_ns();
 	idx_cfg_t icfg = {
 	    .ip_shards = c->ip_threads,
@@ -92,12 +92,12 @@ static int prepare(afr_ctx_t *c)
 	int64_t t1 = afr_now_ns();
 	c->index_ns = t1 - t0;
 	if (c->ix.n == 0) {
-		afr_log_err("в файле нет ни одного пакета%s",
-		            c->ix.tail_problem ? " (файл обрезан или повреждён сразу после заголовка)" : "");
+		afr_log_err("the file contains no packets%s",
+		            c->ix.tail_problem ? " (file is truncated or corrupt right after the header)" : "");
 		return 1;
 	}
 
-	/* Шкала времени. */
+	/* Timeline. */
 	ts_cfg_t tcfg = {
 	    .order = o->ts_order,
 	    .max_gap = o->max_gap,
@@ -106,26 +106,48 @@ static int prepare(afr_ctx_t *c)
 	    .now_ns = afr_realtime_ns(),
 	};
 	if (afr_ts_normalize(c->ix.ts, c->ix.shard, c->ix.n, &tcfg, &c->tsr) < 0) {
-		afr_log_err("нет памяти для нормализации тайм-стампов");
+		afr_log_err("out of memory for timestamp normalization");
 		return 1;
 	}
 	if (c->tsr.n == 0) {
-		afr_log_err("все %" PRIu64 " кадров будут пропущены (см. --analyze)", c->ix.st.pkts);
+		afr_log_err("all %" PRIu64 " frames would be skipped (see --analyze)", c->ix.st.pkts);
 		if (!o->analyze)
 			return 1;
+	}
+
+	if (o->mode == MODE_MBPS && o->line_frac > 0) {
+		/* Pacing works on L2 bytes; convert the wire-rate target using the file's own
+		 * ratio of L2 bytes to on-the-wire bytes (preamble, IFG, FCS, 60-byte minimum). */
+		if (c->link_bps <= 0) {
+			afr_log_err("--mbps line/N%%: link speed is unknown, set it with --link-speed");
+			return 2;
+		}
+		uint64_t l2 = 0;
+		for (unsigned s = 0; s < c->ix.nshards; s++)
+			l2 += c->ix.shard_bytes[s];
+		if (l2 == 0 || c->ix.st.l1_bytes == 0) {
+			afr_log_err("--mbps line/N%%: no frames to send");
+			return 1;
+		}
+		double ratio = (double)l2 / (double)c->ix.st.l1_bytes;
+		o->mbps = c->link_bps * o->line_frac * ratio / 1e6;
+		char b1[64];
+		afr_fmt_bps(b1, sizeof(b1), c->link_bps);
+		afr_log_info("--mbps %.4g%% of %s link on the wire -> %.0f Mbit/s L2 (L2/wire byte ratio %.4f)",
+		             o->line_frac * 100, b1, o->mbps, ratio);
 	}
 
 	c->mult = o->mode == MODE_TIMED ? o->multiplier : 1.0;
 	if (o->mode == MODE_TIMED && o->duration_ns > 0) {
 		if (c->tsr.duration <= 0) {
-			afr_log_err("--duration: у файла нулевая длительность по тайм-стампам");
+			afr_log_err("--duration: the file has zero duration by timestamps");
 			return 1;
 		}
 		c->mult = (double)c->tsr.duration / (double)o->duration_ns;
 		char b1[64], b2[64];
 		afr_fmt_ns(b1, sizeof(b1), (double)c->tsr.duration);
 		afr_fmt_ns(b2, sizeof(b2), (double)o->duration_ns);
-		afr_log_info("--duration: шкала %s -> %s, множитель x%.6g", b1, b2, c->mult);
+		afr_log_info("--duration: timeline %s -> %s, multiplier x%.6g", b1, b2, c->mult);
 	}
 
 	if (o->analyze || o->mode == MODE_TIMED) {

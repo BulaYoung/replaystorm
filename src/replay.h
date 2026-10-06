@@ -1,5 +1,5 @@
 /*
- * Общий контекст запуска и интерфейсы отчёта и отправки.
+ * Shared run context and the report and replay interfaces.
  */
 #ifndef AFR_REPLAY_H
 #define AFR_REPLAY_H
@@ -16,23 +16,23 @@ typedef struct {
 	ts_result_t tsr;
 	rate_result_t rr;
 	int have_rr;
-	double mult;           /* итоговый множитель для MODE_TIMED */
-	unsigned ip_threads;   /* число IP-шардов/потоков */
+	double mult;           /* effective multiplier for MODE_TIMED */
+	unsigned ip_threads;   /* number of IP shards/threads */
 	int cpus[MAX_CPUS];
 	int ncpus;
 	int cpus_from_numa;
 	unsigned mtu;
-	double link_bps;       /* 0 — неизвестна */
+	double link_bps;       /* 0 means unknown */
 	const char *link_src;
-	int64_t index_ns, norm_ns; /* сколько заняла подготовка */
+	int64_t index_ns, norm_ns; /* preparation time */
 } afr_ctx_t;
 
-/* Отчёт анализа (--analyze) */
+/* Analysis report (--analyze) */
 void afr_report_analysis(const afr_ctx_t *c);
-/* Предупреждения перед стартом; возвращает число предупреждений. */
+/* Pre-start warnings; returns the number of warnings. */
 int afr_report_warnings(const afr_ctx_t *c);
 
-/* Отправка; возвращает код выхода. */
+/* Replay; returns the exit code. */
 int afr_replay_run(afr_ctx_t *c);
 
 #endif
