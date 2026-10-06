@@ -86,6 +86,14 @@ static inline int64_t afr_target(int64_t t0, uint64_t lap, int64_t lap_len, int6
 	return t0 + (int64_t)(((double)lap * (double)lap_len + (double)sched) * inv_mult);
 }
 
+/*
+ * Timeline for --mbps/--pps: ts[i] = (bytes, or packets, of all non-skipped packets before
+ * i in file order) * ns_per_unit. Skipped packets get the value of the next one. Returns
+ * the length of one lap in ns.
+ */
+int64_t afr_rate_timeline(int64_t *ts, const uint64_t *offlen, const uint16_t *shard, size_t n,
+                          uint32_t l2_extra, int per_packet, double ns_per_unit, unsigned threads);
+
 /* ---------- Rate profile ---------- */
 
 #define RATE_WINDOWS 3

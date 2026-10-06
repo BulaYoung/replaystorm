@@ -109,8 +109,9 @@ A file much larger than RAM (for example 500 GB on a 62 GB machine) cannot be pr
 streamed from disk during replay:
 
 - A background thread (`afr-stream`) wakes every 20 ms and keeps `--readahead` bytes (default
-  2 GB) of the file requested with `madvise(MADV_WILLNEED)` ahead of the fastest sender thread,
-  so sender threads do not stall on disk reads inside the hot loop. The nearest 512 MB are
+  2 GB) of the file requested with `madvise(MADV_WILLNEED)` ahead of the sender threads, so
+  they do not stall on disk reads inside the hot loop. Each thread reports the file position it
+  reads *next*, so a thread whose next packet is far ahead does not hold anything back. The nearest 512 MB are
   also pre-mapped into the process with `MADV_POPULATE_READ` (Linux 5.14+); on older kernels
   (RHEL 8: 4.18) the background thread touches one byte per page instead, with the same
   effect: page faults and disk waits happen in that thread, not in the sender threads.
@@ -197,16 +198,20 @@ The unordered case is bound by memory bandwidth of the radix sort.
 | Mode | What it does |
 |---|---|
 | `--topspeed` | As fast as possible. Threads wait for nothing but free frames in the ring. |
-| `--mbps X` | Total rate of X Mbit/s by L2 frame length (without FCS, preamble and IFG). It is split between threads **in proportion to the byte volume of their shards**, so all threads finish at the same time and the sum equals X. |
+| `--mbps X` | Total rate of X Mbit/s by L2 frame length (without FCS, preamble and IFG). Packets are paced **in file order**: packet i is due at `T0 + (bytes of all packets before i in the file) / rate`, whichever thread sends it. The total rate is exactly X and all threads move through the file together. |
 | `--mbps line`, `--mbps N%` | Rate as a share of the link speed **on the wire** (preamble, IFG, FCS and the 60-byte minimum included): `line` = 100%, e.g. `99%`. The link speed comes from ethtool or `--link-speed`. It is converted to an L2 rate with the file's own ratio of L2 bytes to on-the-wire bytes and then paced like `--mbps X`. If an explicit `--mbps X` exceeds the link on the wire, afreplay warns before start. |
 | `--pace-slack T` | For `--mbps`/`--pps`: instead of busy-waiting for every packet, a thread sleeps and sends everything due within the next T at once (default 200 us). The schedule stays absolute, so the average rate is exact; bursts are at most T long per thread. In a 4 Gbit/s test this cut user CPU from 15.3 s to 2.5 s with the same rate. `--spin-us` only applies to timestamp replay. |
-| `--pps X` | The same, but in packets per second; split in proportion to the packet count of the shards. |
+| `--pps X` | The same, but in packets per second: packet i is due at `T0 + i / rate`. |
 | `--multiplier X` | Replay by timestamps (the default mode, X = 1). 2.0 is twice as fast, 0.5 twice as slow. |
 | `--duration T` | The multiplier is chosen so that the whole file (one lap) plays in T. Suffixes: `ns`, `us`, `ms`, `s`, `m`, `h`. |
 
-In the `--mbps` and `--pps` modes the send time is also computed from a common origin:
-`T0 + bytes_so_far × ns_per_byte`. So the error does not accumulate, and after a stall (for
-example, when the ring is full) the thread catches up with the schedule.
+In the `--mbps` and `--pps` modes the send time is also computed from a common origin, so the
+error does not accumulate, and after a stall (for example, when the ring is full) a thread
+catches up with the schedule. Pacing in file order matters for big files: an earlier version
+split the rate between threads in proportion to shard volume, so a shard whose packets were
+unevenly spread over the file (for example, non-IP frames only at the start) moved through the
+file at its own pace. The slowest thread held back drop-behind, the page cache filled up and
+the replay degraded into disk waits after a few minutes.
 
 All modes start simultaneously: threads pass a barrier and wait for the common point T0.
 

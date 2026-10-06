@@ -304,7 +304,7 @@ static void print_plan(const afr_ctx_t *c, worker_t **ws, unsigned nw)
 	case MODE_TOPSPEED: afr_log_info("Mode: top speed"); break;
 	case MODE_MBPS:
 		afr_fmt_bps(b1, sizeof(b1), o->mbps * 1e6);
-		afr_log_info("Mode: fixed rate %s (split proportionally to shard volume)", b1);
+		afr_log_info("Mode: fixed rate %s (packets paced in file order)", b1);
 		break;
 	case MODE_PPS:
 		afr_fmt_count(b1, sizeof(b1), o->pps);
@@ -349,14 +349,13 @@ int afr_replay_run(afr_ctx_t *c)
 		return 1;
 	}
 	memset(sh, 0, sizeof(*sh));
-	uint64_t tot_bytes = 0, tot_pkts = 0;
-	for (unsigned s = 0; s < c->ix.nshards; s++) {
-		tot_bytes += c->ix.shard_bytes[s];
-		tot_pkts += c->ix.shard_pkts[s];
-	}
 	if (c->ip_threads > (unsigned)c->ncpus)
 		afr_log_warn("more threads (%u) than CPUs (%d): several threads share a core",
 		             c->ip_threads, c->ncpus);
+	else if (c->ix.shard_pkts[c->ip_threads] && c->ip_threads == (unsigned)c->ncpus)
+		afr_log_warn("the non-IP thread shares CPU %d with thread 0 (%u IP threads on %d CPUs); "
+		             "use -t %u to give it its own core",
+		             c->cpus[0], c->ip_threads, c->ncpus, c->ip_threads > 1 ? c->ip_threads - 1 : 1);
 	for (unsigned s = 0; s < c->ix.nshards; s++) {
 		if (c->ix.shard_pkts[s] == 0)
 			continue;
@@ -372,11 +371,6 @@ int afr_replay_run(afr_ctx_t *c)
 		w->cpu = c->cpus[s % (unsigned)c->ncpus];
 		w->c = c;
 		w->sh = sh;
-		w->rate_share = o->mode == MODE_PPS
-		                    ? (double)c->ix.shard_pkts[s] / (double)tot_pkts
-		                    : (double)c->ix.shard_bytes[s] / (double)(tot_bytes ? tot_bytes : 1);
-		if (w->rate_share <= 0)
-			w->rate_share = 1e-9;
 		w->mutate = o->mutate_ip || o->mutate_port;
 		w->mut = (mutate_cfg_t){.ip = o->mutate_ip,
 		                        .port = o->mutate_port,

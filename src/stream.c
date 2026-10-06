@@ -81,7 +81,7 @@ static void *stream_main(void *arg)
 {
 	streamer_t *s = arg;
 	while (!atomic_load(&s->stop)) {
-		uint64_t mn = UINT64_MAX, mx = 0;
+		uint64_t mn = UINT64_MAX;
 		unsigned active = 0;
 		for (unsigned i = 0; i < s->nw; i++) {
 			if (atomic_load_explicit(&s->ws[i]->st.finished, RLX))
@@ -90,12 +90,12 @@ static void *stream_main(void *arg)
 			active++;
 			if (g < mn)
 				mn = g;
-			if (g > mx)
-				mx = g;
 		}
 		if (active) {
-			/* Readahead: keep [slowest, fastest + window) requested. */
-			uint64_t target = mx + s->window;
+			/* Every thread reports the position it reads next, and all threads move
+			 * through the file together (both timestamp and rate modes follow file
+			 * order), so the slowest position is the front: read ahead from it. */
+			uint64_t target = mn + s->window;
 			uint64_t from = s->ra_upto > mn ? s->ra_upto : mn;
 			if (from < target) {
 				apply(s, from, target, do_willneed);
@@ -105,9 +105,9 @@ static void *stream_main(void *arg)
 			if (s->populate) {
 				uint64_t ahead = s->window < STREAM_POPULATE_AHEAD ? s->window : STREAM_POPULATE_AHEAD;
 				uint64_t pfrom = s->pop_upto > mn ? s->pop_upto : mn;
-				if (pfrom < mx + ahead) {
-					apply(s, pfrom, mx + ahead, do_populate);
-					s->pop_upto = mx + ahead;
+				if (pfrom < mn + ahead) {
+					apply(s, pfrom, mn + ahead, do_populate);
+					s->pop_upto = mn + ahead;
 				}
 			}
 			/* Drop-behind: everything the slowest thread has passed, minus a margin. */

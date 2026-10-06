@@ -196,6 +196,13 @@ static int prepare(afr_ctx_t *c)
 		                     &c->rr) == 0)
 			c->have_rr = 1;
 	}
+	if (!o->analyze && (o->mode == MODE_MBPS || o->mode == MODE_PPS)) {
+		/* Pace in file order: every packet gets its place on a common rate timeline. */
+		double ns_per_unit = o->mode == MODE_MBPS ? 8e9 / (o->mbps * 1e6) : 1e9 / o->pps;
+		c->rate_lap_ns = afr_rate_timeline(c->ix.ts, c->ix.offlen, c->ix.shard, c->ix.n,
+		                                   c->pf.raw_ip ? 14 : 0, o->mode == MODE_PPS,
+		                                   ns_per_unit, icfg.hash_threads);
+	}
 	c->norm_ns = afr_now_ns() - t1;
 	return 0;
 }

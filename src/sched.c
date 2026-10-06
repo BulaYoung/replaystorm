@@ -1143,3 +1143,62 @@ uint64_t afr_lh_quantile(const uint64_t *hist, double q)
 	}
 	return afr_lh_upper(LH_BUCKETS - 1);
 }
+
+/* ---------- Rate timeline (--mbps / --pps) ---------- */
+
+typedef struct {
+	int64_t *ts;
+	const uint64_t *offlen;
+	const uint16_t *shard;
+	uint32_t extra;
+	int per_packet;
+	double ns_per_unit;
+	uint64_t *sum; /* per chunk: units in the chunk, then units before the chunk */
+} rtl_ctx_t;
+
+static inline uint64_t rtl_units(const rtl_ctx_t *x, size_t i)
+{
+	if (x->shard && x->shard[i] == SHARD_SKIP)
+		return 0;
+	return x->per_packet ? 1 : OFFLEN_LEN(x->offlen[i]) + x->extra;
+}
+
+static void rtl_sum(void *arg, unsigned t, size_t a, size_t b)
+{
+	rtl_ctx_t *x = arg;
+	uint64_t s = 0;
+	for (size_t i = a; i < b; i++)
+		s += rtl_units(x, i);
+	x->sum[t] = s;
+}
+
+static void rtl_fill(void *arg, unsigned t, size_t a, size_t b)
+{
+	rtl_ctx_t *x = arg;
+	uint64_t cum = x->sum[t];
+	for (size_t i = a; i < b; i++) {
+		x->ts[i] = (int64_t)((double)cum * x->ns_per_unit);
+		cum += rtl_units(x, i);
+	}
+}
+
+int64_t afr_rate_timeline(int64_t *ts, const uint64_t *offlen, const uint16_t *shard, size_t n,
+                          uint32_t l2_extra, int per_packet, double ns_per_unit, unsigned threads)
+{
+	unsigned nt = afr_par_threads(threads, n);
+	uint64_t sums[256];
+	rtl_ctx_t x = {.ts = ts, .offlen = offlen, .shard = shard, .extra = l2_extra,
+	               .per_packet = per_packet, .ns_per_unit = ns_per_unit, .sum = sums};
+	if (nt > 256)
+		nt = 256;
+	afr_par_for(nt, n, 1, rtl_sum, &x);
+	uint64_t total = 0;
+	for (unsigned t = 0; t < nt; t++) {
+		uint64_t s = sums[t];
+		sums[t] = total;
+		total += s;
+	}
+	afr_par_for(nt, n, 1, rtl_fill, &x);
+	int64_t lap = (int64_t)((double)total * ns_per_unit);
+	return lap > 0 ? lap : 1000;
+}

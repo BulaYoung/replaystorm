@@ -358,11 +358,16 @@ static inline void hist_add(worker_t *w, int64_t late)
 		PUB(w->st.late_max, late);
 }
 
-static inline void publish_pos(worker_t *w, const pkt_t *p, uint64_t lap, int64_t lap_len)
+static inline void publish_pos(worker_t *w, size_t i, uint64_t lap, int64_t lap_len)
 {
-	PUB(w->st.pos, (int64_t)lap * lap_len + p->ts);
+	PUB(w->st.pos, (int64_t)lap * lap_len + w->pk[i].ts);
 	PUB(w->st.lap, lap);
-	PUB(w->st.gpos, lap * w->c->pf.size + OFFLEN_OFF(p->offlen));
+	/* The streamer needs where this thread reads next, not where it has been: a thread
+	 * whose next packet is far ahead must not hold back dropping the pages behind. */
+	const uint64_t size = w->c->pf.size;
+	uint64_t next = i + 1 < w->n ? lap * size + OFFLEN_OFF(w->pk[i + 1].offlen)
+	                             : (lap + 1) * size + OFFLEN_OFF(w->pk[0].offlen);
+	PUB(w->st.gpos, next);
 }
 
 static void run(worker_t *w)
@@ -372,20 +377,15 @@ static void run(worker_t *w)
 	const int64_t t0 = atomic_load(&w->sh->t0);
 	const int64_t spin = o->spin_ns;
 	const int64_t pace_slack = o->pace_slack;
-	const int64_t lap_len = c->tsr.lap_len;
+	/* Rate modes have their own timeline: cumulative bytes (or packets) in file order. */
+	const int64_t lap_len = (o->mode == MODE_MBPS || o->mode == MODE_PPS) ? c->rate_lap_ns
+	                                                                      : c->tsr.lap_len;
 	const uint64_t loops = o->loops;
 	const int mode = o->mode;
 	const int asis = o->ts_order == TS_ORDER_ASIS;
 	const int rebase = o->lag_policy == LAG_REBASE;
 	const int64_t lag_thr = o->lag_threshold;
 	const double inv_mult = 1.0 / c->mult;
-	const uint32_t l2_extra = c->pf.raw_ip ? 14 : 0;
-	double ns_per_unit = 0; /* for --mbps: ns per byte, for --pps: ns per packet */
-	if (mode == MODE_MBPS)
-		ns_per_unit = 8e9 / (o->mbps * 1e6 * w->rate_share);
-	else if (mode == MODE_PPS)
-		ns_per_unit = 1e9 / (o->pps * w->rate_share);
-	double cum = 0;
 
 	/* All modes start simultaneously at the common point T0. */
 	w->now = wait_until(t0, spin);
@@ -416,15 +416,16 @@ static void run(worker_t *w)
 					}
 				}
 			} else if (mode != MODE_TOPSPEED) {
-				/* Fixed rate needs no microsecond precision: sleep instead of spinning and
-				 * send everything due within the next pace_slack at once. The schedule is
-				 * absolute, so the average rate is unchanged. */
-				pace(w, t0 + (int64_t)(cum * ns_per_unit) - pace_slack, 0);
-				cum += mode == MODE_MBPS ? (double)(OFFLEN_LEN(p->offlen) + l2_extra) : 1.0;
+				/* p->ts is the packet's place in the common rate timeline (bytes or packets
+				 * before it in the file, converted to ns), so all threads move through the
+				 * file together and the total rate is exact. Fixed rate needs no
+				 * microsecond precision: sleep instead of spinning and send everything due
+				 * within the next pace_slack at once. */
+				pace(w, afr_target(t0, lap, lap_len, p->ts, 1.0) - pace_slack, 0);
 			}
 			if (AFR_UNLIKELY(emit(w, p, lap) < 0))
 				return;
-			publish_pos(w, p, lap, lap_len);
+			publish_pos(w, i, lap, lap_len);
 		}
 	}
 }
@@ -456,6 +457,8 @@ static int build_shard(worker_t *w)
 		afr_radix_sort16((rec16_t *)w->pk, tmp, k);
 		free(tmp);
 	}
+	if (w->n)
+		atomic_store(&w->st.gpos, OFFLEN_OFF(w->pk[0].offlen));
 	return 0;
 }
 

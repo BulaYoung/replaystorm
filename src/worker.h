@@ -49,7 +49,6 @@ typedef struct {
 	int is_l2;
 	const afr_ctx_t *c;
 	shared_t *sh;
-	double rate_share;     /* share of the total rate (--mbps/--pps) */
 	mutate_cfg_t mut;
 	int mutate;
 	/* data */

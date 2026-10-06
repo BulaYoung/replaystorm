@@ -268,6 +268,7 @@ static void histogram(void)
 }
 
 static void parallel_equivalence(void);
+static void rate_timeline(void);
 
 void test_sched(void)
 {
@@ -280,6 +281,7 @@ void test_sched(void)
 	rate();
 	histogram();
 	parallel_equivalence();
+	rate_timeline();
 }
 
 /* ---------- Parallel implementation vs the original single-threaded one ---------- */
@@ -431,4 +433,39 @@ static void parallel_equivalence(void)
 	free(b);
 	free(sh);
 	free(ol);
+}
+
+static void rate_timeline(void)
+{
+	/* ts = units before the packet in file order * ns_per_unit; skipped packets add nothing */
+	int64_t ts[5];
+	uint64_t ol[5] = {OFFLEN_MAKE(0, 100), OFFLEN_MAKE(0, 200), OFFLEN_MAKE(0, 50),
+	                  OFFLEN_MAKE(0, 300), OFFLEN_MAKE(0, 10)};
+	uint16_t sh[5] = {0, 3, SHARD_SKIP, 1, 0};
+	int64_t lap = afr_rate_timeline(ts, ol, sh, 5, 0, 0, 2.0, 1);
+	int64_t e[] = {0, 200, 600, 600, 1200};
+	check_arr(ts, e, 5);
+	CHECK_EQ(lap, 1220);
+	/* per packet, with the synthetic Ethernet header ignored */
+	lap = afr_rate_timeline(ts, ol, sh, 5, 14, 1, 10.0, 1);
+	int64_t e2[] = {0, 10, 20, 20, 30};
+	check_arr(ts, e2, 5);
+	CHECK_EQ(lap, 40);
+	/* parallel version is identical */
+	enum { N = 400000 };
+	int64_t *a = malloc(N * sizeof(int64_t)), *b = malloc(N * sizeof(int64_t));
+	uint64_t *o2 = malloc(N * sizeof(uint64_t));
+	uint16_t *s2 = malloc(N * sizeof(uint16_t));
+	for (size_t i = 0; i < N; i++) {
+		o2[i] = OFFLEN_MAKE(i, 60 + rnd() % 1400);
+		s2[i] = rnd() % 50 == 0 ? SHARD_SKIP : 0;
+	}
+	int64_t l1 = afr_rate_timeline(a, o2, s2, N, 0, 0, 0.8, 1);
+	int64_t l7 = afr_rate_timeline(b, o2, s2, N, 0, 0, 0.8, 7);
+	CHECK_EQ(l1, l7);
+	CHECK(memcmp(a, b, N * sizeof(int64_t)) == 0);
+	free(a);
+	free(b);
+	free(o2);
+	free(s2);
 }
