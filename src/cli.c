@@ -60,6 +60,10 @@ void afr_usage(FILE *f)
 	    "\n"
 	    "Input:\n"
 	    "  --preload               load the whole file into memory before start\n"
+	    "  --readahead SIZE        keep this much of the file requested ahead of the senders\n"
+	    "                          (default 2G); a background thread does it every 20 ms\n"
+	    "  --drop-behind M         auto | on | off: drop already sent parts of the file from the\n"
+	    "                          page cache; auto = on when the file is larger than free RAM\n"
 	    "  --smac MAC, --dmac MAC  MAC addresses of the synthetic Ethernet header for RAW IP\n"
 	    "\n"
 	    "Looping with mutation:\n"
@@ -114,6 +118,8 @@ enum {
 	O_LINK,
 	O_MTU,
 	O_PRELOAD,
+	O_READAHEAD,
+	O_DROP_BEHIND,
 	O_SMAC,
 	O_DMAC,
 	O_ANALYZE,
@@ -151,6 +157,8 @@ static const struct option long_opts[] = {
     {"link-speed", required_argument, NULL, O_LINK},
     {"mtu", required_argument, NULL, O_MTU},
     {"preload", no_argument, NULL, O_PRELOAD},
+    {"readahead", required_argument, NULL, O_READAHEAD},
+    {"drop-behind", required_argument, NULL, O_DROP_BEHIND},
     {"smac", required_argument, NULL, O_SMAC},
     {"dmac", required_argument, NULL, O_DMAC},
     {"analyze", no_argument, NULL, O_ANALYZE},
@@ -180,6 +188,8 @@ int afr_parse_args(int argc, char **argv, opts_t *o)
 	o->spin_ns = 50 * NS_PER_US;
 	o->timing_res = 2 * NS_PER_US;
 	o->batch = 64;
+	o->readahead = 2ull << 30;
+	o->drop_behind = -1;
 	o->ring_frames = 4096;
 	static const uint8_t smac[6] = {0x02, 0, 0, 0, 0, 0x01}, dmac[6] = {0x02, 0, 0, 0, 0, 0x02};
 	memcpy(o->smac, smac, 6);
@@ -332,6 +342,20 @@ int afr_parse_args(int argc, char **argv, opts_t *o)
 			o->mtu = (unsigned)u;
 			break;
 		case O_PRELOAD: o->preload = 1; break;
+		case O_READAHEAD:
+			if (afr_parse_size(optarg, &o->readahead) < 0 || o->readahead < (16u << 20))
+				return bad("--readahead", optarg);
+			break;
+		case O_DROP_BEHIND:
+			if (!strcmp(optarg, "auto"))
+				o->drop_behind = -1;
+			else if (!strcmp(optarg, "on"))
+				o->drop_behind = 1;
+			else if (!strcmp(optarg, "off"))
+				o->drop_behind = 0;
+			else
+				return bad("--drop-behind", optarg);
+			break;
 		case O_SMAC:
 			if (afr_parse_mac(optarg, o->smac) < 0)
 				return bad("--smac", optarg);

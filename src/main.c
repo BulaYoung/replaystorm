@@ -55,23 +55,23 @@ static int prepare(afr_ctx_t *c)
 		c->link_src = "unknown";
 	}
 
-	/* File. */
-	if (o->preload) {
+	/* File. A file larger than RAM is streamed: --preload is pointless (it would
+	 * only thrash the page cache), and already sent data is dropped from the cache. */
+	{
 		struct stat st;
-		uint64_t avail = 0;
-		FILE *mi = fopen("/proc/meminfo", "r");
-		if (mi) {
-			char line[256];
-			while (fgets(line, sizeof(line), mi))
-				if (sscanf(line, "MemAvailable: %" SCNu64 " kB", &avail) == 1)
-					break;
-			fclose(mi);
+		uint64_t avail = afr_mem_available();
+		uint64_t fsize = stat(o->file, &st) == 0 ? (uint64_t)st.st_size : 0;
+		int too_big = avail && fsize > avail / 10 * 8;
+		if (o->preload && too_big) {
+			afr_log_warn("--preload ignored: the file is %.1f GB but only %.1f GB of memory is "
+			             "available; the file will be streamed from disk instead",
+			             (double)fsize / 1e9, (double)avail / 1e9);
+			o->preload = 0;
 		}
-		if (stat(o->file, &st) == 0 && avail && (uint64_t)st.st_size > avail * 1024 * 9 / 10)
-			afr_log_warn("--preload: file is %.1f GB but only %.1f GB of memory is available; pages will be "
-			             "evicted and preloading will not help",
-			             (double)st.st_size / 1e9, (double)avail * 1024 / 1e9);
-		afr_log_info("Loading the whole file into memory (--preload)...");
+		if (o->drop_behind < 0)
+			o->drop_behind = !o->preload && too_big;
+		if (o->preload)
+			afr_log_info("Loading the whole file into memory (--preload)...");
 	}
 	if (pcap_open(&c->pf, o->file, o->preload, err, sizeof(err)) < 0) {
 		afr_log_err("%s", err);

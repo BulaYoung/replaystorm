@@ -29,7 +29,7 @@ typedef struct AFR_ALIGNED {
 	_Atomic int64_t late_max;
 	_Atomic int64_t pos;         /* position on the timeline (lap*length + ts) */
 	_Atomic uint64_t lap;
-	_Atomic uint64_t file_off;
+	_Atomic uint64_t gpos;       /* lap * file_size + file offset of the last packet */
 	_Atomic int64_t t_end;       /* when the thread finished sending */
 	atomic_int finished;
 } wstats_t;
@@ -58,6 +58,7 @@ typedef struct {
 	tx_ring_t tx;
 	pthread_t th;
 	char err[256];
+	int mlock_failed;
 	/* hot state (thread only) */
 	unsigned head, pending;
 	int64_t now; /* last clock reading */

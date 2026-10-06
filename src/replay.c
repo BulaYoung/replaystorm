@@ -2,6 +2,7 @@
 
 #include "clock.h"
 #include "util.h"
+#include "stream.h"
 #include "worker.h"
 
 #include <errno.h>
@@ -15,7 +16,6 @@
 
 #define RLX memory_order_relaxed
 #define LD(x) atomic_load_explicit(&(x), RLX)
-#define READAHEAD_BYTES (512ull << 20)
 
 static void on_signal(int sig)
 {
@@ -32,7 +32,6 @@ typedef struct {
 	int sys_ok;
 	int64_t pos_min, pos_last;
 	uint64_t lap_min, lap_last;
-	uint64_t off_min;
 	unsigned active;
 } snap_t;
 
@@ -40,7 +39,6 @@ static void take_snap(worker_t **ws, unsigned nw, const char *iface, snap_t *s)
 {
 	memset(s, 0, sizeof(*s));
 	s->pos_min = INT64_MAX;
-	s->off_min = UINT64_MAX;
 	s->lap_min = UINT64_MAX;
 	s->pos_last = INT64_MIN;
 	for (unsigned i = 0; i < nw; i++) {
@@ -70,9 +68,6 @@ static void take_snap(worker_t **ws, unsigned nw, const char *iface, snap_t *s)
 			uint64_t l = LD(w->st.lap);
 			if (l < s->lap_min)
 				s->lap_min = l;
-			uint64_t o = LD(w->st.file_off);
-			if (o < s->off_min)
-				s->off_min = o;
 		}
 	}
 	s->sys_ok = afr_sysfs_read_u64(iface, "statistics/tx_packets", &s->sys_tx) == 0 &&
@@ -415,6 +410,25 @@ int afr_replay_run(afr_ctx_t *c)
 	pthread_barrier_wait(&sh->bar); /* 1 */
 	/* Threads have copied their shards; the global index is no longer needed. */
 	afr_index_free_arrays(&c->ix);
+	for (unsigned i = 0; i < nw && o->drop_behind > 0; i++) {
+		if (ws[i]->mlock_failed) {
+			afr_log_warn("could not lock the packet index in RAM (mlock); with a file larger "
+			             "than RAM it may be swapped out. Run as root or raise ulimit -l");
+			break;
+		}
+	}
+	/* Streaming of the file: readahead ahead of the senders, drop-behind for big files. */
+	streamer_t stream = {.pf = &c->pf, .ws = ws, .nw = nw, .window = o->readahead,
+	                     .drop_behind = o->drop_behind > 0};
+	if (!c->pf.preloaded) {
+		char ra[32];
+		snprintf(ra, sizeof(ra), "%.1f GB", (double)o->readahead / (1 << 30));
+		if (afr_stream_start(&stream) == 0)
+			afr_log_info("File streaming: readahead %s, drop-behind %s", ra,
+			             stream.drop_behind ? "on (file larger than free RAM)" : "off");
+		else
+			afr_log_warn("could not start the readahead thread");
+	}
 	snap_t start, prev, cur;
 	take_snap(ws, nw, o->iface, &start);
 	int64_t t0 = afr_now_ns() + 20 * NS_PER_MS;
@@ -424,6 +438,7 @@ int afr_replay_run(afr_ctx_t *c)
 	if (atomic_load(&sh->failed)) {
 		for (unsigned i = 0; i < nw; i++)
 			pthread_join(ws[i]->th, NULL);
+		afr_stream_stop(&stream);
 		for (unsigned i = 0; i < nw; i++)
 			if (ws[i]->err[0])
 				afr_log_err("%s", ws[i]->err);
@@ -471,14 +486,6 @@ int afr_replay_run(afr_ctx_t *c)
 			prev = cur;
 			last = now;
 		}
-		/* Read ahead in the file if it is not fully preloaded. */
-		if (!c->pf.preloaded && cur.off_min != UINT64_MAX) {
-			uint64_t a = cur.off_min & ~(uint64_t)(sysconf(_SC_PAGESIZE) - 1);
-			if (a < c->pf.size) {
-				uint64_t len = c->pf.size - a < READAHEAD_BYTES ? c->pf.size - a : READAHEAD_BYTES;
-				madvise((void *)(c->pf.base + a), len, MADV_WILLNEED);
-			}
-		}
 		if (cur.active == 0)
 			break;
 	}
@@ -488,12 +495,17 @@ int afr_replay_run(afr_ctx_t *c)
 		if (LD(ws[i]->st.t_end) > t_end)
 			t_end = LD(ws[i]->st.t_end);
 	}
+	afr_stream_stop(&stream);
 	/* Wait for interface counters to catch up (frames may still be queued). */
 	usleep(100000);
 	take_snap(ws, nw, o->iface, &cur);
 	int stopped = atomic_load(&g_stop) && !atomic_load(&sh->failed);
 	print_summary(c, &cur, &start, (double)(t_end - t0) / 1e9, ws, nw, json, stopped,
 	              atomic_load(&sh->shift));
+	if (!c->pf.preloaded)
+		printf("File streaming: requested ahead %.1f GB, dropped from page cache %.1f GB\n",
+		       (double)atomic_load(&stream.ra_bytes) / 1e9,
+		       (double)atomic_load(&stream.dropped_bytes) / 1e9);
 	for (unsigned i = 0; i < nw; i++) {
 		if (ws[i]->err[0]) {
 			afr_log_err("%s", ws[i]->err);

@@ -362,7 +362,7 @@ static inline void publish_pos(worker_t *w, const pkt_t *p, uint64_t lap, int64_
 {
 	PUB(w->st.pos, (int64_t)lap * lap_len + p->ts);
 	PUB(w->st.lap, lap);
-	PUB(w->st.file_off, OFFLEN_OFF(p->offlen));
+	PUB(w->st.gpos, lap * w->c->pf.size + OFFLEN_OFF(p->offlen));
 }
 
 static void run(worker_t *w)
@@ -498,6 +498,10 @@ void *afr_worker_main(void *arg)
 		snprintf(w->err, sizeof(w->err), "thread %u: %s", w->id, terr);
 		atomic_store(&w->sh->failed, 1);
 		ok = 0;
+	} else if (mlock(w->pk, (w->n ? w->n : 1) * sizeof(pkt_t)) != 0) {
+		/* Not fatal: the index stays swappable. With a file much larger than RAM the
+		 * page cache churns hard, so pinning the index avoids stalls on swap-in. */
+		w->mlock_failed = 1;
 	}
 	pthread_barrier_wait(&w->sh->bar); /* 1: everything is prepared */
 	pthread_barrier_wait(&w->sh->bar); /* 2: T0 is set */

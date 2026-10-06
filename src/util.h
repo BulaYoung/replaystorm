@@ -9,6 +9,10 @@ int afr_parse_duration(const char *s, int64_t *ns);
 int afr_parse_bitrate(const char *s, double *bps);
 int afr_parse_double(const char *s, double *v);
 int afr_parse_u64(const char *s, uint64_t *v);
+/* "2G", "512M", "64K"; a number without a suffix means bytes. */
+int afr_parse_size(const char *s, uint64_t *bytes);
+/* MemAvailable from /proc/meminfo in bytes, 0 if unknown. */
+uint64_t afr_mem_available(void);
 int afr_parse_mac(const char *s, uint8_t mac[6]);
 int afr_parse_ipv4(const char *s, uint32_t *host_order);
 

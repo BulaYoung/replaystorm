@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 #include <sched.h>
 #include <stdarg.h>
@@ -319,4 +320,40 @@ int64_t afr_realtime_ns(void)
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
 	return (int64_t)ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
+}
+
+int afr_parse_size(const char *s, uint64_t *bytes)
+{
+	char *end;
+	errno = 0;
+	double d = strtod(s, &end);
+	if (errno || end == s || d < 0 || !isfinite(d))
+		return -1;
+	double m = 1;
+	if (!*end)
+		m = 1;
+	else if (!strcasecmp(end, "k"))
+		m = 1024.0;
+	else if (!strcasecmp(end, "m"))
+		m = 1024.0 * 1024;
+	else if (!strcasecmp(end, "g"))
+		m = 1024.0 * 1024 * 1024;
+	else
+		return -1;
+	*bytes = (uint64_t)(d * m);
+	return 0;
+}
+
+uint64_t afr_mem_available(void)
+{
+	uint64_t kb = 0;
+	FILE *f = fopen("/proc/meminfo", "r");
+	if (!f)
+		return 0;
+	char line[256];
+	while (fgets(line, sizeof(line), f))
+		if (sscanf(line, "MemAvailable: %" SCNu64 " kB", &kb) == 1)
+			break;
+	fclose(f);
+	return kb * 1024;
 }

@@ -213,6 +213,14 @@ def t_bytes(pcaps):
         check(js and js["summary"]["skipped"] == 1, "%s: 1 frame larger than MTU skipped (JSON)" % name)
         check(js and js["summary"]["truncated_caplen"] == 1, "%s: 1 truncated frame counted (JSON)" % name)
 
+    print("== Streaming: drop-behind and a minimal readahead window do not affect content")
+    p = os.path.join(pcaps, "l2mix.pcap")
+    rc, out, frames, _ = replay(p, ["--topspeed", "-t", "2", "--loop", "3", "--drop-behind", "on",
+                                    "--readahead", "16M"])
+    check(rc == 0 and "dropped from page cache" in out, "drop-behind: exit code 0, streaming summary printed")
+    check(collections.Counter(f for _, f in frames) == collections.Counter(expected_frames(p) * 3),
+          "drop-behind: all frames of 3 laps arrived byte for byte")
+
     print("== RAW IP with synthetic Ethernet")
     p = os.path.join(pcaps, "raw_ip.pcap")
     sm, dm = "02:aa:00:00:00:01", "02:bb:00:00:00:02"

@@ -103,6 +103,36 @@ Memory: building the index needs about 18 bytes per packet, distributing shards 
 roughly 2.4 GB at peak and 1.1 GB while running. With `--ts-order sort` or `asis` on
 non-monotonic timestamps, another 32 bytes per packet is added while the timeline is computed.
 
+## Files larger than RAM
+
+A file much larger than RAM (for example 500 GB on a 62 GB machine) cannot be preloaded and is
+streamed from disk during replay:
+
+- A background thread (`afr-stream`) wakes every 20 ms and keeps `--readahead` bytes (default
+  2 GB) of the file requested with `madvise(MADV_WILLNEED)` ahead of the fastest sender thread,
+  so sender threads do not stall on disk reads inside the hot loop.
+- Drop-behind (`--drop-behind auto|on|off`, auto = on when the file is larger than 80% of
+  available RAM): everything the slowest thread has passed (minus a 256 MB margin) is dropped
+  from the page cache (`MADV_DONTNEED` + `POSIX_FADV_DONTNEED`). Without it the page cache would
+  churn through hundreds of GB and push the packet index out to swap.
+- The per-thread packet index is locked in RAM with `mlock` (works as root; otherwise raise
+  `ulimit -l`).
+- `--preload` is ignored with a warning when the file does not fit into available memory.
+- The summary shows how much was requested ahead and dropped from the page cache.
+
+Requirements for such a file:
+
+- **Disk throughput.** Each lap re-reads the file from disk, so the disk must deliver the target
+  rate: 24 Gbit/s is about 3 GB/s. Check before a run, e.g.
+  `dd if=/mnt/big.pcap of=/dev/null bs=16M count=2000 iflag=direct`. If the disk is slower,
+  the replay rate is capped by the disk (on the test laptop: 17.9 Gbit/s from a 2.2 GB/s NVMe
+  versus 24.2 Gbit/s from the page cache).
+- **Index memory.** About 16 bytes per packet during replay and about 34 bytes per packet at peak
+  while the index is built (more with `--ts-order sort` on unordered timestamps). A 500 GB file
+  with ~900-byte frames has ~550 million packets: ~9 GB during replay, ~19 GB at peak.
+- **Startup time.** The index pass reads the whole file once (about 2.4 GB/s cold on mendel17:
+  ~3.5 minutes for 500 GB), followed by single-threaded timeline normalization.
+
 ## Rate modes
 
 | Mode | What it does |
