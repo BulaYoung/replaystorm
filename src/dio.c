@@ -85,6 +85,7 @@ static int read_chunk(dio_t *d, uint64_t q, uint8_t *buf)
 	if (off + want > d->file_size)
 		want = (size_t)(d->file_size - off + DIO_ALIGN - 1) / DIO_ALIGN * DIO_ALIGN;
 	size_t got = 0;
+	const int64_t t0 = afr_now_ns();
 	while (got < want) {
 		ssize_t r = pread(d->fd, buf + got, want - got, (off_t)(off + got));
 		if (r < 0) {
@@ -101,6 +102,8 @@ static int read_chunk(dio_t *d, uint64_t q, uint8_t *buf)
 			break; /* short read at the end of the file */
 	}
 	atomic_fetch_add_explicit(&d->bytes_read, got, RLX);
+	atomic_fetch_add_explicit(&d->read_ns, (uint64_t)(afr_now_ns() - t0), RLX);
+	atomic_fetch_add_explicit(&d->reads, 1, RLX);
 	return 0;
 }
 

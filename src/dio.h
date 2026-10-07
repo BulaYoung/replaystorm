@@ -52,6 +52,7 @@ typedef struct {
 	unsigned nw;
 	/* statistics */
 	_Atomic uint64_t bytes_read, chunks_loaded, reader_waits;
+	_Atomic uint64_t reads, read_ns; /* chunk reads and their total duration */
 } dio_t;
 
 /* Open the file with O_DIRECT and allocate the window. Returns -1 with a reason if

@@ -33,7 +33,8 @@ typedef struct {
 	int64_t late_max;
 	uint64_t hist[LH_BUCKETS];
 	uint64_t sys_tx, sys_drop;
-	uint64_t disk_bytes;
+	uint64_t disk_bytes, disk_reads, disk_read_ns;
+	uint64_t gpos_min; /* slowest next-read position: lap * size + offset */
 	int sys_ok;
 	int64_t pos_min, pos_last;
 	uint64_t lap_min, lap_last;
@@ -46,6 +47,7 @@ static void take_snap(worker_t **ws, unsigned nw, const char *iface, snap_t *s)
 	s->pos_min = INT64_MAX;
 	s->lap_min = UINT64_MAX;
 	s->pos_last = INT64_MIN;
+	s->gpos_min = UINT64_MAX;
 	for (unsigned i = 0; i < nw; i++) {
 		worker_t *w = ws[i];
 		int64_t lp = LD(w->st.pos);
@@ -73,9 +75,14 @@ static void take_snap(worker_t **ws, unsigned nw, const char *iface, snap_t *s)
 			uint64_t l = LD(w->st.lap);
 			if (l < s->lap_min)
 				s->lap_min = l;
+			uint64_t g = LD(w->st.gpos);
+			if (g < s->gpos_min)
+				s->gpos_min = g;
 		}
 	}
 	s->disk_bytes = g_dio_on ? LD(g_dio.bytes_read) : 0;
+	s->disk_reads = g_dio_on ? LD(g_dio.reads) : 0;
+	s->disk_read_ns = g_dio_on ? LD(g_dio.read_ns) : 0;
 	s->sys_ok = afr_sysfs_read_u64(iface, "statistics/tx_packets", &s->sys_tx) == 0 &&
 	            afr_sysfs_read_u64(iface, "statistics/tx_dropped", &s->sys_drop) == 0;
 }
@@ -122,6 +129,9 @@ typedef struct {
 	double t;
 	double dt;
 	uint64_t pkts, bytes, sys_tx, sys_drop, enobufs, eagain, sends, disk;
+	double disk_lat_ms;  /* mean duration of one 32 MB direct read */
+	double file_pct;     /* slowest thread's position in the file, % (-1: unknown) */
+	uint64_t file_lap;
 	int sys_ok;
 	uint64_t p50, p99, pmax, late_n;
 	int timed;
@@ -140,7 +150,10 @@ static void json_row(FILE *f, int first, const row_t *r)
 		fprintf(f, ", \"sys_tx_packets\": %" PRIu64 ", \"sys_tx_dropped\": %" PRIu64, r->sys_tx,
 		        r->sys_drop);
 	if (g_dio_on)
-		fprintf(f, ", \"disk_gbytes_per_s\": %.3f", (double)r->disk / r->dt / 1e9);
+		fprintf(f, ", \"disk_gbytes_per_s\": %.3f, \"disk_read_ms\": %.2f", (double)r->disk / r->dt / 1e9,
+		        r->disk_lat_ms);
+	if (r->file_pct >= 0)
+		fprintf(f, ", \"file_pct\": %.2f, \"file_lap\": %" PRIu64, r->file_pct, r->file_lap);
 	if (r->timed)
 		fprintf(f, ", \"late_p50_ns\": %" PRIu64 ", \"late_p99_ns\": %" PRIu64
 		           ", \"late_max_ns\": %" PRIu64 ", \"pcap_pos_s\": %.6f, \"lap\": %" PRIu64,
@@ -164,7 +177,9 @@ static void print_row(const row_t *r, const afr_ctx_t *c)
 		printf(" | sysfs unavailable");
 	printf(" | ENOBUFS +%" PRIu64 " EAGAIN +%" PRIu64, r->enobufs, r->eagain);
 	if (g_dio_on)
-		printf(" | disk %.2f GB/s", (double)r->disk / r->dt / 1e9);
+		printf(" | disk %.2f GB/s, %.0f ms/read", (double)r->disk / r->dt / 1e9, r->disk_lat_ms);
+	if (!r->timed && r->file_pct >= 0)
+		printf(" | file %.1f%% lap %" PRIu64, r->file_pct, r->file_lap + 1);
 	if (r->timed) {
 		if (r->late_n) {
 			char a[32], p[32], x[32];
@@ -193,6 +208,13 @@ static void make_row(row_t *r, const snap_t *cur, const snap_t *prev, double t, 
 	r->enobufs = cur->enobufs - prev->enobufs;
 	r->eagain = cur->eagain - prev->eagain;
 	r->disk = cur->disk_bytes - prev->disk_bytes;
+	uint64_t nr = cur->disk_reads - prev->disk_reads;
+	r->disk_lat_ms = nr ? (double)(cur->disk_read_ns - prev->disk_read_ns) / (double)nr / 1e6 : 0;
+	r->file_pct = -1;
+	if (cur->gpos_min != UINT64_MAX && c->pf.size) {
+		r->file_lap = cur->gpos_min / c->pf.size;
+		r->file_pct = 100.0 * (double)(cur->gpos_min % c->pf.size) / (double)c->pf.size;
+	}
 	r->sys_ok = cur->sys_ok && prev->sys_ok;
 	if (r->sys_ok) {
 		r->sys_tx = cur->sys_tx - prev->sys_tx;
@@ -470,6 +492,25 @@ int afr_replay_run(afr_ctx_t *c)
 			}
 		} else
 			afr_log_warn("could not start the readahead thread");
+	}
+	/* Is something else already sending on this interface (another replayer, for example)?
+	 * It would share the link with us and distort every rate we report. */
+	{
+		uint64_t a, b;
+		if (afr_sysfs_read_u64(o->iface, "statistics/tx_packets", &a) == 0) {
+			usleep(300000);
+			if (afr_sysfs_read_u64(o->iface, "statistics/tx_packets", &b) == 0 && b > a) {
+				double pps = (double)(b - a) / 0.3;
+				if (pps > 10000) {
+					char cnt[32];
+					afr_fmt_count(cnt, sizeof(cnt), pps);
+					afr_log_warn("%s is already sending %spps before the start: another program "
+					             "(another replayer?) shares the link, and the rates below will "
+					             "be lower; \"sent (sysfs)\" includes its traffic",
+					             o->iface, cnt);
+				}
+			}
+		}
 	}
 	snap_t start, prev, cur;
 	take_snap(ws, nw, o->iface, &start);
