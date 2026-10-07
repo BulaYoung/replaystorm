@@ -1,15 +1,27 @@
 # afreplay
 
-A multithreaded pcap replayer over `AF_PACKET` (TX_RING), built for large files (50+ GB) and
-multicore machines with weak single cores. Frames are sent **byte for byte, including L2**: MAC,
-VLAN/QinQ, MPLS, ARP, STP, LLDP and any non-IP frames. The rate can be set in four ways:
-maximum, fixed (Mbit/s or pps), by pcap timestamps with a multiplier, or to fit a given
-duration. Looping is supported, including with modification of addresses and ports.
+A multithreaded pcap replayer over Linux `AF_PACKET` (TX_RING) for testing network sensors with
+large captures (hundreds of GB) at 25 Gbit/s and beyond, on machines with many but weak cores.
 
-Only `AF_PACKET` is used, no DPDK, AF_XDP, netmap or libpcap. The language is C11, the only
-dependencies are pthread and libm.
+- Frames are sent **byte for byte, including L2**: MAC addresses, VLAN/QinQ, MPLS, PPPoE, ARP,
+  STP, LLDP and any non-IP frames, as they were captured.
+- Rate: maximum, fixed (Mbit/s, pps, or a share of the link "on the wire"), or by pcap timestamps
+  with a speed multiplier (preserving the shape of the traffic, including its bursts).
+- Built for files larger than RAM: an on-disk index cache, `O_DIRECT` streaming into a RAM window,
+  NVMe temperature monitoring and a thermal governor.
+- Built for runs that last days or weeks: endless looping with new sessions on every lap,
+  surviving link outages, a watchdog, and long-run statistics you can query at any time.
+- Only `AF_PACKET`: no DPDK, AF_XDP, netmap or libpcap. C11, dependencies: pthread and libm.
 
-Program output (messages, statistics, `--help`) and code comments are in English.
+Contents: [Building](#building) · [Recipes](#recipes) · [How it works](#how-it-works) ·
+[Rate modes](#rate-modes) · [Timestamp replay](#timestamp-replay) ·
+[Looping with modification](#looping-with-modification) ·
+[Files larger than RAM](#files-larger-than-ram) · [Long runs](#long-runs) ·
+[Statistics](#statistics) · [Tuning the sender](#tuning-the-sender) ·
+[Checking the receiver](#checking-the-receiver) · [Realism of the load](#realism-of-the-load) ·
+[Analysis mode](#analysis-mode) · [Input files](#input-files) · [Tests](#tests) ·
+[Results](#results) · [Known limitations](#known-limitations) · [Source layout](#source-layout) ·
+[Command line reference](#command-line-reference)
 
 ## Building
 
@@ -17,279 +29,286 @@ Program output (messages, statistics, `--help`) and code comments are in English
 make                # the ./afreplay binary
 make unit-test      # unit tests
 make test           # unit tests + test pcap generation + functional tests on veth
-make sanitize       # unit tests built with UBSan (trap) and FORTIFY; SAN=-fsanitize=address if libasan is available
+make sanitize       # unit tests built with UBSan (trap) and FORTIFY; SAN=-fsanitize=address if libasan exists
+sudo install -m 755 afreplay /usr/local/bin/
 ```
 
-Requires gcc or clang with C11 and Linux 3.14+ (for `PACKET_QDISC_BYPASS`). The tests need
-python3 without third-party modules, plus `ip` and `ethtool`. The build uses
-`-Wall -Wextra -Werror`.
+- Requires gcc or clang with C11 and Linux 3.14+ (`PACKET_QDISC_BYPASS`). Tested on Fedora (kernel
+  6.19) and RHEL 8 (kernel 4.18, gcc 8). Some features are better on newer kernels
+  (`MADV_POPULATE_READ` from 5.14); older ones get an equivalent fallback.
+- The build uses `-Wall -Wextra -Werror`. If an older compiler warns about something a newer one
+  does not: `make clean && make XCFLAGS="-std=c11 -D_GNU_SOURCE -Wall -Wextra -pthread -MMD -MP"`.
+- Copy the sources, not `build/` or the binary, to another machine: a binary built against a newer
+  glibc does not run on an older one. If you did copy them, `make clean && make`.
+- Running requires root (or `CAP_NET_RAW`; `CAP_NET_ADMIN` to enlarge the socket buffer; root also
+  for `mlock` of the index and for reading the NVMe temperature on older kernels).
+- The tests need python3 without third-party modules, `ip` and `ethtool`. Functional tests use
+  their own network namespace (`unshare -rn` without root).
 
-Running requires root or `CAP_NET_RAW`. With `CAP_NET_ADMIN` the socket buffer is enlarged
-(`SO_SNDBUFFORCE`); without it, whatever `net.core.wmem_max` allows is used.
-
-## Quick start
+## Recipes
 
 ```sh
-# What is inside the file: timestamp anomalies, rate peaks, traffic mix, shards
+# What is inside the file: traffic mix, VLAN share, timestamp anomalies, rate peaks, shards
 afreplay --analyze big.pcap
 afreplay --analyze --multiplier 10 --link-speed 25G big.pcap
 
-# Maximum rate, 12 threads, bypassing qdisc
+# Build the index cache once (reads the whole file); later starts take seconds
+afreplay --analyze --index-cache /var/tmp/big.afridx big.pcap
+
+# Line rate on a 25G link, forever, new sessions on every lap
+afreplay -i ens1f0 big.pcap --mbps 99% --loop 0 --loop-mutate ip,port \
+  --qdisc-bypass --index-cache /var/tmp/big.afridx
+
+# Customer traffic shape, 20x faster (peaks and pauses kept, scaled)
+afreplay -i ens1f0 big.pcap --multiplier 20 --loop 0 --loop-mutate ip,port --qdisc-bypass
+
+# Maximum rate, 12 threads
 afreplay -i ens1f0 --topspeed --qdisc-bypass -t 12 big.pcap
 
-# Fixed 20 Gbit/s, forever (Ctrl-C prints the summary)
-afreplay -i ens1f0 --mbps 20000 --loop 0 big.pcap
-
-# Saturate a 25G link at 99% on the wire, forever, with new sessions every lap
-afreplay -i ens1f0 --mbps 99% --loop 0 --loop-mutate ip,port --qdisc-bypass --preload big.pcap
-
-# By timestamps at double speed, compress pauses longer than 1 s, sort timestamps
-afreplay -i ens1f0 --multiplier 2 --max-gap 1s --ts-order sort big.pcap
-
-# Replay the file in exactly 10 minutes, write statistics to JSON
+# Play the file in exactly 10 minutes, statistics to JSON
 afreplay -i ens1f0 --duration 10m --stats-json run.json big.pcap
 
-# 5 laps, the sensor sees new sessions on each one
-afreplay -i ens1f0 --loop 5 --loop-mutate ip,port big.pcap
-
-# RAW IP (linktype 101/228/229): an Ethernet header is prepended
+# RAW IP pcap (linktype 101/228/229): an Ethernet header is prepended
 afreplay -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap
 ```
 
-`afreplay --help` prints the full list of options.
+### A run that lasts days or weeks
+
+```sh
+screen -S afreplay
+timeout -s INT 30d afreplay -i ens1f0 /data/big.pcap \
+  --mbps 99% --loop 0 --loop-mutate ip,port \
+  --qdisc-bypass --cpus 1-11 -t 10 \
+  --readahead 24G --disk-max-temp 74 \
+  --index-cache /var/tmp/big.afridx \
+  --stats-json /root/afreplay-$(date +%F).json -q
+# Ctrl-A D to detach; screen -r afreplay to come back
+```
+
+| Option | Why |
+|---|---|
+| `--mbps 99%` | 99% of the link counted on the wire, no ENOBUFS from asking more than the link carries |
+| `--loop 0 --loop-mutate ip,port` | loop forever; every lap brings new sessions (see the address caveat below) |
+| `--cpus 1-11 -t 10` | 10 IP threads + 1 non-IP thread on cores 1-11, core 0 left to the system |
+| `--readahead 24G` | RAM window that rides out short disk slowdowns (index + window must fit in RAM) |
+| `--disk-max-temp 74` | safety net: if cooling degrades, the read rate goes down smoothly instead of collapsing |
+| `--index-cache` | start in seconds without heating the disk by reading the whole file |
+| `-q` | no per-second line (millions of lines over days); statistics stay available on request |
+| `timeout -s INT 30d` | stops after 30 days exactly like Ctrl-C: summary, status file and JSON are kept |
+
+Check it at any time from another terminal: `afreplay --status -i ens1f0`. In its own terminal:
+Enter (statistics), `r` (reset minimum/maximum), `q` (stop).
+
+Before a long run: build the index cache, make sure no other replayer uses the interface, enlarge
+the NIC TX ring (`ethtool -G IF tx <max>`), check the NVMe temperature under load (see
+[Files larger than RAM](#files-larger-than-ram)).
 
 ## How it works
 
-1. **The file** is mapped into memory (`mmap`, read-only) and is not copied to the heap. The
-   `--preload` flag uses `MAP_POPULATE`, i.e. reads the whole file before starting. If the file
-   is larger than available memory, the program warns. Without `--preload` the statistics
-   thread calls `madvise(MADV_WILLNEED)` once a second on 512 MB ahead of the position of the
-   slowest thread.
-2. **The index** is built in a single sequential pass over the records (the pcap record chain
-   cannot be walked any other way). In parallel with the pass, N threads classify and hash
-   already-read packets in blocks of 64K. Per packet, 8 bytes are stored (48-bit offset +
-   16-bit length), plus an 8-byte timestamp and a 2-byte shard number.
-3. **The timeline** is normalized from each packet's timestamp: outliers, clamp and max-gap are
-   handled (see below). These are pure functions covered by unit tests (`src/sched.c`).
-4. **Sharding** uses a symmetric 5-tuple hash, so A→B and B→A land in the same thread and order
-   within a session is preserved. The parser walks VLAN/QinQ (0x8100, 0x88a8, 0x9100, 0x9200),
-   the MPLS stack (including a pseudowire with control word and inner Ethernet), PPPoE and IPv6
-   extension headers. Ports are not used for IP fragments (IPv4 and IPv6), so all fragments of
-   a datagram go to the same thread. The VLAN ID is deliberately excluded from the hash: with
-   inter-VLAN routing the two sides of a session may be in different VLANs. Tunnels (GRE,
-   VXLAN) are hashed by the outer header. Non-IP frames go to a separate shard served by its
-   own thread.
-5. **Sender threads.** A thread is created for each non-empty shard. It is pinned to a core and
-   only then allocates its own copy of the shard index and its TX_RING, so the memory ends up
-   on the right NUMA node. By default cores are taken from
-   `/sys/class/net/<if>/device/local_cpulist`; `--cpus` overrides the list. By default there
-   is one IP thread fewer than cores, and the non-IP thread takes the remaining core. Once the
-   shards are built, the global index is freed.
-6. **Sending.** Each thread has its own `AF_PACKET`/`SOCK_RAW` socket with protocol = 0 (the
-   socket receives nothing), `TPACKET_V2`, `PACKET_TX_RING`. A frame is copied from the mmap
-   straight into the ring, and after a batch (`--batch`, 64 by default) `send(MSG_DONTWAIT)` is
-   called once. `PACKET_QDISC_BYPASS` and `PACKET_LOSS` are enabled by flags. Ring slots are
-   sized by the largest frame actually present in the file (capped by MTU+18), not by the MTU:
-   with MTU 9000 and ordinary traffic that is 2 KB per slot instead of 16 KB.
-   When the device queue is full (ENOBUFS/EAGAIN), the thread backs off instead of retrying
-   `send()` in a tight loop: a few short spins, then 5..100 us sleeps. When the ring itself is
-   full of frames still in the driver, the thread also sleeps 10 us between checks.
-7. **The hot loop** has no locks and no malloc. Its only system calls are the batched `send()`
-   and `clock_nanosleep` in waiting modes. Counters are per thread, cache-line aligned and
-   published with relaxed stores. The statistics thread only reads them.
+1. **The file** is mapped read-only (`mmap`) for indexing and, if it fits in RAM, for sending. A file
+   larger than RAM is streamed during the replay (see [Files larger than RAM](#files-larger-than-ram)).
+2. **The index** is built in one sequential pass over the records (the pcap record chain cannot be
+   walked otherwise); in parallel, N threads classify and hash already-read packets in blocks of 64K.
+   It is built in two steps: the option-independent part (offset, length, timestamp, a 32-bit
+   symmetric flow hash, classification flags; 21 bytes per packet) can be cached on disk; shard
+   numbers and MTU-based skipping are resolved in parallel on every start.
+3. **The timeline** is normalized from the timestamps (outliers, clamp, max-gap), in parallel and
+   bit-identical to a single-threaded reference implementation (see
+   [Parallel preparation](#parallel-preparation)).
+4. **Sharding** uses a symmetric 5-tuple hash, so A→B and B→A go through the same thread and order
+   within a session is preserved. The parser walks VLAN/QinQ (0x8100, 0x88a8, 0x9100, 0x9200), MPLS
+   (including a pseudowire with control word and inner Ethernet), PPPoE and IPv6 extension headers.
+   IP fragments (v4 and v6) are hashed without ports, so all fragments of a datagram stay together.
+   The VLAN ID is deliberately not part of the hash: in SPAN captures from several segments the same
+   session appears in several VLANs, and all copies must stay in order. Tunnels are hashed by the
+   outer header. Non-IP frames go to a separate shard with its own thread.
+5. **Sender threads.** One thread per non-empty shard, pinned to a core; it allocates its shard index
+   (locked in RAM) and its TX_RING after pinning, so memory is NUMA-local. Default cores:
+   `/sys/class/net/<if>/device/local_cpulist`; `--cpus` overrides. Default: one IP thread fewer than
+   cores, the non-IP thread on the remaining core.
+6. **Sending.** Each thread has its own `AF_PACKET`/`SOCK_RAW` socket with protocol 0 (receives
+   nothing), `TPACKET_V2`, `PACKET_TX_RING`. A frame is copied into the ring and after a batch
+   (`--batch`, 64) one `send(MSG_DONTWAIT)` hands the whole batch to the kernel.
+   `PACKET_QDISC_BYPASS` and `PACKET_LOSS` are flags. Ring slots are sized by the largest frame in
+   the file (capped by MTU+18), not by the MTU. When the device queue is full (ENOBUFS/EAGAIN) a
+   thread backs off (short spins, then 5-100 µs sleeps) instead of hammering `send()`.
+7. **The hot loop** has no locks and no malloc; per-thread counters are cache-line aligned and
+   published with relaxed stores, the statistics thread only reads them. All modes start together:
+   threads pass a barrier and wait for a common point T0.
 
-Memory: building the index needs about 18 bytes per packet, distributing shards peaks at about
-34 bytes per packet, and sending uses 16 bytes per packet. For 70 million packets that is
-roughly 2.4 GB at peak and 1.1 GB while running. With `--ts-order sort` or `asis` on
-non-monotonic timestamps, another 32 bytes per packet is added while the timeline is computed.
+Where the CPU time goes: copying a packet into the ring costs about 58 ns (~2% of a core at 25G);
+batch size barely matters (1.79 vs 1.86 Mpps for batches of 16 and 1024). About 80% of the CPU is
+the kernel's per-packet work (skb, driver, completion), so kernel and NIC settings matter more than
+user-space code (see [Tuning the sender](#tuning-the-sender)).
+
+Memory: the index needs ~16 bytes per packet while sending (~550 million packets of a 500 GB file:
+~9 GB) and ~34 bytes per packet at peak while it is built (more with `--ts-order sort` on unordered
+timestamps). Plus the `--readahead` window when streaming.
+
+## Rate modes
+
+| Mode | What it does |
+|---|---|
+| `--topspeed` | As fast as possible. Threads wait only for free ring frames. |
+| `--mbps X` | Total X Mbit/s of L2 frame bytes (without FCS, preamble and IFG). Packets are paced **in file order**: packet i is due at `T0 + (bytes before i in the file) / rate`, whichever thread sends it. The total is exact and all threads move through the file together. |
+| `--mbps line`, `--mbps N%` | A share of the link speed **on the wire** (preamble, IFG, FCS, 60-byte minimum): `line` = 100%, e.g. `99%`. The link speed comes from ethtool or `--link-speed`; it is converted to an L2 rate with the file's own L2/wire byte ratio. An explicit `--mbps X` above the link on the wire gives a warning before start. |
+| `--pps X` | The same in packets per second: packet i is due at `T0 + i / rate`. |
+| `--pace-slack T` | `--mbps`/`--pps`: a thread sleeps and sends everything due within the next T at once (default 200 µs) instead of busy-waiting for every packet. The schedule stays absolute, so the average is exact; bursts are at most T long per thread. At 4 Gbit/s this cut user CPU from 15.3 s to 2.5 s. |
+| `--multiplier X` | Replay by timestamps (the default mode, X = 1); 2.0 is twice as fast. |
+| `--duration T` | The multiplier is chosen so that one lap takes T (`ns`, `us`, `ms`, `s`, `m`, `h`). |
+
+`--loop N` plays the file N times; `--loop 0` forever. Fixed-rate schedules are computed from a
+common origin, so errors do not accumulate and a stalled thread catches up.
+
+## Timestamp replay
+
+**Schedule.** `t_send = T0 + (lap × lap_length + ts_pkt − ts_first) / multiplier`, from a common
+origin T0 shared by all threads, so errors do not accumulate and threads do not drift. The lap
+length is the timeline duration plus the mean inter-packet interval, so laps continue the timeline.
+
+**Waiting** is hybrid: `clock_nanosleep(TIMER_ABSTIME)` for long pauses (in chunks of at most 50 ms),
+busy-spin for the last `--spin-us` µs (50). Timer slack is 1 ns. If the next packet is not due yet,
+the pending batch is sent first. A packet that is already due is sent without re-reading the clock.
+
+**Clock** (`--clock auto|tsc|monotonic`). If the kernel uses the `hpet`/`acpi_pm` clocksource
+(`clock_gettime` ~1 µs instead of ~20 ns), `auto` uses an invariant TSC, calibrated twice for 100 ms
+on one core (falls back if the estimates differ by more than 0.1%), with a per-thread offset
+(cores may have offset TSCs) and a resync against `CLOCK_MONOTONIC` before each sleep.
+
+**Lag.** A late packet is sent immediately. Lateness (actual minus scheduled time) goes into a
+per-thread histogram: p50/p99/max per second, p99.9 in the summary. `--lag-policy catchup` (default)
+keeps absolute times and catches up; `rebase` shifts the common T0 when lateness exceeds
+`--lag-threshold` (10 ms), stretching the timeline for all threads together.
+
+### Problematic timestamps
+
+| Problem | What afreplay does |
+|---|---|
+| Non-monotonic timestamps | `--ts-order clamp` (default) replaces a backward timestamp with the running maximum; `sort` stably sorts the index within each shard; `asis` sends backward packets immediately and counts them separately. |
+| Long pauses | `--max-gap X` compresses pauses longer than X to X. `--analyze` lists the top 10 pauses. |
+| Outliers | ts = 0, before 1990, in the future, and short clock spikes (a packet or up to 16 that jumped further than `--outlier-jump`, 60 s, and came back) are reported; `--ts-outliers exclude` gives them a neighbour's timestamp. |
+| Speedup beyond the link | Peak rates in 1 ms, 10 ms and 1 s windows are computed with the multiplier, on L2 and on the wire; a peak above the link speed gives a warning. |
+| Intervals too small | The share of intervals within a shard shorter than `--timing-res` (2 µs) after the multiplier is reported as packets that will effectively go out in bursts. |
+
+## Looping with modification
+
+`--loop-mutate ip|port|ip,port`: on lap k > 0 frames are modified in the TX ring (the file is never
+written). **L2 (MAC, VLAN, MPLS) is never changed.**
+
+- **ip**: `k × --mutate-ip-offset` (0.1.0.0) is added to every IPv4 address (32-bit addition with
+  carry; `10.0.0.1` → `10.1.0.1` → ...). For IPv6, the 32-bit word in bytes 8-11 is shifted; the /64
+  prefix stays.
+- **port**: ports ≥ 1024 are shifted by `k × --mutate-port-step` within 1024..65535; service ports
+  (< 1024) are kept. Only TCP/UDP, only unfragmented packets.
+- The mapping is the same for both directions, so a session stays one session. Checksums are updated
+  incrementally (RFC 1624): IPv4 header, TCP/UDP/ICMPv6 with the pseudo-header; a UDP zero checksum
+  stays zero.
+- Uniqueness: with the defaults, addresses repeat only after 65 536 laps and ports after 64 512, so
+  sessions stay new for months of looping.
+
+**Caveat: address classes change over laps.** `192.168.x.x` becomes `192.169.x.x` (public) on lap 1,
+`172.16/12` leaves the private range after a few laps, a carry can move `17.248.x.x` to `18.3.x.x`.
+For capture and throughput tests this does not matter. If the sensor's analysis is part of the test,
+internal hosts gradually look external, and every lap creates a new set of hosts in the sensor's
+host tables (memory and storage grow with it).
 
 ## Files larger than RAM
 
-A file much larger than RAM (for example 500 GB on a 62 GB machine) cannot be preloaded and is
-streamed from disk during replay. There are two ways to do it (`--io auto|direct|mmap`; auto =
-direct when the file is larger than 80% of available RAM).
+A 500 GB file on a 62 GB machine is read from disk on every lap. `--io auto` (default) chooses
+direct I/O when the file is larger than 80% of available RAM, the page cache otherwise.
 
-### Direct I/O (`--io direct`, the default for big files)
+### Direct I/O (`--io direct`)
 
-Reader threads (`--io-threads`, default 4) read the file sequentially with `O_DIRECT` in 32 MB
-chunks into a ring of buffers in RAM (the window, `--readahead` bytes), bypassing the page cache
-entirely, like `dd iflag=direct`. Chunks are numbered across laps, so reading simply continues
-into the next lap. Each slot holds its chunk plus 128 KB of the next one, so a packet starting in a
-chunk is always contiguous. A slot is reused only when every sender thread has moved past it
-(each thread publishes the position it reads next). The window is filled before T0.
+Reader threads (`--io-threads`, 4) read the file with `O_DIRECT` in 32 MB chunks into a ring of
+buffers in RAM (the window, `--readahead`), bypassing the page cache, like `dd iflag=direct`.
+Chunks are numbered across laps; each slot also holds 128 KB of the next chunk, so a packet is
+always contiguous. A slot is reused only when every sender thread has passed it (threads publish
+the position they read *next*). The window is filled before T0, locked in RAM, and reduced with a
+warning if it does not fit into free memory.
 
-Sender threads take packet data from the window: they never touch the disk, never take page
-faults and never wait in the kernel. If a chunk is not loaded yet, a thread waits in memory and the
-summary counts it. The per-second line shows the disk read rate (`disk X GB/s`), the summary shows
-the total, the average and how often senders waited for data or readers waited for a free slot
-(readers waiting means the disk is faster than sending). If `O_DIRECT` is not supported by the
-filesystem (tmpfs, some network filesystems), afreplay falls back to the page cache with a warning.
+Sender threads never touch the disk, never take page faults and never wait in the kernel. The
+per-second line shows `disk X GB/s, N ms/read` (mean time of one 32 MB read: if it grows, the drive
+itself got slower). Threads are kept within half the window of the slowest thread; otherwise, at top
+speed, they drift apart in the file and the fast ones outrun the window. A lap ends with the slowest
+thread anyway, so this does not lower the total rate.
 
-On the test laptop (3 GB file streamed from NVMe, top speed, 8 threads, two laps):
-
-| | rate | disk waits in sender threads |
+| 3 GB file streamed from NVMe, top speed, 8 threads | rate | disk waits in sender threads |
 |---|---|---|
 | page cache (`--io mmap`) | 17.2-18.1 Gbit/s | 1150-1350 |
-| direct I/O (`--io direct`) | 22.7 Gbit/s | 0 (2 faults in total) |
-
-The disk delivered 2.5 GB/s with four readers in flight versus 1.9 GB/s for a single `dd`; the
-remaining limit was the veth sender, not the disk.
+| direct I/O (`--io direct`) | 22.7 Gbit/s | 0 |
 
 ### NVMe temperature and the thermal governor
 
-Sustained reads at the drive's limit heat an NVMe drive until it enters thermal throttling
-(Thermal Management T1) and drops to a fraction of its speed for tens of seconds. On the test
-server the drive throttles at about 77 C and falls from 3.5 to about 1 GB/s; at 24 Gbit/s this
-happened after about 190 s, at 20 Gbit/s after about 345 s. Building the index also reads the
-whole file at full speed, so a replay right after it starts with a hot drive.
+Sustained reads at the drive's limit can heat an NVMe drive into thermal throttling (Thermal
+Management T1), where it drops to a fraction of its speed for tens of seconds. Seen on a test server
+(consumer NVMe drive in a rack server, chassis fans at 50%): throttling at ~77 °C, 3.5 → ~1 GB/s,
+after ~190 s at 24 Gbit/s and ~345 s at 20 Gbit/s; building the index also heats the drive. With
+the fans at 100% the same drive stayed at 61 °C under full load.
 
-- afreplay finds the NVMe drive(s) holding the file (through partitions, LVM, dm-crypt and md,
-  also for btrfs) and shows the temperature in the per-second line (`disk ... 71 C`), the
-  throttling transitions as `THROTTLED` and the maximum in the summary. The temperature comes
-  from sysfs hwmon on newer kernels or from the NVMe SMART log (admin ioctl, needs root) on older
-  ones such as RHEL 8.
-- `--disk-max-temp C` (direct I/O): a governor limits the read rate once a second to keep the
-  drive at or below C, e.g. 2-3 C below its throttling point. Reads are spread evenly under the
-  limit (`limit X GB/s` in the per-second line). This does not raise the average rate, which is
-  set by the cooling, but replaces "full speed, then a collapse to 1 GB/s" with a steady rate.
-  In a thermal model of the drive (unit test) the governor holds 1.97 GB/s without a single
-  throttling event, versus an average of 2.04 GB/s with drops to 1 GB/s and 106 throttling
+- The temperature of the NVMe drive(s) holding the file (found through partitions, LVM, dm-crypt, md,
+  btrfs) is in the per-second line, `THROTTLED` marks throttling transitions, the summary has the
+  maximum. Source: sysfs hwmon on newer kernels, the NVMe SMART log (admin ioctl, root) on older ones.
+- `--disk-max-temp C`: once a second a governor limits the direct I/O read rate to keep the drive at
+  or below C (2-3 °C below its throttling point). This does not raise the average (cooling sets it),
+  but turns "full speed, then a collapse" into a steady rate. In a thermal model (unit test): 1.97
+  GB/s steady and no throttling, versus 2.04 GB/s average with drops to 1 GB/s and 106 throttling
   events per hour without it.
-- `--disk-start-temp C`: before filling the window, wait until the drive cools down to C.
-- The direct I/O window is locked in RAM and is reduced (with a warning) if `--readahead` does
-  not fit into free memory. A larger window rides out a short slowdown: at 20 Gbit/s and a drive
-  throttled to 1 GB/s, 32 GB last about 20 s.
+- `--disk-start-temp C`: wait until the drive cools down to C before filling the window.
+- The real fix is cooling (airflow, a heatsink, a server fan profile) or two drives in RAID0.
 
-The real fix is cooling: a heatsink and airflow on the drive, or two drives in RAID0 so each
-works at half the rate.
+Check a drive: `nvme smart-log /dev/nvme0n1 | grep -i -E "^temperature|T1 Trans Count|media_errors"`.
 
 ### Page cache (`--io mmap`)
 
-- A background thread (`afr-stream`) wakes every 20 ms and keeps `--readahead` bytes (default
-  2 GB) of the file requested with `madvise(MADV_WILLNEED)` ahead of the sender threads, so
-  they do not stall on disk reads inside the hot loop. Each thread reports the file position it
-  reads *next*, so a thread whose next packet is far ahead does not hold anything back. The nearest 512 MB are
-  also pre-mapped into the process with `MADV_POPULATE_READ` (Linux 5.14+); on older kernels
-  (RHEL 8: 4.18) the background thread touches one byte per page instead, with the same
-  effect: page faults and disk waits happen in that thread, not in the sender threads.
-- The kernel caps one `MADV_WILLNEED` request at the device readahead size (`read_ahead_kb`,
-  128 KB by default on many systems), so readahead is requested in 1 MB pieces. In a test at
-  top speed with the file streamed from disk, this cut disk waits in sender threads from about
-  1500 to about 150 and raised the rate from 14.4 to 19.4 Gbit/s (the disk was the limit).
-- A larger device readahead also helps the kernel's own readahead:
-  `blockdev --setra 16384 /dev/nvme0n1` (8 MB, value in 512-byte sectors).
-- Drop-behind (`--drop-behind auto|on|off`, auto = on when the file is larger than 80% of
-  available RAM): everything the slowest thread has passed (minus a 256 MB margin) is dropped
-  from the page cache (`MADV_DONTNEED` + `POSIX_FADV_DONTNEED`). Without it the page cache would
-  churn through hundreds of GB and push the packet index out to swap.
-- Threads are kept within half the readahead window of the slowest one (the slowest
-  next-read position is recomputed from all threads when a thread gets that far ahead). At top
-  speed, or at a rate the link cannot reach, threads would otherwise drift apart in the file:
-  the fast ones outrun the readahead and wait for the disk, the slowest one keeps the pages
-  behind it alive. A lap ends with the slowest thread anyway, so the total rate does not
-  change. The summary reports how many times threads waited.
-- The per-thread packet index is locked in RAM with `mlock` (works as root; otherwise raise
-  `ulimit -l`).
-- `--preload` is ignored with a warning when the file does not fit into available memory.
-- The summary shows how much was requested ahead and dropped from the page cache.
+A background thread keeps `--readahead` bytes requested with `MADV_WILLNEED` (in 1 MB pieces: the
+kernel caps each request at `read_ahead_kb`), pre-maps the nearest 512 MB with `MADV_POPULATE_READ`
+(or by touching pages on kernels before 5.14), and with `--drop-behind` (auto for big files) drops
+what all threads have passed from the page cache. `--preload` (whole file into RAM before start) is
+ignored with a warning if the file does not fit.
 
-Requirements for such a file:
+### Index cache
 
-- **Disk throughput.** Each lap re-reads the file from disk, so the disk must deliver the target
-  rate: 24 Gbit/s is about 3 GB/s. Check before a run, e.g.
-  `dd if=/mnt/big.pcap of=/dev/null bs=16M count=2000 iflag=direct`. If the disk is slower,
-  the replay rate is capped by the disk (on the test laptop: 17.9 Gbit/s from a 2.2 GB/s NVMe
-  versus 24.2 Gbit/s from the page cache).
-- **Index memory.** About 16 bytes per packet during replay and about 34 bytes per packet at peak
-  while the index is built (more with `--ts-order sort` on unordered timestamps). A 500 GB file
-  with ~900-byte frames has ~550 million packets: ~9 GB during replay, ~19 GB at peak.
-- **Startup time.** The index pass reads the whole file once (about 2.4 GB/s cold on mendel17:
-  ~3.5 minutes for 500 GB). Use `--index-cache` so that only the first run pays for the scan.
-  Timeline normalization, the radix sort and the rate profile run in parallel on the same
-  threads as hashing (see below).
+`--index-cache FILE` (or `auto` for `FILE.pcap.afridx`) stores the option-independent index (21
+bytes per packet: ~11.5 GB for 500 GB of pcap). Later starts map it instead of reading the pcap
+(minutes → seconds). It is used only for the same pcap (size, mtime, inode, a hash of the first and
+last 64 KB, format version), otherwise rebuilt with a message; written atomically; valid for any
+`-t`, `--cpus` and MTU. Delete the file to force a rebuild.
 
-## Index cache
+### Parallel preparation
 
-`--index-cache FILE` (or `--index-cache auto` for `FILE.pcap.afridx` next to the pcap) keeps the
-packet index on disk. The first run builds the index as usual and saves it; later runs map the
-cache instead of reading the whole pcap. For a 500 GB file this replaces a ~3.5 minute scan with
-reading an ~11.5 GB cache.
+Timeline normalization, the radix sort for unordered timestamps and the rate profile run on the
+hashing threads. Stateful phases (running maximum, gap excess, last mapped value) summarize chunks,
+merge the summaries in order and redo each chunk from the exact sequential state, so the result is
+bit-identical to the single-threaded reference in `tests/ref_sched.c` (unit tests compare 360
+combinations of data, options and thread counts 1-16; mutation testing confirmed they catch
+boundary bugs). 4.7 million packets, 1 vs 11 threads: 34 → 14 ms (normalization), 131 → 24 ms (rate
+profile).
 
-- The cache stores the part of the index that does not depend on options: offset and length,
-  timestamp, a 32-bit symmetric flow hash and classification flags (21 bytes per packet). Shard
-  numbers and the MTU-based skipping are recomputed in parallel on every start, so one cache
-  works for any `-t`, `--cpus` and MTU.
-- The cache is used only for the same pcap: same size, mtime, inode and a hash of its first and
-  last 64 KB, and the same cache format version. Otherwise it is rebuilt and overwritten, with a
-  message saying why.
-- It is written to a temporary file and then renamed, so an interrupted run never leaves a broken
-  cache. The cache file is mapped read-only from the disk's point of view (copy-on-write), and
-  is never modified by a run.
-- Timeline normalization (`--ts-order`, `--max-gap`, outliers) is not cached and is redone on
-  every start, since it depends on options.
-- To force a rebuild, delete the cache file.
+## Long runs
 
-On the test laptop, a 4.2 GB file (4.7 million packets) produced a 98.5 MB cache, and a start
-took 0.19 s with it versus 1.06 s without it.
+**Link outages.** Interface down (`ENETDOWN`): threads wait, frames stay in the ring. Interface
+removed and re-created (`ENXIO`/`ENODEV`, a driver reload): threads open a new socket and ring by
+name; frames from the old ring are lost and counted. Carrier lost: threads wait in the ENOBUFS
+backoff. The schedule is paused for the length of the outage (applied once, by whoever first sees
+the link back), so the replay continues instead of bursting to catch up. `LINK DOWN` in the
+per-second line, `Link outages: N, X s` in the summary.
 
-## Parallel preparation
+**Watchdog.** Each thread publishes what it is doing: sending, waiting for its schedule, for a TX
+ring frame (the NIC does not complete transmissions), for the device queue (ENOBUFS), for disk data,
+for the slowest thread, or for the link. A thread that sends nothing for 3 s while not waiting for its
+schedule gets a warning with the reason and the file position, and another when it resumes. The
+summary and the JSON show per thread how long it waited for each.
 
-Timeline normalization (outliers, clamp, max-gap, mapping), the radix sort used for unordered
-timestamps and the rate profile (peaks, interval statistics) run on as many threads as the index
-hashing. Each phase is split into contiguous chunks; phases that carry state from packet to
-packet (running maximum, accumulated gap excess, last mapped value, last good timestamp) first
-summarize every chunk, then merge the summaries in chunk order, then redo each chunk from the
-exact state the sequential algorithm would have had. The result is bit for bit identical to the
-original single-threaded code, which is kept in `tests/ref_sched.c`; the unit tests compare both
-on 360 combinations of data patterns, `--ts-order`, `--max-gap`, outlier exclusion and thread
-counts (1 to 16). Clock spike detection stays sequential: each decision depends on the previous
-good packet, and it is a single light pass.
+**Long-run statistics on request.** The stats thread keeps statistics of the per-second rate:
 
-On the test laptop, 4.7 million packets, 1 vs 11 threads:
-
-| Phase | 1 thread | 11 threads |
-|---|---|---|
-| normalization, ordered timestamps | 34 ms | 14 ms |
-| rate profile, ordered timestamps | 131 ms | 24 ms |
-| normalization, unordered (sort + max-gap) | 219 ms | 116 ms |
-| rate profile, unordered | 293 ms | 124 ms |
-
-The unordered case is bound by memory bandwidth of the radix sort.
-
-## Long runs: link outages and the watchdog
-
-**Link outages do not stop the replay.**
-- Interface down (`ENETDOWN`: `ip link set down`, a driver reset): threads wait and retry; frames
-  stay in the ring and go out when the interface is back.
-- Interface removed and re-created (`ENXIO`/`ENODEV`: driver reload): threads open a new socket
-  and ring by name. Frames that were in the old ring are lost; the summary counts them per thread.
-- Carrier lost (cable, switch port): the device queue stops, threads wait in the ENOBUFS backoff.
-- The outage is detected by the first sender thread whose `send()` fails, or by the stats thread
-  from `operstate` once a second. The schedule is paused for the length of the outage, applied
-  once by whoever first sees the link back, so the replay continues where it was instead of
-  bursting to catch up. The per-second line shows `LINK DOWN`; the summary shows the number and
-  total length of outages.
-
-**Watchdog.** Every sender thread publishes what it is doing: sending, waiting for its schedule,
-for a free TX ring frame (the NIC is not completing transmissions), for the device queue
-(ENOBUFS), for data from the disk, for the slowest thread, or for the link. If a thread sends
-nothing for 3 seconds while not simply waiting for its schedule, a warning names the reason and
-the file position; another one says when it resumed. The summary and the JSON show, per thread,
-how much time it spent in each kind of wait.
-
-## Checking on a run that lasts for days
-
-The stats thread keeps long-run statistics of the per-second send rate and shows them on request:
-
-- **In the terminal** where afreplay runs (also inside `screen`): Enter or `s` prints them, `r`
-  resets minimum/maximum/averages (to watch a new period), `q` stops gracefully.
-- **From any other terminal:** `afreplay --status -i IF` prints the status file
-  `/tmp/afreplay-IF.status` (or `--status-file`), rewritten atomically every second. After the run
-  it keeps the final result; if it is not updated any more, `--status` says so.
-- **`kill -USR1 PID`** prints them into the program's output (handy under `nohup` or systemd).
+- in the program's terminal (also in `screen`): Enter or `s` prints them, `r` resets
+  minimum/maximum/averages, `q` stops gracefully;
+- from any terminal: `afreplay --status -i IF` prints `/tmp/afreplay-IF.status` (`--status-file`),
+  rewritten atomically every second and kept after the end;
+- `kill -USR1 PID` prints them into the program's output (`nohup`, systemd).
 
 ```
-afreplay on enp1s0f3np3, pid 4242: running for 2d 03:14:07 (started 2026-10-07 10:40:12, now ...)
+afreplay on ens1f0, pid 4242: running for 2d 03:14:07 (started 2026-10-07 10:40:12, now ...)
   now:          24.310 Gbit/s, 3.360 Mpps, disk 61 C
   average:      last minute 24.300, last hour 24.280, overall 24.250 Gbit/s
   minimum 1 s:  18.200 Gbit/s (2.510 Mpps min) at +1d 04:12:03 (2026-10-08 14:52:15)
@@ -301,345 +320,338 @@ afreplay on enp1s0f3np3, pid 4242: running for 2d 03:14:07 (started 2026-10-07 1
   events:       link outages 0 (0.0 s), stalled-thread warnings 0, disk max 63 C, thermal throttling 0
 ```
 
-The first 10 seconds (warm-up), seconds with the link down and partial intervals are not counted
-in minimum, percentiles and averages. The worst minute is the lowest average over 60 consecutive
-counted seconds; it is less sensitive to single-second jitter than the 1-second minimum. The same
-block is printed at the end of the run, and the JSON summary gets the minimum, worst minute,
-percentiles and seconds below the target.
-
-## Rate modes
-
-| Mode | What it does |
-|---|---|
-| `--topspeed` | As fast as possible. Threads wait for nothing but free frames in the ring. |
-| `--mbps X` | Total rate of X Mbit/s by L2 frame length (without FCS, preamble and IFG). Packets are paced **in file order**: packet i is due at `T0 + (bytes of all packets before i in the file) / rate`, whichever thread sends it. The total rate is exactly X and all threads move through the file together. |
-| `--mbps line`, `--mbps N%` | Rate as a share of the link speed **on the wire** (preamble, IFG, FCS and the 60-byte minimum included): `line` = 100%, e.g. `99%`. The link speed comes from ethtool or `--link-speed`. It is converted to an L2 rate with the file's own ratio of L2 bytes to on-the-wire bytes and then paced like `--mbps X`. If an explicit `--mbps X` exceeds the link on the wire, afreplay warns before start. |
-| `--pace-slack T` | For `--mbps`/`--pps`: instead of busy-waiting for every packet, a thread sleeps and sends everything due within the next T at once (default 200 us). The schedule stays absolute, so the average rate is exact; bursts are at most T long per thread. In a 4 Gbit/s test this cut user CPU from 15.3 s to 2.5 s with the same rate. `--spin-us` only applies to timestamp replay. |
-| `--pps X` | The same, but in packets per second: packet i is due at `T0 + i / rate`. |
-| `--multiplier X` | Replay by timestamps (the default mode, X = 1). 2.0 is twice as fast, 0.5 twice as slow. |
-| `--duration T` | The multiplier is chosen so that the whole file (one lap) plays in T. Suffixes: `ns`, `us`, `ms`, `s`, `m`, `h`. |
-
-In the `--mbps` and `--pps` modes the send time is also computed from a common origin, so the
-error does not accumulate, and after a stall (for example, when the ring is full) a thread
-catches up with the schedule. Pacing in file order matters for big files: an earlier version
-split the rate between threads in proportion to shard volume, so a shard whose packets were
-unevenly spread over the file (for example, non-IP frames only at the start) moved through the
-file at its own pace. The slowest thread held back drop-behind, the page cache filled up and
-the replay degraded into disk waits after a few minutes.
-
-All modes start simultaneously: threads pass a barrier and wait for the common point T0.
-
-`--loop N` plays the file N times; `--loop 0` loops forever, until SIGINT/SIGTERM.
-
-## Timestamp replay
-
-**Schedule.** A packet's send time is computed from a common origin, not from the previous
-packet:
-
-```
-t_send = T0 + (lap_number × lap_length + ts_pkt − ts_first) / multiplier
-```
-
-So the error does not accumulate and threads do not drift apart. T0 is shared by all threads:
-it is assigned after the barrier, once all sockets and rings are ready. The lap length equals
-the timeline duration plus the mean inter-packet interval. This way the last packet of a lap
-and the first packet of the next do not merge, and when looping the timeline continues rather
-than starting over.
-
-**Waiting** is hybrid. Long pauses are spent in `clock_nanosleep(TIMER_ABSTIME)` in chunks of
-at most 50 ms, so a stop is noticed in time. The last `--spin-us` us (50 by default) are
-busy-spun on the clock. The thread's timer slack is set to 1 ns.
-
-**Batches do not break timing.** If the next packet is not yet due, the accumulated batch is
-sent early, and only then does the thread sleep. If the packet is already due, the clock is not
-read again: when lagging, this saves a clock call per packet. The clock is refreshed after
-every `send()`.
-
-**Clock** (`--clock auto|tsc|monotonic`). Normally `CLOCK_MONOTONIC` via vDSO costs about 20 ns.
-But if the kernel has switched to the `hpet` or `acpi_pm` clocksource (TSC rejected; happens on
-laptops and in VMs), each call costs about 1 us, and a single thread in timestamp mode loses
-half its rate. In `auto` mode in this situation, if the CPU has an invariant TSC (`constant_tsc`
-and `nonstop_tsc`), `rdtsc` is used. The frequency is calibrated against `CLOCK_MONOTONIC`
-twice for 100 ms on one core; if the two estimates differ by more than 0.1%,
-`CLOCK_MONOTONIC` is used. The offset is calibrated in each thread separately, after pinning
-to a core. This matters: on the test laptop the TSC of CPU 0 is offset from the other cores by
-2.09 s, which is why the kernel rejected the TSC. Before each `nanosleep` a thread checks the
-TSC against `CLOCK_MONOTONIC` and resynchronizes if they diverge by more than 50 us. The
-selected clock is shown in the "Clock: ..." line at startup.
-
-**Lag.** If a packet is already late, the thread does not sleep and sends it immediately.
-Lateness = actual time the frame is placed in the ring − scheduled time. It is recorded in a
-per-thread histogram: p50, p99 and max for each second, plus p99.9 in the summary. What to do
-on large lag is set by `--lag-policy`:
-
-- `catchup` (default) — catch up: late packets are sent back to back until the thread is back
-  on schedule. Absolute times are preserved, but there will be a burst after a stall.
-- `rebase` — if lateness exceeds `--lag-threshold` (10 ms by default), the shared T0 is shifted
-  forward by the lateness. The shift is common to all threads (a lock-free atomic variable),
-  so the relative position of threads is preserved. Inter-packet intervals stay correct, and
-  the whole timeline is "stretched". The number of shifts and the total shift are printed in
-  the summary.
-
-### Problematic timestamps
-
-| Problem | What afreplay does |
-|---|---|
-| Non-monotonic timestamps (merged or multi-queue captures) | `--ts-order`: **`clamp`** (default) replaces a "backwards in time" timestamp with the previous one (more precisely, with the running maximum). **`sort`** stably sorts the index by timestamp; the data is untouched, only the index within a shard is sorted (order between threads is set by the timeline anyway). **`asis`** sends as is: a "backwards in time" packet is sent without waiting and without being counted in lateness; such packets are counted separately. `--analyze` shows the count and the largest backward jump. |
-| Long pauses | `--max-gap X` compresses every pause longer than X down to X. Pauses are found on the ordered timeline, so this also works with `asis`/`sort`. `--analyze` shows the top 10 pauses with timestamps and packet numbers. |
-| Outliers | Always detected: ts = 0, timestamps before 1990, timestamps in the future (later than the current time + one day), and a short clock spike. A spike is a packet (or a run of up to 16 packets) that jumped further than `--outlier-jump` (60 s by default) from the previous normal one, after which time returned. By default outliers are only reported (`--ts-outliers report`) with a warning before start. With `--ts-outliers exclude` they are excluded from the timeline: the packet gets the timestamp of a neighbouring normal packet and is sent next to it. If the timeline with outliers would be longer than a day, there is also a warning. |
-| Speedup beyond link capacity | Before start, peak rates in 1 ms, 10 ms and 1 s windows are computed **taking the multiplier into account**, in two variants: L2 and "on the wire" (with an 8 B preamble, 12 B IFG, 4 B FCS and a 60 B minimum frame). If the on-the-wire peak exceeds the link speed (from ethtool, i.e. from `/sys/class/net/<if>/speed`, or from `--link-speed`), a warning is printed. Example: "on x10 the 1 ms peak is 38.42 Gbit/s (with preamble and IFG), above the 25.00 Gbit/s link; timing will be violated". |
-| Intervals too small | After applying the multiplier, the distribution of intervals between adjacent packets **within a shard** is computed (< 1 us, < 10 us, < 100 us). The share of intervals shorter than `--timing-res` (2 us by default) is shown as the share of packets that will effectively be sent in batches. If it is at least 1%, a warning is printed. |
-
-## Looping with modification
-
-`--loop-mutate ip|port|ip,port`: on lap k > 0 frames are modified directly in the TX ring. The
-file mmap stays read-only. L2 (MAC, VLAN, MPLS) is not changed.
-
-- **ip.** `k × --mutate-ip-offset` is added to every IPv4 address (both source and destination)
-  (0.1.0.0 by default: 10.0.0.1 → 10.1.0.1 → 10.2.0.1). For IPv6 the 32-bit word in bytes 8–11
-  of the address (the high part of the interface identifier) is shifted; the /64 prefix stays
-  the same.
-- **port.** Ports of 1024 and above are shifted by `k × --mutate-port-step`, wrapping within
-  1024..65535. Service ports (< 1024) are not changed, so protocol detection is not broken.
-  Ports are changed only for TCP and UDP and only in unfragmented packets: otherwise the first
-  fragment would diverge from the rest.
-
-The transformation is deterministic and identical for both sides, so A→B and B→A remain one
-session after the shift (and land in the same shard). Checksums are updated incrementally
-(RFC 1624, eq. 3): for IPv4 the header checksum, for TCP, UDP and ICMPv6 the checksum with the
-pseudo-header. UDP with a zero checksum (IPv4) stays without a checksum; a computed zero is
-written as 0xFFFF. For the first fragment the L4 checksum is updated as well: it covers the
-whole datagram, and the pseudo-header changes by the same amount.
-
-## Analysis mode
-
-`--analyze` sends nothing. It prints:
-
-- file format, number of packets and bytes, index build time;
-- timestamp range, replay timeline duration (taking `--ts-order`, `--max-gap`, `--ts-outliers`
-  into account);
-- mean and peak rate in 1 ms, 10 ms and 1 s windows (taking `--multiplier` or `--duration` into
-  account);
-- the distribution of intervals within shards and the share that will be sent in batches;
-- timestamp anomalies: number of "backwards in time" packets and the largest backward jump,
-  outliers by kind, top 10 pauses;
-- traffic mix: IPv4, IPv6, non-IP (ARP, 802.3/LLC with STP, LLDP, other), VLAN, QinQ, MPLS,
-  PPPoE, IP fragments;
-- skipped frames by reason, and frames truncated at capture;
-- the distribution of packets and bytes across shards and the imbalance of the most loaded
-  shard.
-
-There are as many shards as set by `-t` (CPU − 1 by default), so the distribution matches what
-sending with the same options will produce.
-
-## Input files
-
-- Classic pcap: microsecond and nanosecond, both endiannesses. For pcapng the program reports
-  an error with the hint `editcap -F pcap in.pcapng out.pcap` (for nanoseconds, `-F nsecpcap`).
-- Linktype 1 (Ethernet); 101 and 12 (RAW IP, the version is taken from the packet), 228 (IPv4),
-  229 (IPv6). For RAW IP an Ethernet header `--dmac`/`--smac` with ethertype 0x0800 or 0x86dd
-  is prepended.
-- A packet with caplen < origlen is sent with length caplen and counted in the statistics.
-- A frame longer than MTU+14 is skipped and counted. For a frame with an outer 802.1Q tag
-  (0x8100) the limit is MTU+18. The kernel checks the same way: the exception is made only for
-  0x8100, so an 802.1ad frame of the same length would be rejected by the kernel. Frames shorter
-  than 14 bytes are skipped too.
-- If the file is truncated or corrupted in the middle of a record, there will be a warning, and
-  everything up to that point is sent.
+The first 10 s (warm-up), seconds with the link down and partial intervals are not counted. The
+worst minute (lowest 60-second average) is less sensitive to counter jitter than the 1-second
+minimum. The block is also printed at the end and its values go into the JSON summary.
 
 ## Statistics
 
-Once a second a line is printed:
+Once a second (unless `-q`):
 
 ```
-[    3.0 s]    3.590 Gbit/s    0.499 Mpps | sent (sysfs) 0.499 Mpps, tx_dropped +0 | ENOBUFS +0 EAGAIN +0 | lateness p50 1.28 us p99 20.48 us max 425.98 us | pcap +3.000 s of 9.387 s
+[  161.0 s]   24.266 Gbit/s    3.819 Mpps | sent (sysfs) 3.760 Mpps, tx_dropped +0 | ENOBUFS +173175 EAGAIN +0 | disk 3.30 GB/s, 38 ms/read, 61 C | file 82.4% lap 1
 ```
 
-- **Gbit/s, Mpps** — how many frames were placed in the ring and handed to the kernel
-  (`send()`).
-- **sent (sysfs)** — the increment of `/sys/class/net/<if>/statistics/tx_packets`;
-  **tx_dropped** — the increment of `tx_dropped`. These are whole-interface counters, so other
-  traffic is included too.
-- **ENOBUFS / EAGAIN** — how many times `send()` returned these errors (see below).
-- **lateness p50/p99/max** — lateness over the second (timestamp mode only). Quantiles come
-  from a log-linear histogram with ±12.5% accuracy. The maximum over the whole run in the
-  summary is exact.
-- **pcap +X s of Y** — the position on the pcap timeline of the slowest thread; with `--loop`
-  also the lap number.
+- **Gbit/s, Mpps**: frames handed to the kernel. **sent (sysfs)**: increment of the interface
+  `tx_packets` (whole interface; some drivers update it about once a second, so single seconds
+  jitter); **tx_dropped**: increment of `tx_dropped`.
+- **ENOBUFS / EAGAIN**: see below.
+- **disk**: direct I/O read rate, mean time of one 32 MB read, drive temperature, `limit` of the
+  thermal governor, `THROTTLED`.
+- **file X% lap N**: position of the slowest thread (rate modes); in timestamp mode
+  `lateness p50/p99/max` and `pcap +X s of Y` instead.
+- `LINK DOWN` during an outage.
 
-At the end a summary is printed: total packets and bytes, mean rate, difference from sysfs,
-number of `send()` calls and mean frames per call, ENOBUFS and EAGAIN, skipped frames, lateness
-p50, p99, p99.9 and max, T0 shifts (rebase) and a per-thread breakdown. On SIGINT/SIGTERM the
-summary is printed too, with exit code 0.
-
-`--stats-json FILE` writes the same in JSON: a header (file, mode, multiplier, threads,
-timeline and lap duration), an `intervals` array (one entry per second; the file is appended to
-while running) and a `summary` with a per-thread breakdown.
-
-Exit codes: 0 — success or stopped by signal, 1 — runtime error, 2 — argument error.
+The summary adds totals, the difference from sysfs, `send()` calls and frames per call, skipped
+frames, lateness quantiles, T0 shifts, link outages, disk temperature and throttling, the long-run
+statistics block, and per thread: packets, bytes, ENOBUFS and time spent waiting by reason.
+`--stats-json FILE` writes a header, one `intervals` entry per second (appended while running) and
+the `summary`. Exit codes: 0 success or stopped by signal, 1 runtime error, 2 argument error.
 
 ### Interpreting ENOBUFS
 
-`send()` returns `ENOBUFS` when the qdisc or the driver queue did not accept the next frame. On
-modern kernels (checked on 6.19) **the frame itself is not lost**: the kernel returns it to the
-ring with status `SEND_REQUEST`, and `send()` stops at it. afreplay repeats `send()`, and the
-frame goes out on the next attempt. So ENOBUFS signals backpressure ("the link or the queue
-cannot keep up"), not a loss count. A large ENOBUFS value with `--topspeed` is normal.
-
-If ENOBUFS is high with `--mbps`, the requested rate is above what the link can carry on the
-wire. Each ENOBUFS triggers a short backoff (see "How it works"), so CPU usage stays reasonable,
-but the cleaner fix is `--mbps line` or `--mbps 99%`.
-
-Test on veth with a tbf qdisc (20 Mbit/s, 2 threads): 219 515 ENOBUFS, but 211 of 6000 frames
-were lost.
-
-**Real losses** should be read from the difference between "handed to the kernel" and
-`tx_packets` in sysfs, as well as from `tx_dropped` and `tc -s qdisc show dev <if>`. Not every
-loss comes with ENOBUFS: in the experiment above 211 frames were dropped by the qdisc without
-an error from `send()`. This appears to be the path where, under qdisc contention, the skb is
-put on a deferred queue while `send()` has already returned success. This conclusion is drawn
-from the kernel sources and has not been confirmed separately.
-
-With `--qdisc-bypass` the frame goes straight to the driver. If the driver queue is stopped,
-the kernel increments `tx_dropped` and returns ENOBUFS, but the frame in the ring is likewise
-returned to `SEND_REQUEST` and resent. So with bypass `tx_dropped` may **overstate** losses: it
-counts attempts, not frames. This could not be reproduced on veth (veth does not stop its
-queue); the conclusion is drawn from the 6.x kernel sources. On a real NIC, rely on the
-difference between sent and `tx_packets`, and on the NIC counters (`ethtool -S`).
-
-`EAGAIN` means the socket send buffer (`SO_SNDBUF`) is exhausted. afreplay tries to size it to
-the ring via `SO_SNDBUFFORCE`, and without `CAP_NET_ADMIN` is capped by `net.core.wmem_max`.
-Frequent EAGAIN is a reason to raise `wmem_max` or run as root.
+`ENOBUFS` from `send()` means the qdisc or driver queue did not accept the next frame. On current
+kernels the frame is **not lost**: it goes back to `SEND_REQUEST` in the ring and is sent on the next
+`send()`. ENOBUFS is backpressure, not a loss count; high values at top speed or at a rate above the
+link are normal (use `--mbps 99%`). Real losses: the difference between frames handed to the kernel
+and `tx_packets`, `tx_dropped`, `tc -s qdisc`, `ethtool -S`. Under qdisc contention some drops happen
+without an error from `send()` (seen on veth with a tbf qdisc). With `--qdisc-bypass`, `tx_dropped`
+can overstate losses (it counts rejected attempts that are then resent). `EAGAIN`: the socket buffer
+is full; run as root or raise `net.core.wmem_max`.
 
 ### Interpreting lateness
 
-Lateness is how much later than scheduled a frame was placed in the ring. This is sender-side
-delay: time in the qdisc, the driver and on the wire is not included.
+Lateness is sender-side delay (placed in the ring vs scheduled). p50 in single-digit microseconds is
+normal. High p99 with low p50: preemption, late wakeup from deep C-states, interrupts; raise
+`--spin-us`, isolate cores, disable deep C-states, or use `chrt -f 50`. Growing p50 and the pcap
+position falling behind: the peak exceeds the link, not enough cores, the disk or the kernel cannot
+keep up. A functional test showed that the lateness afreplay reports matches the interval error
+measured at the receiver to within a few microseconds.
 
-- **p50 in single-digit microseconds** — normal.
-- **High p99 with low p50** — rare delays: thread preemption by the scheduler, late wakeup from
-  a deep C-state, interrupts on the same core. What helps: a larger `--spin-us` (busy-spin
-  covers `nanosleep` misses), dedicated cores (`isolcpus`, `nohz_full`), disabling deep
-  C-states (`cpupower idle-set -D 10`, `tuned-adm profile network-latency`), running with
-  real-time priority (`chrt -f 50 afreplay ...`; threads inherit the policy).
-- **Growing p50 and a pcap position falling behind real time** — the thread cannot sustain the
-  rate: the peak exceeds the link (see the warnings before start), not enough cores (increase
-  `-t`), the disk cannot keep up (`--preload`), the kernel cannot keep up (ENOBUFS grows). With
-  `catchup` the thread will later "fire" the backlog; with `rebase` the timeline will shift.
+## Tuning the sender
 
-On the test laptop (Ryzen 5 7535HS, clocksource hpet) `nanosleep` occasionally wakes up 1–4 ms
-late. The functional test showed that the lateness reported by afreplay matches the interval
-error measured at the receiver to within a few microseconds. So the metric is honest.
+Most of the CPU time is spent in the kernel and the NIC driver, so these settings matter:
+
+```sh
+ethtool -l IF                 # TX queues: with --qdisc-bypass a thread on CPU c uses queue c % queues;
+                              # have at least as many queues as sender cores
+ethtool -G IF tx <max>        # larger NIC TX ring: fewer ENOBUFS (e.g. 511 -> 2047 on bnxt_en)
+ethtool -C IF tx-usecs 64 tx-frames 128   # fewer TX completion interrupts (experimental)
+
+# completion interrupt of queue i on the CPU of the thread using queue i
+systemctl stop irqbalance
+for irq in $(grep IF-TxRx /proc/interrupts | awk -F: '{print $1}'); do
+  q=$(grep "^ *$irq:" /proc/interrupts | grep -o 'TxRx-[0-9]*' | cut -d- -f2)
+  echo $(( q % $(nproc) )) > /proc/irq/$irq/smp_affinity_list
+done
+```
+
+- `dmesg | grep -i "IOMMU enabled"`: if the IOMMU translates DMA, `iommu=pt` on the kernel command
+  line may help a lot.
+- `tuned-adm profile throughput-performance`, low `vm.swappiness`, no other traffic generator on the
+  interface (it shares the link and the RAM).
+- Experimental: a newer kernel, `isolcpus`/`nohz_full` for the sender cores, `mitigations=off` on a
+  lab machine.
+- Disk: `dd if=FILE of=/dev/null bs=16M count=2000 iflag=direct` must deliver the target rate
+  (24 Gbit/s ≈ 3.1 GB/s of pcap); watch the NVMe temperature under sustained load.
+
+Settings made with `ethtool` and `/proc/irq` are lost on reboot; persist them with tuned or udev
+if they help.
+
+## Checking the receiver
+
+**L2 arrives as captured.** On the sensor: `tcpdump -i IF -nn -e -c 50`. Each line shows MACs and the
+VLAN tag; with afreplay they are the original ones (many vendors' MACs, the original VLAN IDs, the
+original share of tagged frames, the same session in several VLANs for multi-segment SPAN
+captures), not the sender's MAC as with replayers that rewrite L2. Compare with the source:
+
+```sh
+editcap -r big.pcap ref.pcap 1-2000000
+tshark -r ref.pcap -T fields -e eth.src -e eth.dst -e vlan.id | sort | uniq -c | sort -rn | head
+tshark -r rx.pcap  -T fields -e eth.src -e eth.dst -e vlan.id | sort | uniq -c | sort -rn | head
+```
+
+For a byte-exact check, replay a slice once without `--loop-mutate`, capture everything on the
+sensor and compare frame by frame (like the functional tests do). Notes: the NIC pads frames shorter
+than 60 bytes with zeros; FCS is not captured; a switch in between drops LLDP/STP and an access port
+strips VLAN tags (use a direct cable, a TAP or a trunk); if the sensor captures with DPDK or its own
+driver, `tcpdump` on the host sees nothing.
+
+**Receiver drops.** NIC level: `ethtool -S IF | grep -i -E "rx_(packets|discard|drop|miss)"`.
+Suricata with AF_PACKET: drop % = `capture.kernel_drops / capture.kernel_packets` (stats.log, eve
+`stats`, `suricatasc -c "iface-stat IF"`); compute it per interval, not since start. Sent vs
+received: `afreplay --status` (`sent`) against the sensor's `rx_packets`.
+
+**Capacity of the sensor.** Step the rate (e.g. 5, 10, 15, 20, 24 Gbit/s, 10 minutes each with
+`timeout -s INT 600`) and find the highest rate with drops below the acceptable level.
+
+**Filling the sensor's storage.** Storage growth depends on what the sensor stores (full packets
+fill disks at the traffic rate; flow metadata grows with sessions per second). Calibrate for an hour
+(`df` on the data partition every 10 minutes), then scale `--mbps`; make sure the sensor's retention
+does not delete old data. `--loop-mutate` keeps sessions new, which is what makes metadata grow.
+
+## Realism of the load
+
+- **Content:** afreplay sends the capture as it was (L2 included) and, with `--loop-mutate`, new
+  sessions on every lap. A capture with L2 removed makes copies of a session from different VLANs
+  collapse into one flow with duplicate segments, and looping without changes repeats the same TCP
+  sessions and sequence numbers; both add work to an IDS that real traffic does not cause. Such
+  setups typically show higher drop rates for that reason.
+- **Shape:** `--mbps` gives a smooth rate. Real traffic at the same average has bursts, and bursts are
+  what overflow receive buffers. To simulate a customer's peak load, replay by timestamps with a
+  multiplier: pick it with `afreplay --analyze --multiplier X --link-speed 25G FILE` so that the 1 s
+  peak is the load you want and the 1 ms peak stays below the link.
+- **Loop boundaries:** at the start of every lap many sessions appear at once (the capture started in
+  the middle of them). With a large file this happens rarely (a 500 GB file at 24 Gbit/s: every
+  ~3 min); periodic drop spikes at the lap period come from this.
+
+## Analysis mode
+
+`--analyze` sends nothing and prints: format, packets and bytes, index time; timestamp range and
+replay timeline (with `--ts-order`, `--max-gap`, `--ts-outliers`); mean and peak rate in 1 ms, 10 ms,
+1 s windows (with `--multiplier`/`--duration`); intervals within shards; timestamp anomalies;
+traffic mix (IPv4, IPv6, non-IP: ARP, LLC/STP, LLDP, other; VLAN, QinQ, MPLS, PPPoE, fragments);
+skipped and truncated frames; distribution across shards and the imbalance (shards = `-t`).
+
+## Input files
+
+- Classic pcap, microsecond or nanosecond, either endianness. pcapng: an error with the hint
+  `editcap -F pcap in.pcapng out.pcap`.
+- Linktype 1 (Ethernet); 101 and 12 (RAW IP), 228 (IPv4), 229 (IPv6): an Ethernet header
+  `--dmac`/`--smac` is prepended.
+- caplen < origlen: sent with caplen, counted. Frames longer than MTU+14 (MTU+18 with an outer
+  802.1Q tag, the same rule as the kernel's) or shorter than 14 bytes: skipped, counted.
+- A file truncated or corrupt in the middle of a record: a warning; everything before it is sent.
 
 ## Tests
 
-- `make unit-test` — unit tests (`tests/test_*.c`):
-  - **parser**: us and ns, LE and BE, truncated file (in the data and in the record header),
-    "insane" caplen, pcapng, unknown magic numbers and linktypes, FCS bits in the linktype,
-    index building and skip reasons;
-  - **hash**: A→B/B→A symmetry for IPv4, VLAN (with different VLAN IDs in the two
-    directions), QinQ, MPLS, IPv6, IPv6 with an extension header, PPPoE; IPv4 and IPv6
-    fragments in the same shard; non-IP in a separate shard; RAW IP; distribution uniformity;
-    MTU limits;
-  - **schedule** as a pure function: clamp, asis, sort, max-gap (including on a non-monotonic
-    timeline), outliers (ts=0, before 1990, future, clock spike, a genuine long jump), gaps,
-    the `t_send` formula with different multipliers and laps, lap length, sort stability, rate
-    peaks, histogram;
-  - **modification**: the RFC 1624 example, IPv4 TCP/UDP with and without VLAN, comparison with
-    full checksum recomputation, UDP without a checksum, carry across 65535 and across an
-    octet, symmetry, fragments, IPv6, ports only, non-IP.
-- `tests/gen_pcaps.py` — a test pcap generator without third-party modules: an L2 mix (ARP,
-  STP, LLDP, VLAN, QinQ, MPLS and pseudowire, PPPoE, IPv6 with extension headers, fragments,
-  sessions in both directions, a truncated frame, a frame larger than MTU, frames of exactly
-  MTU+14 and MTU+18), the same mix in ns/BE, RAW IP, files with anomalies (backward jumps, long
-  pauses, ts = 0 and future, clock spike), a timing file, a truncated file and a pcapng.
-- `make func-test` (or `tests/func_veth.sh`) — functional tests on a veth pair in a separate
-  network namespace. Without root `unshare -rn` (user namespace) is used, so root is not
-  required. If user namespaces are disabled and there is no root, the tests are skipped. What
-  is checked:
-  - all frames arrived **byte for byte**; the VLAN tag stripped by the kernel on receive is
-    restored from `PACKET_AUXDATA`; there are no extra frames; order within sessions is
-    preserved (modes `--pps`, `--topspeed --qdisc-bypass`, `--mbps --ts-order sort`, RAW IP);
-  - intervals at **x1, x2 and x0.5**, captured with nanosecond timestamps (`SO_TIMESTAMPNS`):
-    p95 error < 100 us, total duration ±0.2%; a rare large outlier is allowed only if afreplay
-    itself reported the same lateness;
-  - `--duration`, `--max-gap`, `--loop` (common timeline across laps), `--ts-outliers exclude`,
-    `--ts-order sort/clamp/asis`;
-  - `--loop-mutate`: lap 0 is unchanged, on the other laps all IP frames are changed, checksums
-    are correct, non-IP and MAC are untouched;
-  - CLI: pcapng (code 1 and hint), unknown option (code 2), `--help`, nonexistent interface,
-    SIGINT with `--loop 0` (summary and code 0), truncated file.
+- `make unit-test` (100 000+ checks): pcap parser (us/ns, LE/BE, truncated, corrupt, pcapng,
+  linktypes); index build, resolve and the index cache (round trip, another `-t`, a changed or
+  damaged pcap/cache); symmetric hash (IPv4, VLAN with different IDs per direction, QinQ, MPLS, IPv6
+  with extension headers, PPPoE, fragments, non-IP, RAW IP, distribution, MTU limits); timeline
+  normalization, schedules, rate profile, radix sort, histograms, and the parallel implementation
+  against the reference (360 combinations); the rate timeline; loop mutation and RFC 1624
+  checksums; the thermal governor on a drive model; long-run statistics.
+- `tests/gen_pcaps.py`: generates the test pcaps (L2 mix with ARP, STP, LLDP, VLAN, QinQ, MPLS,
+  pseudowire, PPPoE, IPv6, fragments; RAW IP; timestamp anomalies; a timing file; a truncated file;
+  pcapng) without third-party modules. `tests/gen_big.py out.pcap 4`: a 4 GB file for benchmarks.
+- `make func-test` (`tests/func_veth.sh`): on a veth pair in a private network namespace (no root
+  needed): every frame byte for byte with VLAN restored from `PACKET_AUXDATA` and order within
+  sessions (several modes, RAW IP, direct I/O, drop-behind, the index cache with another `-t`);
+  timing at x0.5/x1/x2 against nanosecond receive timestamps; `--duration`, `--max-gap`, `--loop`,
+  outliers, `--ts-order`, `--mbps N%`; `--loop-mutate` (lap 0 unchanged, checksums valid, L2
+  untouched); link down/up and interface re-creation; the watchdog; `--status`, SIGUSR1; CLI errors,
+  SIGINT, a truncated file.
+- `make sanitize`: the unit tests with UBSan; the functional tests also pass with that binary.
 
-  Timing tolerances are configurable: `tests/func_veth.sh build/pcaps --tol-p95-us 200 --spin-us 3000`.
-- `tests/gen_big.py out.pcap 4` — a large synthetic file (4 GB) for performance measurements.
+## Results
 
-## Results on the test machine
-
-Laptop, Ryzen 5 7535HS (12 threads), veth in a netns. On veth the same CPU also receives the
-frames, so the numbers on a real NIC will differ.
+Laptop (Ryzen 5 7535HS, 12 threads, veth, which also receives on the same CPU):
 
 | What | Result |
 |---|---|
-| Index of 4.2 GB, 4.7 million packets (file in page cache) | 0.69 s |
-| `--topspeed --qdisc-bypass`, 1 / 4 / 8 threads | 4.4 / 12.8 / 24.2 Gbit/s (0.61 / 1.78 / 3.36 Mpps) |
-| `--mbps 5000` | 5.000 Gbit/s |
-| `--pps 300000` | 0.300 Mpps |
-| x1, 0.5 Mpps, 4 threads | lateness p50 14 ns, p99 13 us |
+| index of 4.2 GB / 4.7 million packets (file cached) | 0.69 s; from the index cache 0.19 s total start |
+| `--topspeed --qdisc-bypass`, 1 / 4 / 8 threads | 4.4 / 12.8 / 24.2 Gbit/s |
+| `--mbps 5000`, `--pps 300000` | 5.000 Gbit/s, 0.300 Mpps |
+| timestamps x1, 0.5 Mpps, 4 threads | lateness p50 14 ns, p99 13 µs |
+| timing at the receiver (x0.5/x1/x2) | interval error p50 ~3 µs, p95 ~10 µs |
+| direct I/O vs page cache, file from NVMe | 22.7 vs 17.2-18.1 Gbit/s |
 
-Real NIC (mendel17, 25G, 11 threads, `--mbps 32000 --qdisc-bypass --preload`, 53.7 GB file):
-24.3-24.4 Gbit/s L2, about 25.0 Gbit/s on the wire (line rate), 3.3 Mpps, `tx_dropped` 0, the
-receiving sensor saw 25 Gbps with 0 RX drops. That run requested more than the link and showed
-about 1.2 M ENOBUFS/s with all threads at 100% CPU; it predates the ENOBUFS backoff and
-`--mbps line`.
+Test server (Dell, 12 cores, Broadcom bnxt_en 25G, RHEL 8, consumer NVMe drive), 500 GB capture,
+`--mbps 99% --qdisc-bypass`, 10 IP threads, direct I/O: line rate, about 24.3 Gbit/s of L2 frames
+(~25 Gbit/s on the wire), 3.3-3.8 Mpps, `tx_dropped` 0, the receiving sensor saw 25 Gbit/s; stable
+for hours once the drive was cooled properly (61 °C under load).
 
 ## Known limitations
 
-- Order is preserved **within a session**: all its packets go through one thread. Order
-  between different sessions is set only by the timeline. With `--topspeed`, `--mbps` and
-  `--pps` packets of different threads are interleaved, and non-IP frames have their own
-  thread.
-- Sharding by session yields unequal shards: a single "elephant" session is capped by the speed
-  of one core. The imbalance is visible in `--analyze`.
-- Packets of one session in which some packets are fragmented and others are not may end up in
-  different threads (ports are not used for fragments).
-- Tunnels (GRE, VXLAN, IP-in-IP) are hashed and modified by the outer header. Headers inside
-  ICMP errors are not changed by `--loop-mutate`. SCTP, DCCP and UDP-Lite are not touched by
-  `--loop-mutate=port` (SCTP uses CRC32c, which cannot be updated incrementally).
-- When modifying an MPLS pseudowire with inner Ethernet, the inner IP is changed; MAC and
-  labels stay the same.
-- Frames longer than MTU+14 (MTU+18
-  with 802.1Q) are skipped: they cannot be put on the wire without changing the MTU.
-- `--mbps` counts L2 bytes without FCS, preamble and IFG. The on-the-wire rate is higher by
-  about 24 bytes per frame.
-- The peak rate in the 1 s window for a file shorter than a second (after the multiplier) is
-  the whole volume divided by one second. The report marks this.
-- Per-second lateness quantiles have ±12.5% error (log-linear histogram).
-- When a thread is lagging, the time is not re-read until the next packet is in the future.
-  The lateness of such packets is understated by at most the duration of one batch.
-- With `PACKET_LOSS` enabled, the kernel silently skips a malformed frame. Without it, such a
-  frame stops the thread with an error (the frame would otherwise stay in the ring forever).
-  Thanks to the length pre-filter this practically never happens.
-- sysfs statistics are whole-interface counters, not just afreplay traffic. Inside a network
-  namespace without its own mounted sysfs they are unavailable, and the program reports this.
-- Linux is required. The TSC clock works only on x86; other architectures use
-  `CLOCK_MONOTONIC`.
+- Order is preserved within a session (one thread per session); order between sessions follows the
+  timeline in timestamp mode, and is interleaved across threads in rate modes. Non-IP frames have
+  their own thread.
+- One very large session is limited by one core (the shard imbalance is shown by `--analyze`).
+- Fragmented and unfragmented packets of the same session may go through different threads.
+- Tunnels are hashed and modified by the outer header; addresses inside ICMP errors are not
+  modified; SCTP/DCCP/UDP-Lite ports are not modified (CRC32c cannot be updated incrementally).
+- Frames longer than MTU+14 (MTU+18 with 802.1Q) are skipped.
+- `--mbps` counts L2 bytes; on the wire it is ~24 bytes per frame more (`--mbps N%` accounts for it).
+- Rate modes are smoother than real traffic (see [Realism of the load](#realism-of-the-load)).
+- Lateness quantiles per second have ±12.5% error; lateness of late packets is understated by at
+  most one batch.
+- Without `PACKET_LOSS`, a frame the kernel rejects stops the thread with an error (practically
+  impossible after the length pre-filter).
+- sysfs counters are per interface (other traffic included) and reset when the interface is
+  re-created.
+- Linux only; the TSC clock is x86 only.
 
 ## Source layout
 
 ```
-src/pcap.[ch]      pcap parsing, mmap, preload
-src/dissect.[ch]   L2/L3/L4 parsing, symmetric hash
-src/index.[ch]     index: sequential pass + parallel hashing, then resolve to shards
+src/pcap.[ch]      pcap parsing, mmap
+src/dissect.[ch]   L2/L3/L4 parsing, symmetric flow hash
+src/index.[ch]     index: sequential pass + parallel classification, resolve to shards
 src/idxcache.[ch]  on-disk index cache
-src/stream.[ch]    readahead and drop-behind for files larger than RAM
+src/sched.[ch]     timeline normalization, schedules, rate profile, radix sort, histogram
 src/par.[ch]       parallel-for over chunks
-src/sched.[ch]     timeline normalization, t_send, rate profile, histogram (pure functions)
 src/clock.[ch]     fast clock (TSC or CLOCK_MONOTONIC)
-src/worker.[ch]    sender thread: TX_RING, hot loop, waiting, batches
-src/mutate.[ch]    --loop-mutate and incremental checksums
-src/replay.c       thread startup, barrier and T0, statistics, JSON, signals
+src/worker.[ch]    sender thread: TX_RING, hot loop, pacing, link outages, wait states
+src/dio.[ch]       direct I/O streaming into a RAM window
+src/stream.[ch]    page-cache streaming: readahead, pre-mapping, drop-behind
+src/therm.[ch]     NVMe temperature and the thermal governor
+src/live.[ch]      long-run statistics
+src/mutate.[ch]    --loop-mutate with incremental checksums
+src/replay.c       thread startup, T0, statistics, status file, watchdog, link monitor, JSON
 src/report.c       --analyze report and pre-start warnings
 src/cli.[ch]       options and --help
-src/main.c         setup: CPU, MTU, file, index, timeline, profile
-tests/             unit tests, pcap generator, functional tests on veth
+src/main.c         setup: CPUs, MTU, file, index, timeline, rate profile
+tests/             unit tests, reference implementation, pcap generators, functional tests
+```
+
+## Command line reference
+
+Output of `afreplay --help`:
+
+```
+afreplay - multithreaded pcap replayer over AF_PACKET preserving L2
+
+Usage:
+  afreplay -i INTERFACE [options] FILE.pcap
+  afreplay --analyze [options] FILE.pcap
+
+Rate modes (mutually exclusive, default --multiplier 1):
+  --topspeed              as fast as possible
+  --mbps X                fixed total rate, Mbit/s (L2, without FCS)
+  --mbps line | N%        rate as a share of the link speed counted on the wire
+                          (preamble, IFG, FCS included): line = 100%, e.g. 99%
+  --pace-slack T          --mbps/--pps: threads sleep and send packets due within T at
+                          once instead of busy-waiting each packet (default 200us)
+  --pps X                 fixed total rate, packets/s
+  --multiplier X          replay by timestamps: 2.0 is twice as fast, 0.5 is twice
+                          as slow, 1.0 is real time
+  --duration T            pick the multiplier so the file plays in T
+  --loop N                play N times (0 means infinite), default 1
+
+Timestamps:
+  --ts-order MODE         asis | clamp | sort (default clamp)
+                            asis  - as is, "backward in time" is sent without waiting
+                            clamp - "backward in time" is replaced by the previous stamp
+                            sort  - stable sort of the index by timestamp
+  --max-gap T             compress pauses longer than T down to T
+  --ts-outliers MODE      report | exclude: outliers (ts=0, before 1990, future,
+                          short clock jump) are only reported or excluded
+                          from the timeline computation (default report)
+  --outlier-jump T        clock jump threshold for outlier detection (default 60s,
+                          0 disables detection)
+  --lag-policy P          catchup | rebase: when lagging, catch up or shift T0
+  --lag-threshold T       lag after which rebase kicks in (10ms)
+  --spin-us N             busy-spin for the last N us of each wait (50)
+  --timing-res T          achievable timing precision for burst estimation (2us)
+  --clock C               auto | tsc | monotonic: hot-loop clock. auto picks TSC
+                          if the kernel clocksource is not tsc (clock_gettime is slow then)
+
+Sending:
+  -i, --interface IF      interface
+  -t, --threads N         threads for IP traffic (default: CPUs of the NUMA node - 1);
+                          non-IP frames always go through a separate thread
+  --cpus LIST             CPUs for threads, e.g. 2-9,12 (default:
+                          /sys/class/net/IF/device/local_cpulist)
+  --batch N               frames per send() call (64)
+  --ring-frames N         frames in each thread's TX_RING (4096)
+  --qdisc-bypass          PACKET_QDISC_BYPASS: bypass qdisc, straight to the driver
+  --packet-loss           PACKET_LOSS: kernel silently skips malformed frames
+  --link-speed X          link speed (25G, 10000M); default from ethtool
+  --mtu N                 MTU (default from the interface, 1500 for --analyze)
+
+Input:
+  --preload               load the whole file into memory before start
+  --index-cache FILE      keep the packet index on disk: the first run builds and saves
+                          it, later runs load it instead of scanning the pcap; auto =
+                          FILE.pcap.afridx next to the pcap. Rebuilt automatically if the
+                          pcap changes; valid for any -t and MTU
+  --readahead SIZE        how much of the file is kept in RAM ahead of the senders:
+                          the direct I/O window or the page-cache readahead (2G)
+  --drop-behind M         auto | on | off: drop already sent parts of the file from the
+                          page cache; auto = on when the file is larger than free RAM
+  --io MODE               auto | direct | mmap: how the file is read during replay.
+                          direct: O_DIRECT reader threads fill a RAM window of
+                          --readahead size, bypassing the page cache; mmap: through the
+                          page cache; auto = direct when the file is larger than free RAM
+  --io-threads N          direct I/O reader threads (default 4)
+  --disk-max-temp C       thermal governor (direct I/O): limit the disk read rate to keep
+                          the NVMe drive at or below C degrees instead of letting it hit
+                          thermal throttling; e.g. 2-3 C below its throttling point
+  --disk-start-temp C     before start, wait until the NVMe drive cools down to C
+  --smac MAC, --dmac MAC  MAC addresses of the synthetic Ethernet header for RAW IP
+
+Looping with mutation:
+  --loop-mutate WHAT      ip | port | ip,port - on lap k>0 shift addresses/ports
+                          so the sensor sees new sessions (L2 is untouched)
+  --mutate-ip-offset A    IPv4 shift per lap, as an address (default 0.1.0.0)
+  --mutate-port-step N    shift of ports >= 1024 per lap (default 1)
+
+Output:
+  --analyze               analyze the file only, do not send
+  --stats-json FILE       write statistics as JSON
+  --status-file F         live status file, rewritten every second (default
+                          /tmp/afreplay-IF.status)
+  --status [-i IF]        print the live status of a running afreplay and exit
+  -q, --quiet             do not print per-second statistics
+  -h, --help              this help
+
+Examples:
+  afreplay --analyze big.pcap
+  afreplay --status -i ens1f0          # statistics of a replay running elsewhere
+  afreplay -i ens1f0 --mbps 99% --index-cache /var/tmp/big.afridx big.pcap
+  afreplay --analyze --multiplier 10 --link-speed 25G big.pcap
+  afreplay -i ens1f0 --topspeed --qdisc-bypass -t 12 big.pcap
+  afreplay -i ens1f0 --mbps 20000 --loop 0 big.pcap
+  afreplay -i ens1f0 --mbps 99% --loop 0 --loop-mutate ip,port big.pcap
+  afreplay -i ens1f0 --multiplier 2 --max-gap 1s --ts-order sort big.pcap
+  afreplay -i ens1f0 --duration 10m --stats-json run.json big.pcap
+  afreplay -i ens1f0 --loop 5 --loop-mutate ip,port big.pcap
+  afreplay -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap
+
+While running: press Enter (or s) for long-run statistics: minimum, worst minute,
+percentiles, averages; r resets them, q stops; kill -USR1 PID prints them too.
+
+Exit code: 0 - success (including stop by SIGINT/SIGTERM), 1 - runtime error,
+2 - invalid arguments.
 ```
