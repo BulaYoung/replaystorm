@@ -22,6 +22,7 @@ int afr_parse_cpulist(const char *s, int *cpus, int max);
 int afr_iface_cpus(const char *iface, int *cpus, int max, int *from_numa);
 
 int afr_sysfs_read_u64(const char *iface, const char *attr, uint64_t *v);
+int afr_sysfs_read_str(const char *iface, const char *attr, char *buf, size_t n);
 int afr_iface_mtu(const char *iface, unsigned *mtu);
 /* Link speed in bit/s; -1 if unknown. */
 int afr_iface_speed(const char *iface, double *bps);

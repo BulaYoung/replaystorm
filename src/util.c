@@ -222,6 +222,16 @@ int afr_iface_cpus(const char *iface, int *cpus, int max, int *from_numa)
 	return n;
 }
 
+int afr_sysfs_read_str(const char *iface, const char *attr, char *buf, size_t n)
+{
+	char path[256];
+	snprintf(path, sizeof(path), "/sys/class/net/%s/%s", iface, attr);
+	if (read_sysfs(path, buf, n) < 0)
+		return -1;
+	buf[strcspn(buf, "\n")] = 0;
+	return 0;
+}
+
 int afr_sysfs_read_u64(const char *iface, const char *attr, uint64_t *v)
 {
 	char path[256], buf[64];

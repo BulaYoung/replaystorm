@@ -130,6 +130,38 @@ static inline struct tpacket2_hdr *frame_at(const tx_ring_t *t, unsigned i)
 
 /* ---------- Sending ---------- */
 
+const char *const afr_wstate_names[W_COUNT] = {"sending", "schedule", "TX ring", "device queue",
+                                               "disk", "slowest thread", "link"};
+
+/* Enter a wait state; returns the time it started. Nested waits keep the outer state. */
+static inline int64_t wenter(worker_t *w, int s, int *prev)
+{
+	*prev = w->wstate;
+	if (w->wstate != W_RUN && w->wstate != W_PACE) {
+		/* Already inside another wait, which accounts for the time. A link outage is
+		 * still made visible: it explains every other wait. */
+		if (s == W_LINK)
+			atomic_store_explicit(&w->st.state, s, RLX);
+		return 0;
+	}
+	w->wstate = s;
+	atomic_store_explicit(&w->st.state, s, RLX);
+	return afr_now_ns();
+}
+
+static inline void wleave(worker_t *w, int s, int prev, int64_t t0)
+{
+	if (!t0) {
+		if (s == W_LINK)
+			atomic_store_explicit(&w->st.state, w->wstate, RLX);
+		return;
+	}
+	_Atomic uint64_t *c = &w->st.wait_ns[s];
+	atomic_store_explicit(c, atomic_load_explicit(c, RLX) + (uint64_t)(afr_now_ns() - t0), RLX);
+	w->wstate = prev;
+	atomic_store_explicit(&w->st.state, prev, RLX);
+}
+
 static void publish(worker_t *w)
 {
 	PUB(w->st.pkts, w->l_pkts);
@@ -171,30 +203,88 @@ static void backoff(unsigned fails)
 	nanosleep(&ts, NULL);
 }
 
+/*
+ * The interface was removed and may come back (driver reload, re-created device): the
+ * socket is bound to a stale ifindex, so open a new socket and ring by name. Frames still
+ * in the old ring are lost and counted.
+ */
+static void tx_reopen(worker_t *w)
+{
+	uint64_t lost = 0;
+	for (unsigned i = 0; i < w->tx.frame_nr; i++) {
+		uint32_t s = status_mask(__atomic_load_n(&frame_at(&w->tx, i)->tp_status, __ATOMIC_ACQUIRE));
+		if (s != TP_STATUS_AVAILABLE)
+			lost++;
+	}
+	PUB(w->st.link_lost, atomic_load_explicit(&w->st.link_lost, RLX) + lost);
+	unsigned frames = w->tx.frame_nr;
+	tx_close(&w->tx);
+	char err[200];
+	while (!STOP_REQUESTED()) {
+		if (tx_open(&w->tx, w->c->o->iface, frames, w->ring_len, w->c->o->qdisc_bypass,
+		            w->c->o->packet_loss, err, sizeof(err)) == 0)
+			break;
+		struct timespec ts = {0, 200 * 1000 * 1000};
+		nanosleep(&ts, NULL);
+	}
+	w->head = 0;
+	w->pending = 0;
+}
+
 static void flush(worker_t *w)
 {
 	unsigned fails = 0;
 	w->pending = 0;
+	int prev = W_RUN;
+	int64_t t0 = 0;
+	int state = W_RUN;
+	int link_seen = 0;
 	for (;;) {
 		w->l_sends++;
-		ssize_t r = send(w->tx.fd, NULL, 0, MSG_DONTWAIT);
+		ssize_t r = w->tx.fd >= 0 ? send(w->tx.fd, NULL, 0, MSG_DONTWAIT) : -1;
 		if (AFR_LIKELY(r >= 0))
 			break;
-		int e = errno;
+		int e = w->tx.fd >= 0 ? errno : ENXIO;
+		int want = W_QUEUE;
 		if (e == ENOBUFS) {
 			/* Device/qdisc queue is full. The frame stays SEND_REQUEST; the kernel
 			 * retries it on the next send(). */
 			w->l_enobufs++;
 		} else if (e == EAGAIN || e == EWOULDBLOCK) {
 			w->l_eagain++; /* socket buffer exhausted */
+		} else if (e == ENETDOWN || e == ENXIO || e == ENODEV) {
+			/* The interface is down or gone: wait for it instead of giving up. Frames
+			 * stay in the ring and go out when it is back. */
+			want = W_LINK;
 		} else if (e != EINTR) {
 			fatal(w, "send", e);
 			break;
 		}
+		if (state != want) {
+			wleave(w, state, prev, t0);
+			t0 = wenter(w, want, &prev);
+			state = t0 ? want : W_RUN;
+		}
+		if (want == W_LINK) {
+			link_seen = 1;
+			afr_link_down(w->sh, afr_now_ns());
+		}
 		if (STOP_REQUESTED())
 			break;
-		backoff(++fails);
+		if (want == W_LINK) {
+			if (e == ENXIO || e == ENODEV)
+				tx_reopen(w);
+			struct timespec ts = {0, 100 * 1000 * 1000};
+			nanosleep(&ts, NULL);
+			if (w->tx.fd >= 0 && w->pending == 0 && e != ENETDOWN)
+				break; /* re-created: the old frames are gone, nothing left to send */
+		} else {
+			backoff(++fails);
+		}
 	}
+	wleave(w, state, prev, t0);
+	if (link_seen && !STOP_REQUESTED())
+		afr_link_up(w->sh, afr_now_ns()); /* back: shift the schedule right away */
 	publish(w);
 	w->now = afr_clock_ns();
 }
@@ -202,12 +292,23 @@ static void flush(worker_t *w)
 static struct tpacket2_hdr *acquire_slow(worker_t *w, struct tpacket2_hdr *h)
 {
 	unsigned spins = 0;
+	int prev;
+	int64_t t0 = wenter(w, W_RING, &prev);
 	for (;;) {
+		if (STOP_REQUESTED() || !w->tx.ring) {
+			wleave(w, W_RING, prev, t0);
+			return NULL; /* stopping, or the ring could not be re-created */
+		}
+		/* The ring may have been re-created by flush() (interface came back). */
+		h = frame_at(&w->tx, w->head);
 		uint32_t s = status_mask(__atomic_load_n(&h->tp_status, __ATOMIC_ACQUIRE));
-		if (s == TP_STATUS_AVAILABLE)
+		if (s == TP_STATUS_AVAILABLE) {
+			wleave(w, W_RING, prev, t0);
 			return h;
+		}
 		if (s & TP_STATUS_WRONG_FORMAT) {
 			fatal(w, "frame rejected by kernel (TP_STATUS_WRONG_FORMAT)", EINVAL);
+			wleave(w, W_RING, prev, t0);
 			return NULL;
 		}
 		if (w->pending) {
@@ -223,8 +324,10 @@ static struct tpacket2_hdr *acquire_slow(worker_t *w, struct tpacket2_hdr *h)
 		} else {
 			afr_cpu_relax();
 		}
-		if (STOP_REQUESTED())
+		if (STOP_REQUESTED()) {
+			wleave(w, W_RING, prev, t0);
 			return NULL;
+		}
 	}
 }
 
@@ -240,6 +343,8 @@ static inline struct tpacket2_hdr *acquire(worker_t *w)
 /* Wait until all ring frames have been sent (no longer than timeout). */
 static void drain(worker_t *w, int64_t timeout)
 {
+	if (!w->tx.ring)
+		return;
 	if (w->pending)
 		flush(w);
 	int64_t deadline = afr_now_ns() + timeout;
@@ -268,9 +373,13 @@ static const uint8_t *dio_wait(worker_t *w, uint64_t q)
 	w->st.dio_waits++;
 	const uint8_t *b;
 	unsigned spins = 0;
+	int prev;
+	int64_t t0 = wenter(w, W_DISK, &prev);
 	while (!(b = afr_dio_chunk(w->dio, q))) {
-		if (STOP_REQUESTED())
+		if (STOP_REQUESTED()) {
+			wleave(w, W_DISK, prev, t0);
 			return NULL;
+		}
 		if (++spins < 64) {
 			afr_cpu_relax();
 		} else {
@@ -278,6 +387,7 @@ static const uint8_t *dio_wait(worker_t *w, uint64_t q)
 			nanosleep(&ts, NULL);
 		}
 	}
+	wleave(w, W_DISK, prev, t0);
 	w->now = afr_clock_ns();
 	return b;
 }
@@ -385,8 +495,12 @@ static inline int64_t pace(worker_t *w, int64_t target, int64_t spin)
 			flush(w);
 			now = w->now;
 		}
-		if (now < target)
+		if (now < target) {
+			int prev;
+			int64_t t0 = wenter(w, W_PACE, &prev);
 			now = wait_until(target, spin);
+			wleave(w, W_PACE, prev, t0);
+		}
 	}
 	w->now = now;
 	return now;
@@ -442,6 +556,8 @@ static void wait_fence(worker_t *w, uint64_t g)
 	if (w->pending)
 		flush(w);
 	w->st.fence_waits++;
+	int prev;
+	int64_t t0 = wenter(w, W_FENCE, &prev);
 	while (!STOP_REQUESTED()) {
 		struct timespec ts = {0, 50000};
 		nanosleep(&ts, NULL);
@@ -449,6 +565,7 @@ static void wait_fence(worker_t *w, uint64_t g)
 		if (g <= w->fence_min + w->fence_lead)
 			break;
 	}
+	wleave(w, W_FENCE, prev, t0);
 	w->now = afr_clock_ns();
 }
 
@@ -488,14 +605,16 @@ static void run(worker_t *w)
 					w->st.asis_back++;
 				} else {
 					max_sched = p->ts;
-					int64_t shift = rebase ? atomic_load_explicit(&w->sh->shift, RLX) : 0;
+					int64_t shift = atomic_load_explicit(&w->sh->pause, RLX) +
+					                (rebase ? atomic_load_explicit(&w->sh->shift, RLX) : 0);
 					int64_t target = afr_target(t0 + shift, lap, lap_len, p->ts, inv_mult);
 					int64_t late = pace(w, target, spin) - target;
 					hist_add(w, late);
 					if (rebase && late > lag_thr) {
 						/* Shift the common T0 forward so this packet is on time. */
-						int64_t want = shift + late;
-						int64_t cur = shift;
+						int64_t base = atomic_load_explicit(&w->sh->shift, RLX);
+						int64_t want = base + late;
+						int64_t cur = base;
 						while (cur < want &&
 						       !atomic_compare_exchange_weak(&w->sh->shift, &cur, want)) {
 						}
@@ -508,7 +627,8 @@ static void run(worker_t *w)
 				 * file together and the total rate is exact. Fixed rate needs no
 				 * microsecond precision: sleep instead of spinning and send everything due
 				 * within the next pace_slack at once. */
-				pace(w, afr_target(t0, lap, lap_len, p->ts, 1.0) - pace_slack, 0);
+				int64_t t0p = t0 + atomic_load_explicit(&w->sh->pause, RLX);
+				pace(w, afr_target(t0p, lap, lap_len, p->ts, 1.0) - pace_slack, 0);
 			}
 			if (AFR_UNLIKELY(emit(w, p, lap) < 0))
 				return;
@@ -588,7 +708,8 @@ void *afr_worker_main(void *arg)
 	if (build_shard(w) < 0) {
 		atomic_store(&w->sh->failed, 1);
 		ok = 0;
-	} else if (tx_open(&w->tx, c->o->iface, c->o->ring_frames, ring_frame_len(c), c->o->qdisc_bypass,
+	} else if ((w->ring_len = ring_frame_len(c)),
+	           tx_open(&w->tx, c->o->iface, c->o->ring_frames, w->ring_len, c->o->qdisc_bypass,
 	                   c->o->packet_loss, terr, sizeof(terr)) < 0) {
 		snprintf(w->err, sizeof(w->err), "thread %u: %s", w->id, terr);
 		atomic_store(&w->sh->failed, 1);

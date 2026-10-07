@@ -256,6 +256,27 @@ On the test laptop, 4.7 million packets, 1 vs 11 threads:
 
 The unordered case is bound by memory bandwidth of the radix sort.
 
+## Long runs: link outages and the watchdog
+
+**Link outages do not stop the replay.**
+- Interface down (`ENETDOWN`: `ip link set down`, a driver reset): threads wait and retry; frames
+  stay in the ring and go out when the interface is back.
+- Interface removed and re-created (`ENXIO`/`ENODEV`: driver reload): threads open a new socket
+  and ring by name. Frames that were in the old ring are lost; the summary counts them per thread.
+- Carrier lost (cable, switch port): the device queue stops, threads wait in the ENOBUFS backoff.
+- The outage is detected by the first sender thread whose `send()` fails, or by the stats thread
+  from `operstate` once a second. The schedule is paused for the length of the outage, applied
+  once by whoever first sees the link back, so the replay continues where it was instead of
+  bursting to catch up. The per-second line shows `LINK DOWN`; the summary shows the number and
+  total length of outages.
+
+**Watchdog.** Every sender thread publishes what it is doing: sending, waiting for its schedule,
+for a free TX ring frame (the NIC is not completing transmissions), for the device queue
+(ENOBUFS), for data from the disk, for the slowest thread, or for the link. If a thread sends
+nothing for 3 seconds while not simply waiting for its schedule, a warning names the reason and
+the file position; another one says when it resumed. The summary and the JSON show, per thread,
+how much time it spent in each kind of wait.
+
 ## Rate modes
 
 | Mode | What it does |

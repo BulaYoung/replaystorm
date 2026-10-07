@@ -465,6 +465,53 @@ def t_cli(pcaps):
     check(rc == 0 and "truncated" in out, "truncated file: warning, sends what is available")
 
 
+def sh(cmd):
+    subprocess.run(cmd, shell=True, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def recreate_veth():
+    sh("ip link del %s" % TX)
+    sh("ip link add name %s type veth peer name %s" % (TX, RX))
+    for i in (TX, RX):
+        sh("echo 1 > /proc/sys/net/ipv6/conf/%s/disable_ipv6" % i)
+        sh("ip link set %s mtu 1500 up" % i)
+    sh("ethtool -K %s gro off" % RX)
+
+
+def t_robust(pcaps):
+    print("== Link outages: interface down/up and re-created, the replay continues")
+    p = subprocess.Popen([BIN, "-i", TX, "--pps", "2000", "--loop", "0", "-t", "2",
+                          os.path.join(pcaps, "timing.pcap")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    time.sleep(1.5)
+    sh("ip link set %s down" % TX)
+    time.sleep(2.5)
+    sh("ip link set %s up" % TX)
+    time.sleep(1.5)
+    sh("ip link del %s" % TX)
+    time.sleep(1.5)
+    recreate_veth()
+    rx = Receiver(RX)
+    time.sleep(2.0)
+    p.send_signal(signal.SIGINT)
+    out = p.communicate(timeout=20)[0].decode()
+    got = rx.finish()
+    check(p.returncode == 0, "exit code 0 after two outages (%s)" % p.returncode)
+    check("Link outages: 2" in out, "both outages detected and the schedule paused")
+    check(len(got) > 100, "sending resumed on the re-created interface (%d frames)" % len(got))
+
+    print("== Watchdog: a stalled thread is reported with the reason")
+    sh("tc qdisc add dev %s root tbf rate 8kbit burst 2kb limit 3kb" % TX)
+    p = subprocess.Popen([BIN, "-i", TX, "-q", "--topspeed", "--loop", "0", "-t", "1",
+                          os.path.join(pcaps, "timing.pcap")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    time.sleep(8)
+    p.send_signal(signal.SIGINT)
+    out = p.communicate(timeout=20)[0].decode()
+    sh("tc qdisc del dev %s root" % TX)
+    check("has sent nothing" in out and "device queue" in out,
+          "stall reported: waiting for the device queue")
+    check("waited for: device queue" in out, "per-thread wait times in the summary")
+
+
 def main():
     global BIN, TX, RX, TOL_P95, TOL_MAX
     ap = argparse.ArgumentParser()
@@ -480,7 +527,8 @@ def main():
     BIN, TX, RX = os.path.abspath(a.bin), a.tx, a.rx
     TOL_P95, TOL_MAX = a.tol_p95_us * 1000, a.tol_max_us * 1000
     tests = {"bytes": lambda: t_bytes(a.pcaps), "timing": lambda: t_timing(a.pcaps, a.spin_us),
-             "mutate": lambda: t_mutate(a.pcaps), "cli": lambda: t_cli(a.pcaps)}
+             "mutate": lambda: t_mutate(a.pcaps), "cli": lambda: t_cli(a.pcaps),
+             "robust": lambda: t_robust(a.pcaps)}
     for name, fn in tests.items():
         if not a.only or name in a.only.split(","):
             fn()

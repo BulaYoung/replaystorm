@@ -24,6 +24,101 @@ static int g_dio_on;
 static therm_mon_t g_therm;
 static int g_therm_on;
 
+/* ---------- Link outages and the watchdog ---------- */
+
+static int g_link_down;          /* shown in the per-second line */
+static int64_t g_link_down_since;
+static unsigned g_link_outages;
+static int64_t g_link_down_ns;
+
+/*
+ * Link state from operstate (and from threads waiting in W_LINK). While the link is down
+ * the schedule must not run on: when it comes back, T0 is shifted by the outage so the
+ * replay continues where it was instead of bursting to catch up.
+ */
+static void link_check(worker_t **ws, unsigned nw, const char *iface, shared_t *sh, int64_t now)
+{
+	int down = 0;
+	char st[32];
+	if (afr_sysfs_read_str(iface, "operstate", st, sizeof(st)) == 0)
+		down = strcmp(st, "up") != 0 && strcmp(st, "unknown") != 0;
+	else if (access("/sys/class/net/lo", F_OK) == 0)
+		down = 1; /* sysfs works but the interface is gone (driver reload, re-creation) */
+	for (unsigned i = 0; i < nw && !down; i++)
+		if (!atomic_load(&ws[i]->st.finished) && atomic_load(&ws[i]->st.state) == W_LINK)
+			down = 1;
+	/* A sender thread may already have seen the outage start or end before us. */
+	if (atomic_load(&sh->down_since) && !g_link_down_since)
+		down = 1;
+	if (down && !g_link_down_since) {
+		g_link_down_since = now;
+		g_link_outages++;
+		afr_link_down(sh, now);
+		afr_log_warn("%s is down: waiting for it, the schedule is paused", iface);
+	} else if (!down && g_link_down_since) {
+		int64_t d = now - g_link_down_since;
+		afr_link_up(sh, now); /* no-op if a sender thread already did it */
+		g_link_down_ns += d;
+		g_link_down_since = 0;
+		afr_log_warn("%s is back after %.1f s, continuing", iface, (double)d / 1e9);
+	}
+	g_link_down = down;
+}
+
+typedef struct {
+	uint64_t last_pkts;
+	int64_t since;
+	int warned;
+} stall_t;
+
+#define STALL_WARN_NS (3 * NS_PER_SEC)
+
+/* A thread that sends nothing for a few seconds while not simply waiting for its
+ * schedule: say what it waits for, and again when it moves on. */
+static void watchdog(worker_t **ws, unsigned nw, stall_t *st, const afr_ctx_t *c, int64_t now)
+{
+	for (unsigned i = 0; i < nw; i++) {
+		worker_t *w = ws[i];
+		if (atomic_load(&w->st.finished))
+			continue;
+		uint64_t p = LD(w->st.pkts);
+		int state = atomic_load(&w->st.state);
+		if (!st[i].since) {
+			st[i].since = now;
+			st[i].last_pkts = p;
+			continue;
+		}
+		if (p != st[i].last_pkts || state == W_PACE || g_link_down) {
+			if (st[i].warned && p != st[i].last_pkts)
+				afr_log_warn("thread %u resumed after %.1f s", w->id,
+				             (double)(now - st[i].since) / 1e9);
+			st[i].last_pkts = p;
+			st[i].since = now;
+			st[i].warned = 0;
+			continue;
+		}
+		if (st[i].warned || now - st[i].since < STALL_WARN_NS)
+			continue;
+		st[i].warned = 1;
+		const char *why = "";
+		switch (state) {
+		case W_RING: why = " (the NIC is not completing transmissions)"; break;
+		case W_QUEUE: why = " (ENOBUFS: the device queue stays full)"; break;
+		case W_DISK: why = " (the direct I/O window is empty: the disk is too slow)"; break;
+		case W_FENCE: why = " (another thread is behind)"; break;
+		case W_RUN: why = " (busy without progress)"; break;
+		default: break;
+		}
+		uint64_t g = LD(w->st.gpos);
+		afr_log_warn("thread %u (CPU %d) has sent nothing for %.0f s: waiting for %s%s, at %.1f%% "
+		             "of the file, lap %" PRIu64,
+		             w->id, w->cpu, (double)(now - st[i].since) / 1e9,
+		             afr_wstate_names[state < W_COUNT ? state : 0], why,
+		             c->pf.size ? 100.0 * (double)(g % c->pf.size) / (double)c->pf.size : 0.0,
+		             c->pf.size ? g / c->pf.size + 1 : 0);
+	}
+}
+
 static void on_signal(int sig)
 {
 	(void)sig;
@@ -201,6 +296,8 @@ static void print_row(const row_t *r, const afr_ctx_t *c)
 		printf(" THROTTLED");
 	if (!r->timed && r->file_pct >= 0)
 		printf(" | file %.1f%% lap %" PRIu64, r->file_pct, r->file_lap + 1);
+	if (g_link_down)
+		printf(" | LINK DOWN");
 	if (r->timed) {
 		if (r->late_n) {
 			char a[32], p[32], x[32];
@@ -318,10 +415,21 @@ static void print_summary(const afr_ctx_t *c, const snap_t *end, const snap_t *s
 	printf("Per thread:\n");
 	for (unsigned i = 0; i < nw; i++) {
 		worker_t *w = ws[i];
-		printf("  %s %2u (CPU %3d): %12" PRIu64 " packets, %14" PRIu64 " bytes, ENOBUFS %" PRIu64
-		       "\n",
+		printf("  %s %2u (CPU %3d): %12" PRIu64 " packets, %14" PRIu64 " bytes, ENOBUFS %" PRIu64,
 		       w->is_l2 ? "non-IP" : "thread", w->id, w->cpu, LD(w->st.pkts), LD(w->st.bytes),
 		       LD(w->st.enobufs));
+		/* Where the thread spent its time waiting. */
+		int any = 0;
+		for (int k = W_PACE; k < W_COUNT; k++) {
+			double sec = (double)LD(w->st.wait_ns[k]) / 1e9;
+			if (sec < 0.05)
+				continue;
+			printf("%s%s %.1f s", any ? ", " : "; waited for: ", afr_wstate_names[k], sec);
+			any = 1;
+		}
+		if (LD(w->st.link_lost))
+			printf("; lost on interface re-creation: %" PRIu64, LD(w->st.link_lost));
+		printf("\n");
 	}
 	if (json) {
 		fprintf(json, "\n  ],\n  \"summary\": {\"stopped\": %s, \"elapsed_s\": %.6f, \"pkts\": %" PRIu64
@@ -342,10 +450,20 @@ static void print_summary(const afr_ctx_t *c, const snap_t *end, const snap_t *s
 			        end->asis_back);
 		fprintf(json, ", \"per_thread\": [");
 		for (unsigned i = 0; i < nw; i++)
+		{
 			fprintf(json, "%s{\"id\": %u, \"non_ip\": %s, \"cpu\": %d, \"pkts\": %" PRIu64
-			              ", \"bytes\": %" PRIu64 ", \"enobufs\": %" PRIu64 "}",
+			              ", \"bytes\": %" PRIu64 ", \"enobufs\": %" PRIu64
+			              ", \"link_lost\": %" PRIu64 ", \"wait_s\": {",
 			        i ? ", " : "", ws[i]->id, ws[i]->is_l2 ? "true" : "false", ws[i]->cpu,
-			        LD(ws[i]->st.pkts), LD(ws[i]->st.bytes), LD(ws[i]->st.enobufs));
+			        LD(ws[i]->st.pkts), LD(ws[i]->st.bytes), LD(ws[i]->st.enobufs),
+			        LD(ws[i]->st.link_lost));
+			static const char *const keys[W_COUNT] = {"send", "schedule", "tx_ring",
+			                                          "device_queue", "disk", "fence", "link"};
+			for (int k = W_PACE; k < W_COUNT; k++)
+				fprintf(json, "%s\"%s\": %.3f", k > W_PACE ? ", " : "", keys[k],
+				        (double)LD(ws[i]->st.wait_ns[k]) / 1e9);
+			fprintf(json, "}}");
+		}
 		fprintf(json, "]}\n}\n");
 	}
 }
@@ -627,6 +745,7 @@ int afr_replay_run(afr_ctx_t *c)
 	prev = start;
 	int64_t tick = t0;
 	int64_t last = t0;
+	stall_t *stalls = calloc(nw ? nw : 1, sizeof(stall_t)); /* NULL: no watchdog */
 	int first_row = 1;
 	for (;;) {
 		tick += NS_PER_SEC;
@@ -649,6 +768,9 @@ int afr_replay_run(afr_ctx_t *c)
 		}
 		int64_t now = afr_now_ns();
 		take_snap(ws, nw, o->iface, &cur);
+		link_check(ws, nw, o->iface, sh, now);
+		if (stalls)
+			watchdog(ws, nw, stalls, c, now);
 		if (now - last >= NS_PER_SEC / 2 || cur.active == 0) {
 			row_t r;
 			make_row(&r, &cur, &prev, (double)(now - t0) / 1e9, (double)(now - last) / 1e9, c);
@@ -664,6 +786,7 @@ int afr_replay_run(afr_ctx_t *c)
 		if (cur.active == 0)
 			break;
 	}
+	free(stalls);
 	int64_t t_end = t0;
 	for (unsigned i = 0; i < nw; i++) {
 		pthread_join(ws[i]->th, NULL);
@@ -681,6 +804,13 @@ int afr_replay_run(afr_ctx_t *c)
 	int stopped = atomic_load(&g_stop) && !atomic_load(&sh->failed);
 	print_summary(c, &cur, &start, (double)(t_end - t0) / 1e9, ws, nw, json, stopped,
 	              atomic_load(&sh->shift));
+	if (g_link_down_since) {
+		g_link_down_ns += afr_now_ns() - g_link_down_since;
+		g_link_down_since = 0;
+	}
+	if (g_link_outages)
+		printf("Link outages: %u, %.1f s in total (the schedule was paused for that time)\n",
+		       g_link_outages, (double)g_link_down_ns / 1e9);
 	uint64_t fwaits = 0;
 	for (unsigned i = 0; i < nw; i++)
 		fwaits += LD(ws[i]->st.fence_waits);
