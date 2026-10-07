@@ -193,12 +193,12 @@ int afr_idxcache_load(const char *path, const pcap_file_t *pf, pkt_index_t *ix, 
 		return 0;
 	}
 	if (memcmp(h.magic, IDXC_MAGIC, 8) != 0 || h.hdr_size != IDXC_HDR_SIZE) {
-		snprintf(why, whylen, "not an afreplay index cache");
+		snprintf(why, whylen, "not an replaystorm index cache");
 		close(fd);
 		return 0;
 	}
 	if (h.version != IDXC_VERSION || h.stats_size != sizeof(idx_stats_t)) {
-		snprintf(why, whylen, "cache was written by another afreplay version");
+		snprintf(why, whylen, "cache was written by another replaystorm version");
 		close(fd);
 		return 0;
 	}

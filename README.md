@@ -1,4 +1,4 @@
-# afreplay
+# replaystorm
 
 A multithreaded pcap replayer over Linux `AF_PACKET` (TX_RING) for testing network sensors with
 large captures (hundreds of GB) at 25 Gbit/s and beyond, on machines with many but weak cores.
@@ -26,11 +26,11 @@ Contents: [Building](#building) · [Recipes](#recipes) · [How it works](#how-it
 ## Building
 
 ```sh
-make                # the ./afreplay binary
+make                # the ./replaystorm binary
 make unit-test      # unit tests
 make test           # unit tests + test pcap generation + functional tests on veth
 make sanitize       # unit tests built with UBSan (trap) and FORTIFY; SAN=-fsanitize=address if libasan exists
-sudo install -m 755 afreplay /usr/local/bin/
+sudo install -m 755 replaystorm /usr/local/bin/
 ```
 
 - Requires gcc or clang with C11 and Linux 3.14+ (`PACKET_QDISC_BYPASS`). Tested on Fedora (kernel
@@ -49,40 +49,40 @@ sudo install -m 755 afreplay /usr/local/bin/
 
 ```sh
 # What is inside the file: traffic mix, VLAN share, timestamp anomalies, rate peaks, shards
-afreplay --analyze big.pcap
-afreplay --analyze --multiplier 10 --link-speed 25G big.pcap
+replaystorm --analyze big.pcap
+replaystorm --analyze --multiplier 10 --link-speed 25G big.pcap
 
 # Build the index cache once (reads the whole file); later starts take seconds
-afreplay --analyze --index-cache /var/tmp/big.afridx big.pcap
+replaystorm --analyze --index-cache /var/tmp/big.rsidx big.pcap
 
 # Line rate on a 25G link, forever, new sessions on every lap
-afreplay -i ens1f0 big.pcap --mbps 99% --loop 0 --loop-mutate ip,port \
-  --qdisc-bypass --index-cache /var/tmp/big.afridx
+replaystorm -i ens1f0 big.pcap --mbps 99% --loop 0 --loop-mutate ip,port \
+  --qdisc-bypass --index-cache /var/tmp/big.rsidx
 
 # Customer traffic shape, 20x faster (peaks and pauses kept, scaled)
-afreplay -i ens1f0 big.pcap --multiplier 20 --loop 0 --loop-mutate ip,port --qdisc-bypass
+replaystorm -i ens1f0 big.pcap --multiplier 20 --loop 0 --loop-mutate ip,port --qdisc-bypass
 
 # Maximum rate, 12 threads
-afreplay -i ens1f0 --topspeed --qdisc-bypass -t 12 big.pcap
+replaystorm -i ens1f0 --topspeed --qdisc-bypass -t 12 big.pcap
 
 # Play the file in exactly 10 minutes, statistics to JSON
-afreplay -i ens1f0 --duration 10m --stats-json run.json big.pcap
+replaystorm -i ens1f0 --duration 10m --stats-json run.json big.pcap
 
 # RAW IP pcap (linktype 101/228/229): an Ethernet header is prepended
-afreplay -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap
+replaystorm -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap
 ```
 
 ### A run that lasts days or weeks
 
 ```sh
-screen -S afreplay
-timeout -s INT 30d afreplay -i ens1f0 /data/big.pcap \
+screen -S replaystorm
+timeout -s INT 30d replaystorm -i ens1f0 /data/big.pcap \
   --mbps 99% --loop 0 --loop-mutate ip,port \
   --qdisc-bypass --cpus 1-11 -t 10 \
   --readahead 24G --disk-max-temp 74 \
-  --index-cache /var/tmp/big.afridx \
-  --stats-json /root/afreplay-$(date +%F).json -q
-# Ctrl-A D to detach; screen -r afreplay to come back
+  --index-cache /var/tmp/big.rsidx \
+  --stats-json /root/replaystorm-$(date +%F).json -q
+# Ctrl-A D to detach; screen -r replaystorm to come back
 ```
 
 | Option | Why |
@@ -96,7 +96,7 @@ timeout -s INT 30d afreplay -i ens1f0 /data/big.pcap \
 | `-q` | no per-second line (millions of lines over days); statistics stay available on request |
 | `timeout -s INT 30d` | stops after 30 days exactly like Ctrl-C: summary, status file and JSON are kept |
 
-Check it at any time from another terminal: `afreplay --status -i ens1f0`. In its own terminal:
+Check it at any time from another terminal: `replaystorm --status -i ens1f0`. In its own terminal:
 Enter (statistics), `r` (reset minimum/maximum), `q` (stop).
 
 Before a long run: build the index cache, make sure no other replayer uses the interface, enlarge
@@ -182,7 +182,7 @@ keeps absolute times and catches up; `rebase` shifts the common T0 when lateness
 
 ### Problematic timestamps
 
-| Problem | What afreplay does |
+| Problem | What replaystorm does |
 |---|---|
 | Non-monotonic timestamps | `--ts-order clamp` (default) replaces a backward timestamp with the running maximum; `sort` stably sorts the index within each shard; `asis` sends backward packets immediately and counts them separately. |
 | Long pauses | `--max-gap X` compresses pauses longer than X to X. `--analyze` lists the top 10 pauses. |
@@ -268,7 +268,7 @@ ignored with a warning if the file does not fit.
 
 ### Index cache
 
-`--index-cache FILE` (or `auto` for `FILE.pcap.afridx`) stores the option-independent index (21
+`--index-cache FILE` (or `auto` for `FILE.pcap.rsidx`) stores the option-independent index (21
 bytes per packet: ~11.5 GB for 500 GB of pcap). Later starts map it instead of reading the pcap
 (minutes → seconds). It is used only for the same pcap (size, mtime, inode, a hash of the first and
 last 64 KB, format version), otherwise rebuilt with a message; written atomically; valid for any
@@ -303,12 +303,12 @@ summary and the JSON show per thread how long it waited for each.
 
 - in the program's terminal (also in `screen`): Enter or `s` prints them, `r` resets
   minimum/maximum/averages, `q` stops gracefully;
-- from any terminal: `afreplay --status -i IF` prints `/tmp/afreplay-IF.status` (`--status-file`),
+- from any terminal: `replaystorm --status -i IF` prints `/tmp/replaystorm-IF.status` (`--status-file`),
   rewritten atomically every second and kept after the end;
 - `kill -USR1 PID` prints them into the program's output (`nohup`, systemd).
 
 ```
-afreplay on ens1f0, pid 4242: running for 2d 03:14:07 (started 2026-10-07 10:40:12, now ...)
+replaystorm on ens1f0, pid 4242: running for 2d 03:14:07 (started 2026-10-07 10:40:12, now ...)
   now:          24.310 Gbit/s, 3.360 Mpps, disk 61 C
   average:      last minute 24.300, last hour 24.280, overall 24.250 Gbit/s
   minimum 1 s:  18.200 Gbit/s (2.510 Mpps min) at +1d 04:12:03 (2026-10-08 14:52:15)
@@ -365,7 +365,7 @@ Lateness is sender-side delay (placed in the ring vs scheduled). p50 in single-d
 normal. High p99 with low p50: preemption, late wakeup from deep C-states, interrupts; raise
 `--spin-us`, isolate cores, disable deep C-states, or use `chrt -f 50`. Growing p50 and the pcap
 position falling behind: the peak exceeds the link, not enough cores, the disk or the kernel cannot
-keep up. A functional test showed that the lateness afreplay reports matches the interval error
+keep up. A functional test showed that the lateness replaystorm reports matches the interval error
 measured at the receiver to within a few microseconds.
 
 ## Tuning the sender
@@ -401,7 +401,7 @@ if they help.
 ## Checking the receiver
 
 **L2 arrives as captured.** On the sensor: `tcpdump -i IF -nn -e -c 50`. Each line shows MACs and the
-VLAN tag; with afreplay they are the original ones (many vendors' MACs, the original VLAN IDs, the
+VLAN tag; with replaystorm they are the original ones (many vendors' MACs, the original VLAN IDs, the
 original share of tagged frames, the same session in several VLANs for multi-segment SPAN
 captures), not the sender's MAC as with replayers that rewrite L2. Compare with the source:
 
@@ -420,7 +420,7 @@ driver, `tcpdump` on the host sees nothing.
 **Receiver drops.** NIC level: `ethtool -S IF | grep -i -E "rx_(packets|discard|drop|miss)"`.
 Suricata with AF_PACKET: drop % = `capture.kernel_drops / capture.kernel_packets` (stats.log, eve
 `stats`, `suricatasc -c "iface-stat IF"`); compute it per interval, not since start. Sent vs
-received: `afreplay --status` (`sent`) against the sensor's `rx_packets`.
+received: `replaystorm --status` (`sent`) against the sensor's `rx_packets`.
 
 **Capacity of the sensor.** Step the rate (e.g. 5, 10, 15, 20, 24 Gbit/s, 10 minutes each with
 `timeout -s INT 600`) and find the highest rate with drops below the acceptable level.
@@ -432,14 +432,14 @@ does not delete old data. `--loop-mutate` keeps sessions new, which is what make
 
 ## Realism of the load
 
-- **Content:** afreplay sends the capture as it was (L2 included) and, with `--loop-mutate`, new
+- **Content:** replaystorm sends the capture as it was (L2 included) and, with `--loop-mutate`, new
   sessions on every lap. A capture with L2 removed makes copies of a session from different VLANs
   collapse into one flow with duplicate segments, and looping without changes repeats the same TCP
   sessions and sequence numbers; both add work to an IDS that real traffic does not cause. Such
   setups typically show higher drop rates for that reason.
 - **Shape:** `--mbps` gives a smooth rate. Real traffic at the same average has bursts, and bursts are
   what overflow receive buffers. To simulate a customer's peak load, replay by timestamps with a
-  multiplier: pick it with `afreplay --analyze --multiplier X --link-speed 25G FILE` so that the 1 s
+  multiplier: pick it with `replaystorm --analyze --multiplier X --link-speed 25G FILE` so that the 1 s
   peak is the load you want and the 1 ms peak stays below the link.
 - **Loop boundaries:** at the start of every lap many sessions appear at once (the capture started in
   the middle of them). With a large file this happens rarely (a 500 GB file at 24 Gbit/s: every
@@ -547,14 +547,14 @@ tests/             unit tests, reference implementation, pcap generators, functi
 
 ## Command line reference
 
-Output of `afreplay --help`:
+Output of `replaystorm --help`:
 
 ```
-afreplay - multithreaded pcap replayer over AF_PACKET preserving L2
+replaystorm - multithreaded pcap replayer over AF_PACKET preserving L2
 
 Usage:
-  afreplay -i INTERFACE [options] FILE.pcap
-  afreplay --analyze [options] FILE.pcap
+  replaystorm -i INTERFACE [options] FILE.pcap
+  replaystorm --analyze [options] FILE.pcap
 
 Rate modes (mutually exclusive, default --multiplier 1):
   --topspeed              as fast as possible
@@ -604,7 +604,7 @@ Input:
   --preload               load the whole file into memory before start
   --index-cache FILE      keep the packet index on disk: the first run builds and saves
                           it, later runs load it instead of scanning the pcap; auto =
-                          FILE.pcap.afridx next to the pcap. Rebuilt automatically if the
+                          FILE.pcap.rsidx next to the pcap. Rebuilt automatically if the
                           pcap changes; valid for any -t and MTU
   --readahead SIZE        how much of the file is kept in RAM ahead of the senders:
                           the direct I/O window or the page-cache readahead (2G)
@@ -631,23 +631,23 @@ Output:
   --analyze               analyze the file only, do not send
   --stats-json FILE       write statistics as JSON
   --status-file F         live status file, rewritten every second (default
-                          /tmp/afreplay-IF.status)
-  --status [-i IF]        print the live status of a running afreplay and exit
+                          /tmp/replaystorm-IF.status)
+  --status [-i IF]        print the live status of a running replaystorm and exit
   -q, --quiet             do not print per-second statistics
   -h, --help              this help
 
 Examples:
-  afreplay --analyze big.pcap
-  afreplay --status -i ens1f0          # statistics of a replay running elsewhere
-  afreplay -i ens1f0 --mbps 99% --index-cache /var/tmp/big.afridx big.pcap
-  afreplay --analyze --multiplier 10 --link-speed 25G big.pcap
-  afreplay -i ens1f0 --topspeed --qdisc-bypass -t 12 big.pcap
-  afreplay -i ens1f0 --mbps 20000 --loop 0 big.pcap
-  afreplay -i ens1f0 --mbps 99% --loop 0 --loop-mutate ip,port big.pcap
-  afreplay -i ens1f0 --multiplier 2 --max-gap 1s --ts-order sort big.pcap
-  afreplay -i ens1f0 --duration 10m --stats-json run.json big.pcap
-  afreplay -i ens1f0 --loop 5 --loop-mutate ip,port big.pcap
-  afreplay -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap
+  replaystorm --analyze big.pcap
+  replaystorm --status -i ens1f0          # statistics of a replay running elsewhere
+  replaystorm -i ens1f0 --mbps 99% --index-cache /var/tmp/big.rsidx big.pcap
+  replaystorm --analyze --multiplier 10 --link-speed 25G big.pcap
+  replaystorm -i ens1f0 --topspeed --qdisc-bypass -t 12 big.pcap
+  replaystorm -i ens1f0 --mbps 20000 --loop 0 big.pcap
+  replaystorm -i ens1f0 --mbps 99% --loop 0 --loop-mutate ip,port big.pcap
+  replaystorm -i ens1f0 --multiplier 2 --max-gap 1s --ts-order sort big.pcap
+  replaystorm -i ens1f0 --duration 10m --stats-json run.json big.pcap
+  replaystorm -i ens1f0 --loop 5 --loop-mutate ip,port big.pcap
+  replaystorm -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap
 
 While running: press Enter (or s) for long-run statistics: minimum, worst minute,
 percentiles, averages; r resets them, q stops; kill -USR1 PID prints them too.

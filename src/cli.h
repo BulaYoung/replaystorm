@@ -52,8 +52,8 @@ typedef struct {
 
 	int analyze;
 	const char *stats_json;
-	const char *status_file; /* live status file (default /tmp/afreplay-IF.status) */
-	int status_query;        /* --status: print the status of a running afreplay and exit */
+	const char *status_file; /* live status file (default /tmp/replaystorm-IF.status) */
+	int status_query;        /* --status: print the status of a running replaystorm and exit */
 	int quiet;
 
 	int mutate_ip, mutate_port;

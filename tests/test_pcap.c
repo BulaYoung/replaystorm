@@ -233,7 +233,7 @@ static void index_cache(void)
 	int fd = mkstemp(pcap);
 	close(fd);
 	char cache[64];
-	snprintf(cache, sizeof(cache), "%s.afridx", pcap);
+	snprintf(cache, sizeof(cache), "%s.rsidx", pcap);
 	unlink(cache);
 	write_flows_pcap(pcap, 5000, 0);
 

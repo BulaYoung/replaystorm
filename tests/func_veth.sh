@@ -29,4 +29,4 @@ for i in va vb; do
 	ip link set $i mtu 1500 up
 done
 ethtool -K vb gro off >/dev/null 2>&1
-exec python3 "$DIR/func_test.py" --bin "$ROOT/afreplay" --pcaps "$PCAPS" "$@"
+exec python3 "$DIR/func_test.py" --bin "$ROOT/replaystorm" --pcaps "$PCAPS" "$@"

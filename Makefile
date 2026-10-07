@@ -1,4 +1,4 @@
-# afreplay — multithreaded pcap replayer over AF_PACKET
+# replaystorm — multithreaded pcap replayer over AF_PACKET
 CC      ?= cc
 CFLAGS  ?= -O2 -g
 # Mandatory flags kept separate so that make CFLAGS=... does not drop them
@@ -12,9 +12,9 @@ TESTSRC := $(wildcard tests/test_*.c tests/ref_*.c)
 
 .PHONY: all clean test unit-test func-test pcaps sanitize
 
-all: afreplay
+all: replaystorm
 
-afreplay: $(OBJS) $(BUILD)/main.o
+replaystorm: $(OBJS) $(BUILD)/main.o
 	$(CC) $(XCFLAGS) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BUILD)/%.o: src/%.c | $(BUILD)
@@ -30,19 +30,19 @@ $(BUILD):
 $(BUILD)/unit_tests: $(TESTSRC:tests/%.c=$(BUILD)/tests/%.o) $(OBJS)
 	$(CC) $(XCFLAGS) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-unit-test: afreplay $(BUILD)/unit_tests
+unit-test: replaystorm $(BUILD)/unit_tests
 	./$(BUILD)/unit_tests
 
 pcaps:
 	python3 tests/gen_pcaps.py $(BUILD)/pcaps
 
-func-test: afreplay pcaps
+func-test: replaystorm pcaps
 	tests/func_veth.sh $(BUILD)/pcaps
 
 test: unit-test func-test
 
 clean:
-	rm -rf build build-san afreplay
+	rm -rf build build-san replaystorm
 
 # Checking build: UBSan in trap mode (no runtime library) and FORTIFY.
 # If libasan is installed, SAN=-fsanitize=address can be added.

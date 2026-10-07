@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test pcap generator for afreplay (no external dependencies).
+"""Test pcap generator for replaystorm (no external dependencies).
 
 Creates in directory OUT:
   l2mix.pcap          — ARP, STP, LLDP, VLAN, QinQ, MPLS (+PW), PPPoE, IPv6 (+ext hdr),

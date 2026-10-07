@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""afreplay functional tests on a veth pair.
+"""replaystorm functional tests on a veth pair.
 
-Runs inside a separate network namespace (see func_veth.sh): afreplay
+Runs inside a separate network namespace (see func_veth.sh): replaystorm
 sends to va, the receiver listens on vb via AF_PACKET with PACKET_AUXDATA (to
 restore the VLAN tag stripped by the kernel) and SO_TIMESTAMPNS (nanosecond receive timestamps).
 """
@@ -223,7 +223,7 @@ def t_bytes(pcaps):
 
     print("== Index cache: second run loads the index, also with another thread count")
     p = os.path.join(pcaps, "l2mix.pcap")
-    cache = "/tmp/afr_func_l2mix.afridx"
+    cache = "/tmp/afr_func_l2mix.rsidx"
     if os.path.exists(cache):
         os.unlink(cache)
     rc1, out1, frames1, _ = replay(p, ["--pps", "5000", "-t", "3", "--index-cache", cache])
@@ -509,7 +509,7 @@ def t_robust(pcaps):
     time.sleep(1.5)
     p.send_signal(signal.SIGINT)
     out = p.communicate(timeout=20)[0].decode()
-    check(rc == 0 and "minimum 1 s:" in st and "running for" in st, "afreplay --status shows a running replay")
+    check(rc == 0 and "minimum 1 s:" in st and "running for" in st, "replaystorm --status shows a running replay")
     check(out.count("minimum 1 s:") >= 2, "SIGUSR1 prints the statistics, and they are in the summary")
     rc, st = run_afr(["--status", "-i", TX])
     check(rc == 0 and "finished after" in st, "the status file keeps the result after the end")

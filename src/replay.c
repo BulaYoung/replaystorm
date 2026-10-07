@@ -264,7 +264,7 @@ static size_t status_text(char *buf, size_t n, const afr_ctx_t *c, const snap_t 
 	fmt_dur(a, sizeof(a), (double)since_t0 / 1e9);
 	fmt_local(b, sizeof(b), l->start_real_ns);
 	fmt_local(d, sizeof(d), l->start_real_ns + since_t0);
-	OUT("afreplay on %s, pid %d: %s for %s (started %s, now %s)\n", c->o->iface, (int)getpid(),
+	OUT("replaystorm on %s, pid %d: %s for %s (started %s, now %s)\n", c->o->iface, (int)getpid(),
 	    finished ? "finished after running" : "running", a, b, d);
 	OUT("  now:          %.3f Gbit/s, %.3f Mpps", l->now_gbps, l->now_mpps);
 	if (cur->disk_temp >= 0)
@@ -351,11 +351,11 @@ int afr_status_query(const opts_t *o)
 	if (o->status_file)
 		snprintf(path, sizeof(path), "%s", o->status_file);
 	else if (o->iface)
-		snprintf(path, sizeof(path), "/tmp/afreplay-%s.status", o->iface);
+		snprintf(path, sizeof(path), "/tmp/replaystorm-%s.status", o->iface);
 	else
-		snprintf(path, sizeof(path), "/tmp/afreplay-*.status");
+		snprintf(path, sizeof(path), "/tmp/replaystorm-*.status");
 	if (glob(pattern, 0, NULL, &g) != 0 || g.gl_pathc == 0) {
-		afr_log_err("no status file %s: is afreplay running (on this interface)?", path);
+		afr_log_err("no status file %s: is replaystorm running (on this interface)?", path);
 		globfree(&g);
 		return 1;
 	}
@@ -956,14 +956,14 @@ int afr_replay_run(afr_ctx_t *c)
 		if (o->status_file)
 			snprintf(g_status_path, sizeof(g_status_path), "%s", o->status_file);
 		else
-			snprintf(g_status_path, sizeof(g_status_path), "/tmp/afreplay-%s.status", o->iface);
+			snprintf(g_status_path, sizeof(g_status_path), "/tmp/replaystorm-%s.status", o->iface);
 		if (isatty(STDIN_FILENO)) {
 			pthread_t th;
 			if (pthread_create(&th, NULL, stdin_main, NULL) == 0)
 				pthread_detach(th);
 		}
 		afr_log_info("Long-run statistics: press Enter here, or from another terminal: "
-		             "afreplay --status -i %s (file %s), or kill -USR1 %d",
+		             "replaystorm --status -i %s (file %s), or kill -USR1 %d",
 		             o->iface, g_status_path, (int)getpid());
 	}
 	char *stext = malloc(8192);

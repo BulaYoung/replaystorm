@@ -16,7 +16,7 @@ void afr_log_err(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
-	fputs("afreplay: error: ", stderr);
+	fputs("replaystorm: error: ", stderr);
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
 	va_end(ap);

@@ -91,7 +91,7 @@ static int prepare(afr_ctx_t *c)
 	char cache_path[4096] = "";
 	if (o->index_cache) {
 		if (!strcmp(o->index_cache, "auto"))
-			snprintf(cache_path, sizeof(cache_path), "%s.afridx", o->file);
+			snprintf(cache_path, sizeof(cache_path), "%s.rsidx", o->file);
 		else
 			snprintf(cache_path, sizeof(cache_path), "%s", o->index_cache);
 	}

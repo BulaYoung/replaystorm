@@ -1,7 +1,7 @@
 /*
  * Long-run statistics: what a replay that runs for days has done so far. Updated once a
  * second by the stats thread; shown on request (Enter in the terminal, SIGUSR1) and
- * written to a status file that can be read from any terminal (afreplay --status).
+ * written to a status file that can be read from any terminal (replaystorm --status).
  */
 #ifndef AFR_LIVE_H
 #define AFR_LIVE_H

@@ -1,5 +1,5 @@
 /*
- * afreplay - multithreaded pcap replayer over AF_PACKET.
+ * replaystorm - multithreaded pcap replayer over AF_PACKET.
  * Common definitions.
  */
 #ifndef AFR_H
