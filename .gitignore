@@ -1,4 +1,23 @@
+# build output
 build/
 build-san/
 /replaystorm
+*.o
+*.d
+
+# captures, index caches and run statistics that may end up next to the sources
+*.pcap
+*.pcapng
+*.cap
+*.rsidx
+*.afridx
+*.json
+*.status
+
+# python, editors
 __pycache__/
+*.pyc
+*.swp
+*~
+.vscode/
+.idea/
