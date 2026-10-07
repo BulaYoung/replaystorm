@@ -31,5 +31,6 @@ void test_pcap(void);
 void test_hash(void);
 void test_sched(void);
 void test_mutate(void);
+void test_therm(void);
 
 #endif

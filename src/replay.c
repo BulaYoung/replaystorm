@@ -2,6 +2,7 @@
 
 #include "clock.h"
 #include "dio.h"
+#include "therm.h"
 #include "util.h"
 #include "stream.h"
 #include "worker.h"
@@ -20,6 +21,8 @@
 
 static dio_t g_dio;
 static int g_dio_on;
+static therm_mon_t g_therm;
+static int g_therm_on;
 
 static void on_signal(int sig)
 {
@@ -35,6 +38,8 @@ typedef struct {
 	uint64_t sys_tx, sys_drop;
 	uint64_t disk_bytes, disk_reads, disk_read_ns;
 	uint64_t gpos_min; /* slowest next-read position: lap * size + offset */
+	int disk_temp;
+	uint64_t throttle, rate_limit;
 	int sys_ok;
 	int64_t pos_min, pos_last;
 	uint64_t lap_min, lap_last;
@@ -83,6 +88,9 @@ static void take_snap(worker_t **ws, unsigned nw, const char *iface, snap_t *s)
 	s->disk_bytes = g_dio_on ? LD(g_dio.bytes_read) : 0;
 	s->disk_reads = g_dio_on ? LD(g_dio.reads) : 0;
 	s->disk_read_ns = g_dio_on ? LD(g_dio.read_ns) : 0;
+	s->disk_temp = g_therm_on ? atomic_load(&g_therm.temp) : -1;
+	s->throttle = g_therm_on ? LD(g_therm.throttle) : 0;
+	s->rate_limit = g_dio_on ? LD(g_dio.rate_limit) : 0;
 	s->sys_ok = afr_sysfs_read_u64(iface, "statistics/tx_packets", &s->sys_tx) == 0 &&
 	            afr_sysfs_read_u64(iface, "statistics/tx_dropped", &s->sys_drop) == 0;
 }
@@ -131,6 +139,9 @@ typedef struct {
 	uint64_t pkts, bytes, sys_tx, sys_drop, enobufs, eagain, sends, disk;
 	double disk_lat_ms;  /* mean duration of one 32 MB direct read */
 	double file_pct;     /* slowest thread's position in the file, % (-1: unknown) */
+	int disk_temp;       /* C, -1 unknown */
+	uint64_t throttled;  /* new thermal throttling transitions during the interval */
+	uint64_t rate_limit; /* governor read limit, bytes/s (0 = none) */
 	uint64_t file_lap;
 	int sys_ok;
 	uint64_t p50, p99, pmax, late_n;
@@ -154,6 +165,10 @@ static void json_row(FILE *f, int first, const row_t *r)
 		        r->disk_lat_ms);
 	if (r->file_pct >= 0)
 		fprintf(f, ", \"file_pct\": %.2f, \"file_lap\": %" PRIu64, r->file_pct, r->file_lap);
+	if (r->disk_temp >= 0)
+		fprintf(f, ", \"disk_temp_c\": %d, \"disk_throttle_events\": %" PRIu64
+		           ", \"disk_read_limit_gbytes_per_s\": %.3f",
+		        r->disk_temp, r->throttled, (double)r->rate_limit / 1e9);
 	if (r->timed)
 		fprintf(f, ", \"late_p50_ns\": %" PRIu64 ", \"late_p99_ns\": %" PRIu64
 		           ", \"late_max_ns\": %" PRIu64 ", \"pcap_pos_s\": %.6f, \"lap\": %" PRIu64,
@@ -178,6 +193,12 @@ static void print_row(const row_t *r, const afr_ctx_t *c)
 	printf(" | ENOBUFS +%" PRIu64 " EAGAIN +%" PRIu64, r->enobufs, r->eagain);
 	if (g_dio_on)
 		printf(" | disk %.2f GB/s, %.0f ms/read", (double)r->disk / r->dt / 1e9, r->disk_lat_ms);
+	if (r->disk_temp >= 0)
+		printf(", %d C", r->disk_temp);
+	if (r->rate_limit)
+		printf(", limit %.2f GB/s", (double)r->rate_limit / 1e9);
+	if (r->throttled)
+		printf(" THROTTLED");
 	if (!r->timed && r->file_pct >= 0)
 		printf(" | file %.1f%% lap %" PRIu64, r->file_pct, r->file_lap + 1);
 	if (r->timed) {
@@ -211,6 +232,9 @@ static void make_row(row_t *r, const snap_t *cur, const snap_t *prev, double t, 
 	uint64_t nr = cur->disk_reads - prev->disk_reads;
 	r->disk_lat_ms = nr ? (double)(cur->disk_read_ns - prev->disk_read_ns) / (double)nr / 1e6 : 0;
 	r->file_pct = -1;
+	r->disk_temp = cur->disk_temp;
+	r->throttled = cur->throttle - prev->throttle;
+	r->rate_limit = cur->rate_limit;
 	if (cur->gpos_min != UINT64_MAX && c->pf.size) {
 		r->file_lap = cur->gpos_min / c->pf.size;
 		r->file_pct = 100.0 * (double)(cur->gpos_min % c->pf.size) / (double)c->pf.size;
@@ -451,6 +475,48 @@ int afr_replay_run(afr_ctx_t *c)
 	int64_t dio_t0 = 0;
 	int want_dio = !c->pf.preloaded &&
 	               (o->io_mode == IO_DIRECT || (o->io_mode == IO_AUTO && c->big_file));
+	/* The window must fit into free memory (the index is already loaded and locked). */
+	if (want_dio) {
+		uint64_t avail = afr_mem_available();
+		uint64_t cap = avail > (3ull << 30) ? avail - (2ull << 30) : (1ull << 30);
+		if (avail && o->readahead > cap) {
+			afr_log_warn("--readahead %.1f GB does not fit into free memory (%.1f GB available); "
+			             "using %.1f GB",
+			             (double)o->readahead / (1 << 30), (double)avail / (1 << 30),
+			             (double)cap / (1 << 30));
+			o->readahead = cap;
+		}
+	}
+	/* Disk temperature: shown in the statistics, used by --disk-max-temp/--disk-start-temp. */
+	if (!c->pf.preloaded) {
+		char tdesc[256];
+		if (afr_therm_open(&g_therm.dev, o->file, tdesc, sizeof(tdesc)) == 0) {
+			g_therm_on = 1;
+			afr_log_info("Disk: %s", tdesc);
+		} else if (o->disk_max_temp || o->disk_start_temp) {
+			afr_log_warn("disk temperature unavailable (%s); --disk-max-temp/--disk-start-temp "
+			             "are ignored",
+			             tdesc);
+		}
+	}
+	if (g_therm_on && o->disk_start_temp) {
+		int64_t last_msg = 0;
+		for (;;) {
+			int temp;
+			uint64_t thr;
+			if (afr_therm_read(&g_therm.dev, &temp, &thr) < 0 || temp <= o->disk_start_temp)
+				break;
+			if (atomic_load(&g_stop))
+				break;
+			if (afr_now_ns() - last_msg > 5 * NS_PER_SEC) {
+				afr_log_info("Waiting for the disk to cool down: %d C, start at %d C", temp,
+				             o->disk_start_temp);
+				last_msg = afr_now_ns();
+			}
+			struct timespec ts = {1, 0};
+			nanosleep(&ts, NULL);
+		}
+	}
 	if (want_dio) {
 		char derr[256];
 		if (afr_dio_open(&g_dio, o->file, c->pf.size, o->readahead, o->io_threads, o->loops, derr,
@@ -462,11 +528,26 @@ int afr_replay_run(afr_ctx_t *c)
 		} else {
 			g_dio_on = 1;
 			dio_t0 = afr_now_ns();
+			if (!g_dio.locked)
+				afr_log_warn("could not lock the direct I/O window in RAM (mlock); it may be "
+				             "swapped out under memory pressure");
 			for (unsigned i = 0; i < nw; i++) {
 				ws[i]->dio = &g_dio;
 				ws[i]->peers = (struct worker **)ws;
 				ws[i]->npeers = nw;
 				ws[i]->fence_lead = lead;
+			}
+			if (g_therm_on) {
+				g_therm.governor = o->disk_max_temp > 0;
+				afr_gov_init(&g_therm.gov, o->disk_max_temp);
+				g_therm.rate_limit = &g_dio.rate_limit;
+				g_therm.bytes_read = &g_dio.bytes_read;
+				if (afr_therm_mon_start(&g_therm) < 0)
+					g_therm.governor = 0;
+				if (g_therm.governor)
+					afr_log_info("Thermal governor: keep the disk at or below %d C by limiting "
+					             "the read rate",
+					             o->disk_max_temp);
 			}
 			double wnd = (double)g_dio.nslots * DIO_CHUNK;
 			double sec = afr_dio_prefill(&g_dio, 300.0);
@@ -475,6 +556,11 @@ int afr_replay_run(afr_ctx_t *c)
 			             wnd / (1 << 30), g_dio.nslots, g_dio.nreaders, sec,
 			             sec > 0 ? (double)atomic_load(&g_dio.bytes_read) / sec / 1e9 : 0.0);
 		}
+	}
+	if (g_therm_on && !g_therm.running) {
+		if (o->disk_max_temp)
+			afr_log_warn("--disk-max-temp works with direct I/O only (--io direct)");
+		afr_therm_mon_start(&g_therm);
 	}
 	/* Streaming of the file: readahead ahead of the senders, drop-behind for big files. */
 	streamer_t stream = {.pf = &c->pf, .ws = ws, .nw = nw, .window = o->readahead,
@@ -526,6 +612,8 @@ int afr_replay_run(afr_ctx_t *c)
 			afr_dio_stop(&g_dio);
 			afr_dio_close(&g_dio);
 		}
+		if (g_therm_on)
+			afr_therm_mon_stop(&g_therm);
 		for (unsigned i = 0; i < nw; i++)
 			if (ws[i]->err[0])
 				afr_log_err("%s", ws[i]->err);
@@ -585,6 +673,8 @@ int afr_replay_run(afr_ctx_t *c)
 	afr_stream_stop(&stream);
 	if (g_dio_on)
 		afr_dio_stop(&g_dio);
+	if (g_therm_on)
+		afr_therm_mon_stop(&g_therm);
 	/* Wait for interface counters to catch up (frames may still be queued). */
 	usleep(100000);
 	take_snap(ws, nw, o->iface, &cur);
@@ -613,6 +703,19 @@ int afr_replay_run(afr_ctx_t *c)
 			rc = 1;
 		}
 		afr_dio_close(&g_dio);
+	}
+	if (g_therm_on) {
+		printf("Disk temperature: max %d C, thermal throttling events during the run: %" PRIu64,
+		       atomic_load(&g_therm.max_temp), (uint64_t)LD(g_therm.throttle));
+		if (g_therm.governor) {
+			uint64_t lim = LD(g_dio.rate_limit);
+			if (lim)
+				printf(", governor read limit at the end: %.2f GB/s", (double)lim / 1e9);
+			else
+				printf(", governor read limit at the end: none");
+		}
+		printf("\n");
+		afr_therm_close(&g_therm.dev);
 	}
 	if (!c->pf.preloaded && !g_dio_on)
 		printf("File streaming: requested ahead %.1f GB, dropped from page cache %.1f GB, pages "

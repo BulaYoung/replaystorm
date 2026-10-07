@@ -22,7 +22,7 @@ $(BUILD)/%.o: src/%.c | $(BUILD)
 
 $(BUILD)/tests/%.o: tests/%.c | $(BUILD)
 	@mkdir -p $(BUILD)/tests
-	$(CC) $(XCFLAGS) $(CFLAGS) -Isrc -c -o $@ $<
+	$(CC) $(XCFLAGS) $(CFLAGS) -iquote src -c -o $@ $<
 
 $(BUILD):
 	mkdir -p $(BUILD)

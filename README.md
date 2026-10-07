@@ -135,6 +135,34 @@ On the test laptop (3 GB file streamed from NVMe, top speed, 8 threads, two laps
 The disk delivered 2.5 GB/s with four readers in flight versus 1.9 GB/s for a single `dd`; the
 remaining limit was the veth sender, not the disk.
 
+### NVMe temperature and the thermal governor
+
+Sustained reads at the drive's limit heat an NVMe drive until it enters thermal throttling
+(Thermal Management T1) and drops to a fraction of its speed for tens of seconds. On the test
+server the drive throttles at about 77 C and falls from 3.5 to about 1 GB/s; at 24 Gbit/s this
+happened after about 190 s, at 20 Gbit/s after about 345 s. Building the index also reads the
+whole file at full speed, so a replay right after it starts with a hot drive.
+
+- afreplay finds the NVMe drive(s) holding the file (through partitions, LVM, dm-crypt and md,
+  also for btrfs) and shows the temperature in the per-second line (`disk ... 71 C`), the
+  throttling transitions as `THROTTLED` and the maximum in the summary. The temperature comes
+  from sysfs hwmon on newer kernels or from the NVMe SMART log (admin ioctl, needs root) on older
+  ones such as RHEL 8.
+- `--disk-max-temp C` (direct I/O): a governor limits the read rate once a second to keep the
+  drive at or below C, e.g. 2-3 C below its throttling point. Reads are spread evenly under the
+  limit (`limit X GB/s` in the per-second line). This does not raise the average rate, which is
+  set by the cooling, but replaces "full speed, then a collapse to 1 GB/s" with a steady rate.
+  In a thermal model of the drive (unit test) the governor holds 1.97 GB/s without a single
+  throttling event, versus an average of 2.04 GB/s with drops to 1 GB/s and 106 throttling
+  events per hour without it.
+- `--disk-start-temp C`: before filling the window, wait until the drive cools down to C.
+- The direct I/O window is locked in RAM and is reduced (with a warning) if `--readahead` does
+  not fit into free memory. A larger window rides out a short slowdown: at 20 Gbit/s and a drive
+  throttled to 1 GB/s, 32 GB last about 20 s.
+
+The real fix is cooling: a heatsink and airflow on the drive, or two drives in RAID0 so each
+works at half the rate.
+
 ### Page cache (`--io mmap`)
 
 - A background thread (`afr-stream`) wakes every 20 ms and keeps `--readahead` bytes (default

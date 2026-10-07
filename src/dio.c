@@ -45,6 +45,8 @@ int afr_dio_open(dio_t *d, const char *path, uint64_t file_size, uint64_t window
 		d->slots = NULL;
 		return -1;
 	}
+	/* Keep the window in RAM: it must not be swapped out under memory pressure. */
+	d->locked = mlock(d->mem, d->mem_len) == 0;
 	for (unsigned i = 0; i < d->nslots; i++) {
 		atomic_store(&d->slots[i].loaded, 0);
 		d->slots[i].buf = d->mem + (size_t)i * d->slot_len;
@@ -130,6 +132,21 @@ static void *reader_main(void *arg)
 			}
 			struct timespec ts = {0, 200000};
 			nanosleep(&ts, NULL);
+		}
+		/* Thermal governor: spread reads so the average rate stays under the limit. */
+		uint64_t lim = atomic_load_explicit(&d->rate_limit, RLX);
+		if (lim) {
+			int64_t cost = (int64_t)((double)d->slot_len * 1e9 / (double)lim);
+			int64_t now = afr_now_ns();
+			int64_t cur = atomic_load(&d->next_ns), start;
+			do {
+				start = cur > now ? cur : now;
+			} while (!atomic_compare_exchange_weak(&d->next_ns, &cur, start + cost));
+			while (afr_now_ns() < start && !atomic_load(&d->stop)) {
+				int64_t left = start - afr_now_ns();
+				struct timespec ts = {0, left > 20000000 ? 20000000 : (left > 0 ? left : 0)};
+				nanosleep(&ts, NULL);
+			}
 		}
 		dio_slot_t *s = &d->slots[q % d->nslots];
 		atomic_store_explicit(&s->loaded, 0, memory_order_release);

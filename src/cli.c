@@ -72,7 +72,10 @@ void afr_usage(FILE *f)
 	    "                          direct: O_DIRECT reader threads fill a RAM window of\n"
 	    "                          --readahead size, bypassing the page cache; mmap: through the\n"
 	    "                          page cache; auto = direct when the file is larger than free RAM\n"
-	    "  --io-threads N          direct I/O reader threads (default 4)\n"
+	    "  --io-threads N          direct I/O reader threads (default 4)\n"	    "  --disk-max-temp C       thermal governor (direct I/O): limit the disk read rate to keep\n"
+	    "                          the NVMe drive at or below C degrees instead of letting it hit\n"
+	    "                          thermal throttling; e.g. 2-3 C below its throttling point\n"
+	    "  --disk-start-temp C     before start, wait until the NVMe drive cools down to C\n"
 	    "  --smac MAC, --dmac MAC  MAC addresses of the synthetic Ethernet header for RAW IP\n"
 	    "\n"
 	    "Looping with mutation:\n"
@@ -134,6 +137,8 @@ enum {
 	O_DROP_BEHIND,
 	O_IO,
 	O_IO_THREADS,
+	O_DISK_MAX_TEMP,
+	O_DISK_START_TEMP,
 	O_SMAC,
 	O_DMAC,
 	O_ANALYZE,
@@ -177,6 +182,8 @@ static const struct option long_opts[] = {
     {"drop-behind", required_argument, NULL, O_DROP_BEHIND},
     {"io", required_argument, NULL, O_IO},
     {"io-threads", required_argument, NULL, O_IO_THREADS},
+    {"disk-max-temp", required_argument, NULL, O_DISK_MAX_TEMP},
+    {"disk-start-temp", required_argument, NULL, O_DISK_START_TEMP},
     {"smac", required_argument, NULL, O_SMAC},
     {"dmac", required_argument, NULL, O_DMAC},
     {"analyze", no_argument, NULL, O_ANALYZE},
@@ -385,6 +392,15 @@ int afr_parse_args(int argc, char **argv, opts_t *o)
 			if (afr_parse_u64(optarg, &u) < 0 || u == 0 || u > 32)
 				return bad("--io-threads", optarg);
 			o->io_threads = (unsigned)u;
+			break;
+		case O_DISK_MAX_TEMP:
+		case O_DISK_START_TEMP:
+			if (afr_parse_u64(optarg, &u) < 0 || u < 20 || u > 100)
+				return bad(c == O_DISK_MAX_TEMP ? "--disk-max-temp" : "--disk-start-temp", optarg);
+			if (c == O_DISK_MAX_TEMP)
+				o->disk_max_temp = (int)u;
+			else
+				o->disk_start_temp = (int)u;
 			break;
 		case O_DROP_BEHIND:
 			if (!strcmp(optarg, "auto"))

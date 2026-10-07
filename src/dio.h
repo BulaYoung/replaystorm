@@ -53,6 +53,10 @@ typedef struct {
 	/* statistics */
 	_Atomic uint64_t bytes_read, chunks_loaded, reader_waits;
 	_Atomic uint64_t reads, read_ns; /* chunk reads and their total duration */
+	/* read rate limit from the thermal governor (bytes/s, 0 = none) */
+	_Atomic uint64_t rate_limit;
+	_Atomic int64_t next_ns; /* earliest start of the next read under the limit */
+	int locked;              /* the window is locked in RAM */
 } dio_t;
 
 /* Open the file with O_DIRECT and allocate the window. Returns -1 with a reason if

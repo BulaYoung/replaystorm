@@ -46,6 +46,8 @@ typedef struct {
 	int drop_behind;      /* -1 auto, 0 off, 1 on */
 	int io_mode;          /* IO_AUTO / IO_DIRECT / IO_MMAP */
 	unsigned io_threads;  /* direct I/O reader threads */
+	int disk_max_temp;    /* thermal governor target, C (0 = off) */
+	int disk_start_temp;  /* wait until the disk cools to this before start, C (0 = off) */
 	uint8_t smac[6], dmac[6];
 
 	int analyze;
