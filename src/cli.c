@@ -87,11 +87,15 @@ void afr_usage(FILE *f)
 	    "Output:\n"
 	    "  --analyze               analyze the file only, do not send\n"
 	    "  --stats-json FILE       write statistics as JSON\n"
+	    "  --status-file F         live status file, rewritten every second (default\n"
+	    "                          /tmp/afreplay-IF.status)\n"
+	    "  --status [-i IF]        print the live status of a running afreplay and exit\n"
 	    "  -q, --quiet             do not print per-second statistics\n"
 	    "  -h, --help              this help\n"
 	    "\n"
 	    "Examples:\n"
 	    "  afreplay --analyze big.pcap\n"
+	    "  afreplay --status -i ens1f0          # statistics of a replay running elsewhere\n"
 	    "  afreplay -i ens1f0 --mbps 99% --index-cache /var/tmp/big.afridx big.pcap\n"
 	    "  afreplay --analyze --multiplier 10 --link-speed 25G big.pcap\n"
 	    "  afreplay -i ens1f0 --topspeed --qdisc-bypass -t 12 big.pcap\n"
@@ -101,6 +105,9 @@ void afr_usage(FILE *f)
 	    "  afreplay -i ens1f0 --duration 10m --stats-json run.json big.pcap\n"
 	    "  afreplay -i ens1f0 --loop 5 --loop-mutate ip,port big.pcap\n"
 	    "  afreplay -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap\n"
+	    "\n"
+	    "While running: press Enter (or s) for long-run statistics: minimum, worst minute,\n"
+	    "percentiles, averages; r resets them, q stops; kill -USR1 PID prints them too.\n"
 	    "\n"
 	    "Exit code: 0 - success (including stop by SIGINT/SIGTERM), 1 - runtime error,\n"
 	    "2 - invalid arguments.\n",
@@ -143,6 +150,8 @@ enum {
 	O_DMAC,
 	O_ANALYZE,
 	O_JSON,
+	O_STATUS,
+	O_STATUS_FILE,
 	O_MUTATE,
 	O_MUT_IP,
 	O_MUT_PORT,
@@ -188,6 +197,8 @@ static const struct option long_opts[] = {
     {"dmac", required_argument, NULL, O_DMAC},
     {"analyze", no_argument, NULL, O_ANALYZE},
     {"stats-json", required_argument, NULL, O_JSON},
+    {"status", no_argument, NULL, O_STATUS},
+    {"status-file", required_argument, NULL, O_STATUS_FILE},
     {"loop-mutate", required_argument, NULL, O_MUTATE},
     {"mutate-ip-offset", required_argument, NULL, O_MUT_IP},
     {"mutate-port-step", required_argument, NULL, O_MUT_PORT},
@@ -422,6 +433,8 @@ int afr_parse_args(int argc, char **argv, opts_t *o)
 			break;
 		case O_ANALYZE: o->analyze = 1; break;
 		case O_JSON: o->stats_json = optarg; break;
+		case O_STATUS: o->status_query = 1; break;
+		case O_STATUS_FILE: o->status_file = optarg; break;
 		case O_MUTATE: {
 			char buf[64];
 			snprintf(buf, sizeof(buf), "%s", optarg);
@@ -454,6 +467,10 @@ int afr_parse_args(int argc, char **argv, opts_t *o)
 			afr_log_err("unknown option %s (see --help)", argv[optind - 1]);
 			return -1;
 		}
+	}
+	if (o->status_query) {
+		afr_quiet = o->quiet;
+		return 0; /* no pcap needed */
 	}
 	if (nmodes > 1) {
 		afr_log_err("--topspeed, --mbps, --pps, --multiplier and --duration are mutually exclusive");

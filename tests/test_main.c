@@ -13,6 +13,7 @@ int main(void)
 	    {"schedule", test_sched},
 	    {"loop mutation", test_mutate},
 	    {"thermal governor", test_therm},
+	    {"long-run statistics", test_live},
 	};
 	for (size_t i = 0; i < sizeof(suites) / sizeof(suites[0]); i++) {
 		int before = t_failed;

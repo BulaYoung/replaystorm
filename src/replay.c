@@ -2,18 +2,22 @@
 
 #include "clock.h"
 #include "dio.h"
+#include "live.h"
 #include "therm.h"
 #include "util.h"
 #include "stream.h"
 #include "worker.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <glob.h>
 #include <inttypes.h>
 #include <math.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define RLX memory_order_relaxed
@@ -25,6 +29,14 @@ static therm_mon_t g_therm;
 static int g_therm_on;
 
 /* ---------- Link outages and the watchdog ---------- */
+
+/* ---------- Long-run statistics on request ---------- */
+
+static live_t g_live;
+static int g_live_on;
+static atomic_int g_want_status, g_want_reset;
+static unsigned g_stalls;          /* watchdog warnings */
+static char g_status_path[512];
 
 static int g_link_down;          /* shown in the per-second line */
 static int64_t g_link_down_since;
@@ -100,6 +112,7 @@ static void watchdog(worker_t **ws, unsigned nw, stall_t *st, const afr_ctx_t *c
 		if (st[i].warned || now - st[i].since < STALL_WARN_NS)
 			continue;
 		st[i].warned = 1;
+		g_stalls++;
 		const char *why = "";
 		switch (state) {
 		case W_RING: why = " (the NIC is not completing transmissions)"; break;
@@ -188,6 +201,183 @@ static void take_snap(worker_t **ws, unsigned nw, const char *iface, snap_t *s)
 	s->rate_limit = g_dio_on ? LD(g_dio.rate_limit) : 0;
 	s->sys_ok = afr_sysfs_read_u64(iface, "statistics/tx_packets", &s->sys_tx) == 0 &&
 	            afr_sysfs_read_u64(iface, "statistics/tx_dropped", &s->sys_drop) == 0;
+}
+
+static void on_usr1(int sig)
+{
+	(void)sig;
+	atomic_store(&g_want_status, 1);
+}
+
+/* Commands typed in the terminal while the replay runs. */
+static void *stdin_main(void *arg)
+{
+	(void)arg;
+	char line[64];
+	while (fgets(line, sizeof(line), stdin)) {
+		line[strcspn(line, "\r\n")] = 0;
+		if (!line[0] || !strcmp(line, "s") || !strcmp(line, "stats"))
+			atomic_store(&g_want_status, 1);
+		else if (!strcmp(line, "r") || !strcmp(line, "reset"))
+			atomic_store(&g_want_reset, 1);
+		else if (!strcmp(line, "q") || !strcmp(line, "quit") || !strcmp(line, "stop"))
+			atomic_store(&g_stop, 1);
+		else
+			printf("commands: Enter or s - long-run statistics, r - reset minimum/maximum, "
+			       "q - stop\n");
+	}
+	return NULL;
+}
+
+static void fmt_dur(char *b, size_t n, double sec)
+{
+	uint64_t s = sec > 0 ? (uint64_t)sec : 0;
+	if (s >= 86400)
+		snprintf(b, n, "%llud %02llu:%02llu:%02llu", (unsigned long long)(s / 86400),
+		         (unsigned long long)(s % 86400 / 3600), (unsigned long long)(s % 3600 / 60),
+		         (unsigned long long)(s % 60));
+	else
+		snprintf(b, n, "%02llu:%02llu:%02llu", (unsigned long long)(s / 3600),
+		         (unsigned long long)(s % 3600 / 60), (unsigned long long)(s % 60));
+}
+
+static void fmt_local(char *b, size_t n, int64_t real_ns)
+{
+	time_t t = (time_t)(real_ns / NS_PER_SEC);
+	struct tm tm;
+	if (!localtime_r(&t, &tm) || !strftime(b, n, "%Y-%m-%d %H:%M:%S", &tm))
+		snprintf(b, n, "?");
+}
+
+/* The long-run statistics block (also the content of the status file). */
+static size_t status_text(char *buf, size_t n, const afr_ctx_t *c, const snap_t *cur,
+                          const snap_t *start, int64_t since_t0, int finished)
+{
+	const live_t *l = &g_live;
+	char a[64], b[64], d[64];
+	size_t k = 0;
+#define OUT(...)                                                        \
+	do {                                                                \
+		if (k < n)                                                      \
+			k += (size_t)snprintf(buf + k, n - k, __VA_ARGS__);         \
+	} while (0)
+	fmt_dur(a, sizeof(a), (double)since_t0 / 1e9);
+	fmt_local(b, sizeof(b), l->start_real_ns);
+	fmt_local(d, sizeof(d), l->start_real_ns + since_t0);
+	OUT("afreplay on %s, pid %d: %s for %s (started %s, now %s)\n", c->o->iface, (int)getpid(),
+	    finished ? "finished after running" : "running", a, b, d);
+	OUT("  now:          %.3f Gbit/s, %.3f Mpps", l->now_gbps, l->now_mpps);
+	if (cur->disk_temp >= 0)
+		OUT(", disk %d C", cur->disk_temp);
+	if (g_link_down)
+		OUT(", LINK DOWN");
+	OUT("\n");
+	if (l->seconds) {
+		unsigned m = l->ring_n < 60 ? l->ring_n : 60;
+		OUT("  average:      last minute %.3f, last hour %.3f, overall %.3f Gbit/s\n",
+		    m ? l->sum_60 / m : 0.0, l->ring_n ? l->sum_3600 / l->ring_n : 0.0,
+		    l->sum_gbps / (double)l->seconds);
+		fmt_dur(a, sizeof(a), (double)l->min_at / 1e9);
+		fmt_local(b, sizeof(b), l->start_real_ns + l->min_at);
+		OUT("  minimum 1 s:  %.3f Gbit/s (%.3f Mpps min) at +%s (%s)\n", l->min_gbps, l->min_mpps,
+		    a, b);
+		if (l->worst_min_at) {
+			fmt_dur(a, sizeof(a), (double)l->worst_min_at / 1e9);
+			fmt_local(b, sizeof(b), l->start_real_ns + l->worst_min_at);
+			OUT("  worst minute: %.3f Gbit/s on average, ended at +%s (%s)\n", l->worst_min_gbps,
+			    a, b);
+		}
+		fmt_dur(a, sizeof(a), (double)l->max_at / 1e9);
+		OUT("  maximum 1 s:  %.3f Gbit/s at +%s\n", l->max_gbps, a);
+		OUT("  1 s rate:     p1 %.2f, p5 %.2f, median %.2f Gbit/s over %llu s", afr_live_quantile(l, 0.01),
+		    afr_live_quantile(l, 0.05), afr_live_quantile(l, 0.5), (unsigned long long)l->seconds);
+		if (l->target_gbps > 0)
+			OUT("; below 95%% of the target (%.2f Gbit/s): %llu s (%.3f%%)", 0.95 * l->target_gbps,
+			    (unsigned long long)l->below_target,
+			    100.0 * (double)l->below_target / (double)l->seconds);
+		OUT("\n");
+	} else {
+		OUT("  (no full seconds counted yet: the first 10 s are a warm-up)\n");
+	}
+	if (l->excluded)
+		OUT("  not counted:  %llu s (warm-up, link outages, partial seconds)\n",
+		    (unsigned long long)l->excluded);
+	if (l->reset_ns > l->start_ns) {
+		fmt_dur(a, sizeof(a), (double)l->reset_ns / 1e9);
+		OUT("  (minimum, maximum and averages since the reset at +%s)\n", a);
+	}
+	afr_fmt_count(a, sizeof(a), (double)cur->pkts);
+	OUT("  sent:         %s packets, %.3f TB; lap %llu; ENOBUFS %llu", a, (double)cur->bytes / 1e12,
+	    (unsigned long long)(cur->lap_min == UINT64_MAX ? cur->lap_last : cur->lap_min) + 1,
+	    (unsigned long long)cur->enobufs);
+	if (cur->sys_ok && start->sys_ok)
+		OUT("; interface tx_dropped +%llu", (unsigned long long)(cur->sys_drop - start->sys_drop));
+	OUT("\n");
+	OUT("  events:       link outages %u (%.1f s)", g_link_outages,
+	    (double)(g_link_down_ns + (g_link_down_since ? afr_now_ns() - g_link_down_since : 0)) / 1e9);
+	OUT(", stalled-thread warnings %u", g_stalls);
+	if (g_therm_on)
+		OUT(", disk max %d C, thermal throttling %llu", atomic_load(&g_therm.max_temp),
+		    (unsigned long long)atomic_load(&g_therm.throttle));
+	OUT("\n");
+#undef OUT
+	return k < n ? k : n - 1;
+}
+
+/* Rewrite the status file atomically so a reader never sees half of it. */
+static void status_write(const char *text, size_t len)
+{
+	if (!g_status_path[0])
+		return;
+	char tmp[600];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", g_status_path);
+	FILE *f = fopen(tmp, "w");
+	if (!f)
+		return;
+	int ok = fwrite(text, 1, len, f) == len;
+	ok = (fclose(f) == 0) && ok;
+	if (ok)
+		rename(tmp, g_status_path);
+	else
+		unlink(tmp);
+}
+
+int afr_status_query(const opts_t *o)
+{
+	char path[600];
+	glob_t g;
+	memset(&g, 0, sizeof(g));
+	const char *pattern = path;
+	if (o->status_file)
+		snprintf(path, sizeof(path), "%s", o->status_file);
+	else if (o->iface)
+		snprintf(path, sizeof(path), "/tmp/afreplay-%s.status", o->iface);
+	else
+		snprintf(path, sizeof(path), "/tmp/afreplay-*.status");
+	if (glob(pattern, 0, NULL, &g) != 0 || g.gl_pathc == 0) {
+		afr_log_err("no status file %s: is afreplay running (on this interface)?", path);
+		globfree(&g);
+		return 1;
+	}
+	for (size_t i = 0; i < g.gl_pathc; i++) {
+		FILE *f = fopen(g.gl_pathv[i], "r");
+		if (!f)
+			continue;
+		char buf[8192];
+		size_t r = fread(buf, 1, sizeof(buf) - 1, f);
+		fclose(f);
+		buf[r] = 0;
+		fputs(buf, stdout);
+		struct stat st;
+		if (stat(g.gl_pathv[i], &st) == 0 && !strstr(buf, "finished after")) {
+			double age = difftime(time(NULL), st.st_mtime);
+			if (age > 5)
+				printf("  (not updated for %.0f s: the replay is probably not running any more)\n",
+				       age);
+		}
+	}
+	globfree(&g);
+	return 0;
 }
 
 static const char *mode_name(int m)
@@ -448,6 +638,15 @@ static void print_summary(const afr_ctx_t *c, const snap_t *end, const snap_t *s
 			        afr_lh_quantile(end->hist, 0.5), afr_lh_quantile(end->hist, 0.99),
 			        afr_lh_quantile(end->hist, 0.999), end->late_max, end->rebases,
 			        end->asis_back);
+		if (g_live_on && g_live.seconds)
+			fprintf(json, ", \"rate_avg_gbps\": %.4f, \"rate_min_gbps\": %.4f, \"rate_min_at_s\": %.1f"
+			              ", \"rate_worst_minute_gbps\": %.4f, \"rate_p1_gbps\": %.2f"
+			              ", \"rate_p5_gbps\": %.2f, \"rate_median_gbps\": %.2f"
+			              ", \"seconds_counted\": %" PRIu64 ", \"seconds_below_target\": %" PRIu64,
+			        g_live.sum_gbps / (double)g_live.seconds, g_live.min_gbps,
+			        (double)g_live.min_at / 1e9, g_live.worst_min_gbps,
+			        afr_live_quantile(&g_live, 0.01), afr_live_quantile(&g_live, 0.05),
+			        afr_live_quantile(&g_live, 0.5), g_live.seconds, g_live.below_target);
 		fprintf(json, ", \"per_thread\": [");
 		for (unsigned i = 0; i < nw; i++)
 		{
@@ -561,6 +760,10 @@ int afr_replay_run(afr_ctx_t *c)
 	sigemptyset(&sa.sa_mask);
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
+	struct sigaction su = {.sa_handler = on_usr1};
+	sigemptyset(&su.sa_mask);
+	su.sa_flags = SA_RESTART;
+	sigaction(SIGUSR1, &su, NULL);
 
 	pthread_barrier_init(&sh->bar, NULL, nw + 1);
 	unsigned started = 0;
@@ -746,6 +949,24 @@ int afr_replay_run(afr_ctx_t *c)
 	int64_t tick = t0;
 	int64_t last = t0;
 	stall_t *stalls = calloc(nw ? nw : 1, sizeof(stall_t)); /* NULL: no watchdog */
+	/* Long-run statistics: on request in the terminal, by SIGUSR1, and in a status file. */
+	g_live_on = afr_live_init(&g_live, o->mode == MODE_MBPS ? o->mbps / 1000.0 : 0.0, t0,
+	                          afr_realtime_ns() + (t0 - afr_now_ns())) == 0;
+	if (g_live_on) {
+		if (o->status_file)
+			snprintf(g_status_path, sizeof(g_status_path), "%s", o->status_file);
+		else
+			snprintf(g_status_path, sizeof(g_status_path), "/tmp/afreplay-%s.status", o->iface);
+		if (isatty(STDIN_FILENO)) {
+			pthread_t th;
+			if (pthread_create(&th, NULL, stdin_main, NULL) == 0)
+				pthread_detach(th);
+		}
+		afr_log_info("Long-run statistics: press Enter here, or from another terminal: "
+		             "afreplay --status -i %s (file %s), or kill -USR1 %d",
+		             o->iface, g_status_path, (int)getpid());
+	}
+	char *stext = malloc(8192);
 	int first_row = 1;
 	for (;;) {
 		tick += NS_PER_SEC;
@@ -780,8 +1001,23 @@ int afr_replay_run(afr_ctx_t *c)
 				json_row(json, first_row, &r);
 				first_row = 0;
 			}
+			if (g_live_on)
+				afr_live_add(&g_live, now - t0, r.dt, (double)r.bytes * 8 / r.dt / 1e9,
+				             (double)r.pkts / r.dt / 1e6, g_link_down);
 			prev = cur;
 			last = now;
+		}
+		if (g_live_on && stext) {
+			if (atomic_exchange(&g_want_reset, 0)) {
+				afr_live_reset(&g_live, now - t0);
+				printf("Long-run statistics reset\n");
+			}
+			size_t len = status_text(stext, 8192, c, &cur, &start, now - t0, 0);
+			status_write(stext, len);
+			if (atomic_exchange(&g_want_status, 0)) {
+				printf("----\n%s----\n", stext);
+				fflush(stdout);
+			}
 		}
 		if (cur.active == 0)
 			break;
@@ -811,6 +1047,14 @@ int afr_replay_run(afr_ctx_t *c)
 	if (g_link_outages)
 		printf("Link outages: %u, %.1f s in total (the schedule was paused for that time)\n",
 		       g_link_outages, (double)g_link_down_ns / 1e9);
+	if (g_live_on && stext) {
+		size_t len = status_text(stext, 8192, c, &cur, &start, t_end - t0, 1);
+		status_write(stext, len);
+		printf("Long-run statistics:\n%s", stext);
+	}
+	free(stext);
+	if (g_live_on)
+		afr_live_free(&g_live);
 	uint64_t fwaits = 0;
 	for (unsigned i = 0; i < nw; i++)
 		fwaits += LD(ws[i]->st.fence_waits);

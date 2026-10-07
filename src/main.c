@@ -215,6 +215,8 @@ int main(int argc, char **argv)
 	if (rc != 0)
 		return rc > 0 ? 0 : 2;
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	if (o.status_query)
+		return afr_status_query(&o);
 
 	afr_ctx_t *c = &g_ctx;
 	c->o = &o;

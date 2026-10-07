@@ -277,6 +277,36 @@ nothing for 3 seconds while not simply waiting for its schedule, a warning names
 the file position; another one says when it resumed. The summary and the JSON show, per thread,
 how much time it spent in each kind of wait.
 
+## Checking on a run that lasts for days
+
+The stats thread keeps long-run statistics of the per-second send rate and shows them on request:
+
+- **In the terminal** where afreplay runs (also inside `screen`): Enter or `s` prints them, `r`
+  resets minimum/maximum/averages (to watch a new period), `q` stops gracefully.
+- **From any other terminal:** `afreplay --status -i IF` prints the status file
+  `/tmp/afreplay-IF.status` (or `--status-file`), rewritten atomically every second. After the run
+  it keeps the final result; if it is not updated any more, `--status` says so.
+- **`kill -USR1 PID`** prints them into the program's output (handy under `nohup` or systemd).
+
+```
+afreplay on enp1s0f3np3, pid 4242: running for 2d 03:14:07 (started 2026-10-07 10:40:12, now ...)
+  now:          24.310 Gbit/s, 3.360 Mpps, disk 61 C
+  average:      last minute 24.300, last hour 24.280, overall 24.250 Gbit/s
+  minimum 1 s:  18.200 Gbit/s (2.510 Mpps min) at +1d 04:12:03 (2026-10-08 14:52:15)
+  worst minute: 23.950 Gbit/s on average, ended at +1d 04:12:40 (2026-10-08 14:52:52)
+  maximum 1 s:  24.500 Gbit/s at +00:12:31
+  1 s rate:     p1 23.90, p5 24.10, median 24.30 Gbit/s over 184230 s; below 95% of the target ...
+  not counted:  10 s (warm-up, link outages, partial seconds)
+  sent:         ... packets, ... TB; lap 312; ENOBUFS ...; interface tx_dropped +0
+  events:       link outages 0 (0.0 s), stalled-thread warnings 0, disk max 63 C, thermal throttling 0
+```
+
+The first 10 seconds (warm-up), seconds with the link down and partial intervals are not counted
+in minimum, percentiles and averages. The worst minute is the lowest average over 60 consecutive
+counted seconds; it is less sensitive to single-second jitter than the 1-second minimum. The same
+block is printed at the end of the run, and the JSON summary gets the minimum, worst minute,
+percentiles and seconds below the target.
+
 ## Rate modes
 
 | Mode | What it does |

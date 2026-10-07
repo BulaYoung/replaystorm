@@ -499,6 +499,21 @@ def t_robust(pcaps):
     check("Link outages: 2" in out, "both outages detected and the schedule paused")
     check(len(got) > 100, "sending resumed on the re-created interface (%d frames)" % len(got))
 
+    print("== Long-run statistics: status file, --status from another terminal, SIGUSR1")
+    p = subprocess.Popen([BIN, "-i", TX, "-q", "--mbps", "200", "--loop", "0", "-t", "1",
+                          os.path.join(pcaps, "timing.pcap")], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    time.sleep(13)
+    rc, st = run_afr(["--status", "-i", TX])
+    p.send_signal(signal.SIGUSR1)
+    time.sleep(1.5)
+    p.send_signal(signal.SIGINT)
+    out = p.communicate(timeout=20)[0].decode()
+    check(rc == 0 and "minimum 1 s:" in st and "running for" in st, "afreplay --status shows a running replay")
+    check(out.count("minimum 1 s:") >= 2, "SIGUSR1 prints the statistics, and they are in the summary")
+    rc, st = run_afr(["--status", "-i", TX])
+    check(rc == 0 and "finished after" in st, "the status file keeps the result after the end")
+
     print("== Watchdog: a stalled thread is reported with the reason")
     sh("tc qdisc add dev %s root tbf rate 8kbit burst 2kb limit 3kb" % TX)
     p = subprocess.Popen([BIN, "-i", TX, "-q", "--topspeed", "--loop", "0", "-t", "1",

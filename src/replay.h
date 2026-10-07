@@ -37,5 +37,7 @@ int afr_report_warnings(const afr_ctx_t *c);
 
 /* Replay; returns the exit code. */
 int afr_replay_run(afr_ctx_t *c);
+/* --status: print the live status of a running afreplay. Returns the exit code. */
+int afr_status_query(const opts_t *o);
 
 #endif

@@ -32,5 +32,6 @@ void test_hash(void);
 void test_sched(void);
 void test_mutate(void);
 void test_therm(void);
+void test_live(void);
 
 #endif
