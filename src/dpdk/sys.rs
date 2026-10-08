@@ -257,6 +257,23 @@ fn group_blockers(pci: &str) -> Vec<String> {
     v
 }
 
+/// PCI class of a device ("0x020000" = Ethernet), "" if unknown.
+fn class_of(pci: &str) -> String {
+    read(&format!("{}/class", dev(pci))).unwrap_or_default()
+}
+
+fn class_name(class: &str) -> &'static str {
+    match class.get(2..4).unwrap_or("") {
+        "01" => "storage controller",
+        "02" => "network controller",
+        "03" => "display controller",
+        "04" => "multimedia device",
+        "06" => "bridge",
+        "0c" => "serial bus controller",
+        _ => "device",
+    }
+}
+
 /// A device's current state, refusing an interface with IP addresses.
 fn dev_state(pci: &str) -> Result<DevState, String> {
     let mut d = DevState { pci: pci.to_string(), driver: driver_of(pci).unwrap_or_default(), ..Default::default() };
@@ -322,6 +339,22 @@ pub fn prepare(pci: &str, bind: bool, bind_group: bool, huge_bytes: u64) -> Resu
             // VFIO hands a device out only if every device of its IOMMU group is on vfio-pci
             // (or unbound). The ports of one card often share a group.
             let others = group_blockers(pci);
+            // Only network ports may be moved along: never a disk (it may hold the pcap or
+            // the system) or anything else.
+            let foreign: Vec<String> = others
+                .iter()
+                .filter(|o| !class_of(o).starts_with("0x02"))
+                .map(|o| format!("{} = {} ({})", describe(o), class_name(&class_of(o)), class_of(o)))
+                .collect();
+            if !foreign.is_empty() {
+                return Err(format!(
+                    "{} shares its IOMMU group with devices that are not network ports: {}. VFIO needs \
+                     the whole group, and these cannot be taken away. Put the NIC in a slot with its own \
+                     IOMMU group (another PCIe root port), enable ACS in the BIOS, or use the kernel path (-i)",
+                    pci,
+                    foreign.join(", ")
+                ));
+            }
             if !others.is_empty() && !bind_group {
                 return Err(format!(
                     "{} shares its IOMMU group with {}: VFIO needs the whole group. Add --dpdk-bind-group to \
@@ -558,6 +591,7 @@ mod tests {
         mk(&format!("/sys/bus/pci/devices/{}/iommu_group/devices/{}", pci, pci));
         mk(&format!("/sys/bus/pci/devices/{}/driver", pci));
         put(&format!("/sys/bus/pci/devices/{}/numa_node", pci), "1\n");
+        put(&format!("/sys/bus/pci/devices/{}/class", pci), "0x020000\n");
         mk("/sys/class/net/ens1f0");
         put("/sys/class/net/ens1f0/mtu", "9000\n");
         put("/sys/class/net/ens1f0/flags", "0x1003\n");
@@ -611,6 +645,7 @@ mod tests {
         mk(&format!("/sys/bus/pci/devices/{}/net/ens1f1", pci2));
         symlink(r.join("sys/bus/pci/drivers/bnxt_en"), r.join(format!("sys/bus/pci/devices/{}/driver", pci2))).unwrap();
         mk(&format!("/sys/bus/pci/devices/{}/iommu_group/devices/{}", pci, pci2));
+        put(&format!("/sys/bus/pci/devices/{}/class", pci2), "0x020000\n");
         mk("/sys/class/net/ens1f1");
         put("/sys/class/net/ens1f1/mtu", "1500\n");
         put("/sys/class/net/ens1f1/flags", "0x1002\n");
@@ -623,6 +658,18 @@ mod tests {
         assert_eq!(read(&format!("/sys/bus/pci/devices/{}/driver_override", pci2)).unwrap(), "vfio-pci");
         restore();
         assert_eq!(read(&format!("/sys/bus/pci/devices/{}/driver_override", pci2)).unwrap(), "");
+        assert!(read(&state_path(pci)).is_none());
+
+        // An NVMe drive in the same group: never moved, even with --dpdk-bind-group.
+        let nvme = "0000:02:00.0";
+        mk("/sys/bus/pci/drivers/nvme");
+        mk(&format!("/sys/bus/pci/devices/{}", nvme));
+        put(&format!("/sys/bus/pci/devices/{}/class", nvme), "0x010802\n");
+        symlink(r.join("sys/bus/pci/drivers/nvme"), r.join(format!("sys/bus/pci/devices/{}/driver", nvme))).unwrap();
+        mk(&format!("/sys/bus/pci/devices/{}/iommu_group/devices/{}", pci, nvme));
+        let e = prepare(pci, true, true, 0).unwrap_err();
+        assert!(e.contains(nvme) && e.contains("storage controller"), "{}", e);
+        assert!(read(&format!("/sys/bus/pci/devices/{}/driver_override", nvme)).is_none());
         assert!(read(&state_path(pci)).is_none());
         std::env::remove_var("RS_SYSFS_ROOT");
         let _ = std::fs::remove_dir_all(&r);

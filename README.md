@@ -421,8 +421,9 @@ replaystorm --status --dpdk ens1f0           # long-run statistics from another 
   ports of one card often share a group (`ls /sys/bus/pci/devices/PCI/iommu_group/devices`):
   then `--dpdk-bind` refuses and lists them, and `--dpdk-bind-group` moves the whole group for
   the run and gives every port back at the end (their interfaces disappear meanwhile; a port
-  with IP addresses is refused). Alternatively the slot/BIOS may put each port in its own group
-  (ACS).
+  with IP addresses is refused). Only network ports are ever moved: if the group also holds a
+  disk or any other device, replaystorm refuses outright. Then the NIC needs a slot with its own
+  group (another PCIe root port) or ACS in the BIOS, or the kernel path (`-i`) is used.
 - After the NIC is given back, the interface first appears as ethN and udev renames it;
   replaystorm waits for udev before restoring the MTU and the up state.
 - `--dpdk-hugepages SIZE` adds SIZE of 2 MB hugepages on the NIC's NUMA node (compacting memory
