@@ -1,0 +1,25 @@
+[package]
+name = "replaystorm"
+version = "1.0.0"
+edition = "2021"
+description = "Multithreaded pcap replayer over AF_PACKET preserving L2"
+
+[dependencies]
+libc = "0.2"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "replaystorm"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+debug = "line-tables-only"
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+
+[profile.test]
+opt-level = 2

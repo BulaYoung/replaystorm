@@ -11,7 +11,7 @@ large captures (hundreds of GB) at 25 Gbit/s and beyond, on machines with many b
   NVMe temperature monitoring and a thermal governor.
 - Built for runs that last days or weeks: endless looping with new sessions on every lap,
   surviving link outages, a watchdog, and long-run statistics you can query at any time.
-- Only `AF_PACKET`: no DPDK, AF_XDP, netmap or libpcap. C11, dependencies: pthread and libm.
+- Only `AF_PACKET`: no DPDK, AF_XDP, netmap or libpcap. Rust, the only dependency is `libc`.
 
 Contents: [Building](#building) · [Recipes](#recipes) · [How it works](#how-it-works) ·
 [Rate modes](#rate-modes) · [Timestamp replay](#timestamp-replay) ·
@@ -25,21 +25,29 @@ Contents: [Building](#building) · [Recipes](#recipes) · [How it works](#how-it
 
 ## Building
 
+replaystorm is written in Rust (edition 2021, the only dependency is the `libc` crate).
+
 ```sh
-make                # the ./replaystorm binary
-make unit-test      # unit tests
+# Rust toolchain, once, without root (or the distribution's rust/cargo packages if recent enough)
+curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+
+make                # cargo build --release, copies the binary to ./replaystorm
+make static         # a fully static binary (musl) that runs on any x86_64 Linux
+make unit-test      # cargo test --release
 make test           # unit tests + test pcap generation + functional tests on veth
-make sanitize       # unit tests built with UBSan (trap) and FORTIFY; SAN=-fsanitize=address if libasan exists
+make clippy         # lints
 sudo install -m 755 replaystorm /usr/local/bin/
 ```
 
-- Requires gcc or clang with C11 and Linux 3.14+ (`PACKET_QDISC_BYPASS`). Tested on Fedora (kernel
-  6.19) and RHEL 8 (kernel 4.18, gcc 8). Some features are better on newer kernels
-  (`MADV_POPULATE_READ` from 5.14); older ones get an equivalent fallback.
-- The build uses `-Wall -Wextra -Werror`. If an older compiler warns about something a newer one
-  does not: `make clean && make XCFLAGS="-std=c11 -D_GNU_SOURCE -Wall -Wextra -pthread -MMD -MP"`.
-- Copy the sources, not `build/` or the binary, to another machine: a binary built against a newer
-  glibc does not run on an older one. If you did copy them, `make clean && make`.
+- Requires Rust 1.80+ and Linux 3.14+ (`PACKET_QDISC_BYPASS`). Tested on Fedora (kernel 6.19) and
+  RHEL 8 (kernel 4.18). Some features are better on newer kernels (`MADV_POPULATE_READ` from
+  5.14); older ones get an equivalent fallback.
+- For older systems such as RHEL/CentOS 8, the simplest is to build a static binary on any
+  machine (`rustup target add x86_64-unknown-linux-musl`, then `make static`) and copy only the
+  binary: it does not depend on the system's glibc. A normal `make` binary must be built on a
+  system with the same or an older glibc than the target.
+- Without internet on the build machine: run `cargo vendor` on a machine with internet and copy
+  the `vendor/` directory along (see the `cargo vendor` output for the config lines).
 - Running requires root (or `CAP_NET_RAW`; `CAP_NET_ADMIN` to enlarge the socket buffer; root also
   for `mlock` of the index and for reading the NVMe temperature on older kernels).
 - The tests need python3 without third-party modules, `ip` and `ethtool`. Functional tests use
@@ -279,7 +287,7 @@ last 64 KB, format version), otherwise rebuilt with a message; written atomicall
 Timeline normalization, the radix sort for unordered timestamps and the rate profile run on the
 hashing threads. Stateful phases (running maximum, gap excess, last mapped value) summarize chunks,
 merge the summaries in order and redo each chunk from the exact sequential state, so the result is
-bit-identical to the single-threaded reference in `tests/ref_sched.c` (unit tests compare 360
+bit-identical to the single-threaded reference in `src/ref_sched.rs` (unit tests compare 360
 combinations of data, options and thread counts 1-16; mutation testing confirmed they catch
 boundary bugs). 4.7 million packets, 1 vs 11 threads: 34 → 14 ms (normalization), 131 → 24 ms (rate
 profile).
@@ -465,12 +473,12 @@ skipped and truncated frames; distribution across shards and the imbalance (shar
 
 ## Tests
 
-- `make unit-test` (100 000+ checks): pcap parser (us/ns, LE/BE, truncated, corrupt, pcapng,
+- `make unit-test` (`cargo test`): pcap parser (us/ns, LE/BE, truncated, corrupt, pcapng,
   linktypes); index build, resolve and the index cache (round trip, another `-t`, a changed or
   damaged pcap/cache); symmetric hash (IPv4, VLAN with different IDs per direction, QinQ, MPLS, IPv6
   with extension headers, PPPoE, fragments, non-IP, RAW IP, distribution, MTU limits); timeline
   normalization, schedules, rate profile, radix sort, histograms, and the parallel implementation
-  against the reference (360 combinations); the rate timeline; loop mutation and RFC 1624
+  against the single-threaded reference in `src/ref_sched.rs` (360 combinations); the rate timeline; loop mutation and RFC 1624
   checksums; the thermal governor on a drive model; long-run statistics.
 - `tests/gen_pcaps.py`: generates the test pcaps (L2 mix with ARP, STP, LLDP, VLAN, QinQ, MPLS,
   pseudowire, PPPoE, IPv6, fragments; RAW IP; timestamp anomalies; a timing file; a truncated file;
@@ -482,7 +490,9 @@ skipped and truncated frames; distribution across shards and the imbalance (shar
   outliers, `--ts-order`, `--mbps N%`; `--loop-mutate` (lap 0 unchanged, checksums valid, L2
   untouched); link down/up and interface re-creation; the watchdog; `--status`, SIGUSR1; CLI errors,
   SIGINT, a truncated file.
-- `make sanitize`: the unit tests with UBSan; the functional tests also pass with that binary.
+- `make clippy`: lints. Unsafe code is limited to the system interfaces (mmap, the TX ring
+  shared with the kernel, the direct I/O window) and to disjoint parallel writes in the
+  preparation phases; frame parsing and checksum updates are bounds-checked.
 
 ## Results
 
@@ -496,6 +506,11 @@ Laptop (Ryzen 5 7535HS, 12 threads, veth, which also receives on the same CPU):
 | timestamps x1, 0.5 Mpps, 4 threads | lateness p50 14 ns, p99 13 µs |
 | timing at the receiver (x0.5/x1/x2) | interval error p50 ~3 µs, p95 ~10 µs |
 | direct I/O vs page cache, file from NVMe | 22.7 vs 17.2-18.1 Gbit/s |
+
+The Rust version replaced an earlier C implementation of the same design. On the same laptop and
+4 GB file they measure the same: index 0.82 s, `--topspeed` 8 threads 24.5 Gbit/s, `--mbps 10000`
+13.9 s of CPU (user + system) for both, lateness p99 14 us at x2; `--analyze` output is identical
+byte for byte on the test captures, and the index cache files are identical and interchangeable.
 
 Test server (Dell, 12 cores, Broadcom bnxt_en 25G, RHEL 8, consumer NVMe drive), 500 GB capture,
 `--mbps 99% --qdisc-bypass`, 10 IP threads, direct I/O: line rate, about 24.3 Gbit/s of L2 frames
@@ -525,24 +540,27 @@ for hours once the drive was cooled properly (61 °C under load).
 ## Source layout
 
 ```
-src/pcap.[ch]      pcap parsing, mmap
-src/dissect.[ch]   L2/L3/L4 parsing, symmetric flow hash
-src/index.[ch]     index: sequential pass + parallel classification, resolve to shards
-src/idxcache.[ch]  on-disk index cache
-src/sched.[ch]     timeline normalization, schedules, rate profile, radix sort, histogram
-src/par.[ch]       parallel-for over chunks
-src/clock.[ch]     fast clock (TSC or CLOCK_MONOTONIC)
-src/worker.[ch]    sender thread: TX_RING, hot loop, pacing, link outages, wait states
-src/dio.[ch]       direct I/O streaming into a RAM window
-src/stream.[ch]    page-cache streaming: readahead, pre-mapping, drop-behind
-src/therm.[ch]     NVMe temperature and the thermal governor
-src/live.[ch]      long-run statistics
-src/mutate.[ch]    --loop-mutate with incremental checksums
-src/replay.c       thread startup, T0, statistics, status file, watchdog, link monitor, JSON
-src/report.c       --analyze report and pre-start warnings
-src/cli.[ch]       options and --help
-src/main.c         setup: CPUs, MTU, file, index, timeline, rate profile
-tests/             unit tests, reference implementation, pcap generators, functional tests
+src/main.rs        entry point
+src/lib.rs         common definitions (packet index entry, offset/length packing, stop flag)
+src/cli.rs         options and --help
+src/prepare.rs     setup: CPUs, MTU, file, index, timeline, rate profile
+src/pcap.rs        pcap parsing, mmap
+src/dissect.rs     L2/L3/L4 parsing, symmetric flow hash
+src/index.rs       index: sequential pass + parallel classification, resolve to shards
+src/idxcache.rs    on-disk index cache (same format as the C version)
+src/sched.rs       timeline normalization, schedules, rate profile, radix sort, histogram
+src/ref_sched.rs   single-threaded reference of sched.rs for the tests
+src/par.rs         parallel-for over chunks
+src/clock.rs       fast clock (TSC or CLOCK_MONOTONIC)
+src/worker.rs      sender thread: TX_RING, hot loop, pacing, link outages, wait states
+src/dio.rs         direct I/O streaming into a RAM window
+src/stream.rs      page-cache streaming: readahead, pre-mapping, drop-behind
+src/therm.rs       NVMe temperature and the thermal governor
+src/live.rs        long-run statistics
+src/mutate.rs      --loop-mutate with incremental checksums
+src/replay.rs      thread startup, T0, statistics, status file, watchdog, link monitor, JSON
+src/report.rs      --analyze report and pre-start warnings
+tests/             pcap generators, functional tests on veth
 ```
 
 ## Command line reference
