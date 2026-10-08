@@ -417,6 +417,14 @@ replaystorm --status --dpdk ens1f0           # long-run statistics from another 
   and up state. It refuses a NIC whose interface has IP addresses (it may carry the server's
   own connection) and one without an IOMMU group. A NIC that is already on vfio-pci is used
   and left as it is.
+- VFIO gives a device to DPDK only when every device of its IOMMU group is on vfio-pci. The
+  ports of one card often share a group (`ls /sys/bus/pci/devices/PCI/iommu_group/devices`):
+  then `--dpdk-bind` refuses and lists them, and `--dpdk-bind-group` moves the whole group for
+  the run and gives every port back at the end (their interfaces disappear meanwhile; a port
+  with IP addresses is refused). Alternatively the slot/BIOS may put each port in its own group
+  (ACS).
+- After the NIC is given back, the interface first appears as ethN and udev renames it;
+  replaystorm waits for udev before restoring the MTU and the up state.
 - `--dpdk-hugepages SIZE` adds SIZE of 2 MB hugepages on the NIC's NUMA node (compacting memory
   if it is fragmented) and removes them at the end.
 - Both are restored at a normal end, on Ctrl-C/SIGTERM (also while the index is being built),
@@ -699,6 +707,9 @@ Sending:
   --dpdk-bind             move the NIC from its kernel driver
                           to vfio-pci for the run and give it back at the end, with its
                           MTU and up state; refused if the interface has IP addresses
+  --dpdk-bind-group       like --dpdk-bind, and also move the other devices of the NIC's
+                          IOMMU group (usually the other ports of the card), which VFIO
+                          requires when they share one group
   --dpdk-hugepages SIZE   reserve SIZE of 2 MB hugepages (e.g. 4G) on the NIC's NUMA node
                           for the run and release them at the end
 

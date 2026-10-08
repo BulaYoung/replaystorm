@@ -133,7 +133,7 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
         let pci = sys::pci_addr(&want).ok_or_else(|| {
             format!("--dpdk-bind/--dpdk-hugepages need a PCI NIC (interface name or PCI address), not '{}'", want)
         })?;
-        sys::prepare(&pci, o.dpdk_bind, o.dpdk_hugepages)?;
+        sys::prepare(&pci, o.dpdk_bind, o.dpdk_bind_group, o.dpdk_hugepages)?;
     }
 
     let user: Vec<String> = o.eal.as_deref().unwrap_or("").split_whitespace().map(String::from).collect();

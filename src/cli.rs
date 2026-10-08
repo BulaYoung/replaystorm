@@ -101,6 +101,7 @@ pub struct Opts {
     pub eal: Option<String>,  // --eal "ARGS": DPDK EAL arguments
     pub link_from_port: bool, // the link speed was read from the DPDK port
     pub dpdk_bind: bool,      // --dpdk-bind: move the NIC to vfio-pci and back
+    pub dpdk_bind_group: bool, // --dpdk-bind-group: also the rest of its IOMMU group
     pub dpdk_hugepages: u64,  // --dpdk-hugepages: bytes reserved for the run (0 = none)
 }
 
@@ -168,6 +169,7 @@ impl Default for Opts {
             eal: None,
             link_from_port: false,
             dpdk_bind: false,
+            dpdk_bind_group: false,
             dpdk_hugepages: 0,
         }
     }
@@ -232,6 +234,9 @@ Sending:
   --dpdk-bind             move the NIC from its kernel driver
                           to vfio-pci for the run and give it back at the end, with its
                           MTU and up state; refused if the interface has IP addresses
+  --dpdk-bind-group       like --dpdk-bind, and also move the other devices of the NIC's
+                          IOMMU group (usually the other ports of the card), which VFIO
+                          requires when they share one group
   --dpdk-hugepages SIZE   reserve SIZE of 2 MB hugepages (e.g. 4G) on the NIC's NUMA node
                           for the run and release them at the end
 
@@ -343,6 +348,7 @@ const LONG_OPTS: &[(&str, bool)] = &[
     ("dpdk", true),
     ("eal", true),
     ("dpdk-bind", false),
+    ("dpdk-bind-group", false),
     ("dpdk-hugepages", true),
 ];
 
@@ -648,6 +654,10 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, ()> {
             "dpdk" => o.dpdk = Some(v.to_string()),
             "eal" => o.eal = Some(v.to_string()),
             "dpdk-bind" => o.dpdk_bind = true,
+            "dpdk-bind-group" => {
+                o.dpdk_bind = true;
+                o.dpdk_bind_group = true;
+            }
             "dpdk-hugepages" => match parse_size(v) {
                 Some(b) if b >= 2 << 20 => o.dpdk_hugepages = b,
                 _ => return bad("--dpdk-hugepages", v),

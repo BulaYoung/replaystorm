@@ -124,7 +124,7 @@ pub fn resolve(name: &str) -> Result<Option<(String, Option<String>)>, String> {
                 continue;
             }
             let st = State::from_text(&std::fs::read_to_string(e.path()).unwrap_or_default());
-            if st.iface == name && pci_addr(&st.pci).is_some() {
+            if st.devs.iter().any(|d| d.iface == name && d.pci == st.pci) && pci_addr(&st.pci).is_some() {
                 return Ok(Some((st.pci, Some(name.to_string()))));
             }
         }
@@ -132,40 +132,65 @@ pub fn resolve(name: &str) -> Result<Option<(String, Option<String>)>, String> {
     Ok(None)
 }
 
+/// One device moved to vfio-pci, and what to give back.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DevState {
+    pub pci: String,
+    pub driver: String, // original kernel driver
+    pub iface: String,  // its interface ("" if none)
+    pub mtu: u32,
+    pub up: bool,
+}
+
 /// What was changed, to be restored.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct State {
-    pub pci: String,
-    pub driver: String,           // original kernel driver ("" if we did not rebind)
-    pub iface: String,
-    pub mtu: u32,
-    pub up: bool,
-    pub huge_path: String,        // nr_hugepages file ("" if we did not reserve)
+    pub pci: String,           // the --dpdk NIC (names the state file)
+    pub devs: Vec<DevState>,   // devices moved to vfio-pci (the NIC and its IOMMU group)
+    pub huge_path: String,     // nr_hugepages file ("" if we did not reserve)
     pub huge_orig: u64,
 }
 
 impl State {
     fn to_text(&self) -> String {
-        format!(
-            "pci={}\ndriver={}\niface={}\nmtu={}\nup={}\nhuge_path={}\nhuge_orig={}\n",
-            self.pci, self.driver, self.iface, self.mtu, self.up as u8, self.huge_path, self.huge_orig
-        )
+        let mut s = format!("pci={}\n", self.pci);
+        for d in &self.devs {
+            s += &format!("dev={}|{}|{}|{}|{}\n", d.pci, d.driver, d.iface, d.mtu, d.up as u8);
+        }
+        s + &format!("huge_path={}\nhuge_orig={}\n", self.huge_path, self.huge_orig)
     }
 
     fn from_text(s: &str) -> State {
         let mut st = State::default();
+        let mut legacy = DevState::default(); // single-device format of earlier versions
         for line in s.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
             match k {
                 "pci" => st.pci = v.into(),
-                "driver" => st.driver = v.into(),
-                "iface" => st.iface = v.into(),
-                "mtu" => st.mtu = v.parse().unwrap_or(0),
-                "up" => st.up = v == "1",
+                "dev" => {
+                    let f: Vec<&str> = v.split('|').collect();
+                    if f.len() == 5 {
+                        st.devs.push(DevState {
+                            pci: f[0].into(),
+                            driver: f[1].into(),
+                            iface: f[2].into(),
+                            mtu: f[3].parse().unwrap_or(0),
+                            up: f[4] == "1",
+                        });
+                    }
+                }
+                "driver" => legacy.driver = v.into(),
+                "iface" => legacy.iface = v.into(),
+                "mtu" => legacy.mtu = v.parse().unwrap_or(0),
+                "up" => legacy.up = v == "1",
                 "huge_path" => st.huge_path = v.into(),
                 "huge_orig" => st.huge_orig = v.parse().unwrap_or(0),
                 _ => {}
             }
+        }
+        if !legacy.driver.is_empty() {
+            legacy.pci = st.pci.clone();
+            st.devs.push(legacy);
         }
         st
     }
@@ -214,22 +239,71 @@ fn bind_to(pci: &str, driver: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Drivers VFIO accepts next to vfio-pci in one IOMMU group.
+fn vfio_ok(driver: &str) -> bool {
+    matches!(driver, "" | "vfio-pci" | "pci-stub" | "pcieport")
+}
+
+/// The other devices of the NIC's IOMMU group that keep the group from being usable by
+/// VFIO (bound to a driver other than vfio-pci). Typically the other ports of the same card.
+fn group_blockers(pci: &str) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(p(&format!("{}/iommu_group/devices", dev(pci)))) else { return Vec::new() };
+    let mut v: Vec<String> = rd
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|d| d != pci && !vfio_ok(&driver_of(d).unwrap_or_default()))
+        .collect();
+    v.sort();
+    v
+}
+
+/// A device's current state, refusing an interface with IP addresses.
+fn dev_state(pci: &str) -> Result<DevState, String> {
+    let mut d = DevState { pci: pci.to_string(), driver: driver_of(pci).unwrap_or_default(), ..Default::default() };
+    if let Some(iface) = netdev_of(pci) {
+        let addrs = addresses(&iface);
+        if !addrs.is_empty() {
+            return Err(format!(
+                "{} ({}) has addresses {}: it may carry this server's connection. Remove them \
+                 (ip addr flush dev {}) or bind the NIC yourself",
+                iface,
+                pci,
+                addrs.join(", "),
+                iface
+            ));
+        }
+        d.mtu = read(&format!("/sys/class/net/{}/mtu", iface)).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let flags = read(&format!("/sys/class/net/{}/flags", iface)).unwrap_or_default();
+        d.up = u32::from_str_radix(flags.trim_start_matches("0x"), 16).is_ok_and(|f| f & 1 != 0);
+        d.iface = iface;
+    }
+    Ok(d)
+}
+
+fn describe(pci: &str) -> String {
+    let drv = driver_of(pci).unwrap_or_default();
+    match netdev_of(pci) {
+        Some(i) => format!("{} ({}, {})", pci, drv, i),
+        None => format!("{} ({})", pci, drv),
+    }
+}
+
 /// Prepare the system before the EAL starts. pci: the --dpdk port as a PCI address.
-pub fn prepare(pci: &str, bind: bool, huge_bytes: u64) -> Result<(), String> {
+/// bind_group: also move the other devices of its IOMMU group to vfio-pci.
+pub fn prepare(pci: &str, bind: bool, bind_group: bool, huge_bytes: u64) -> Result<(), String> {
     let d = dev(pci);
     if !Path::new(&p(&d)).exists() {
         return Err(format!("PCI device {} not found ({} does not exist)", pci, d));
     }
     let mut st = State { pci: pci.to_string(), ..Default::default() };
 
-    // A previous run that was killed may have left the device on vfio-pci or hugepages
+    // A previous run that was killed may have left devices on vfio-pci or hugepages
     // reserved: restore what it recorded first.
     if let Some(old) = load_state(pci) {
-        log_warn!(
-            "a previous run did not finish cleanly ({}): restoring its changes first",
-            state_path(pci)
-        );
-        let _ = restore_state(&old);
+        log_warn!("a previous run did not finish cleanly ({}): restoring its changes first", state_path(pci));
+        if let Err(e) = restore_state(&old) {
+            log_warn!("restoring the previous run: {}", e);
+        }
     }
 
     if bind {
@@ -237,33 +311,30 @@ pub fn prepare(pci: &str, bind: bool, huge_bytes: u64) -> Result<(), String> {
         if cur == "vfio-pci" || cur == "uio_pci_generic" || cur == "igb_uio" {
             log_info!("DPDK: {} is already bound to {}; it is left so at the end", pci, cur);
         } else {
-            if !Path::new(&p(&format!("{}/iommu_group", d))).exists()
-                && read("/sys/module/vfio/parameters/enable_unsafe_noiommu_mode").as_deref() != Some("Y")
-            {
+            let noiommu = read("/sys/module/vfio/parameters/enable_unsafe_noiommu_mode").as_deref() == Some("Y");
+            if !Path::new(&p(&format!("{}/iommu_group", d))).exists() && !noiommu {
                 return Err(format!(
                     "{} has no IOMMU group: enable the IOMMU (kernel command line intel_iommu=on \
                      iommu=pt, or amd_iommu=on iommu=pt) and reboot",
                     pci
                 ));
             }
-            if let Some(iface) = netdev_of(pci) {
-                let addrs = addresses(&iface);
-                if !addrs.is_empty() {
-                    return Err(format!(
-                        "{} ({}) has addresses {}: it may carry this server's connection. Remove them \
-                         (ip addr flush dev {}) or bind the NIC yourself",
-                        iface,
-                        pci,
-                        addrs.join(", "),
-                        iface
-                    ));
-                }
-                st.iface = iface.clone();
-                st.mtu = read(&format!("/sys/class/net/{}/mtu", iface)).and_then(|s| s.parse().ok()).unwrap_or(0);
-                let flags = read(&format!("/sys/class/net/{}/flags", iface)).unwrap_or_default();
-                st.up = u32::from_str_radix(flags.trim_start_matches("0x"), 16).is_ok_and(|f| f & 1 != 0);
+            // VFIO hands a device out only if every device of its IOMMU group is on vfio-pci
+            // (or unbound). The ports of one card often share a group.
+            let others = group_blockers(pci);
+            if !others.is_empty() && !bind_group {
+                return Err(format!(
+                    "{} shares its IOMMU group with {}: VFIO needs the whole group. Add --dpdk-bind-group to \
+                     move them to vfio-pci for the run as well (their interfaces disappear until the end), \
+                     or put the port in its own group (ACS support in the PCIe slot/BIOS)",
+                    pci,
+                    others.iter().map(|o| describe(o)).collect::<Vec<_>>().join(", ")
+                ));
             }
-            st.driver = cur;
+            st.devs.push(dev_state(pci)?);
+            for o in &others {
+                st.devs.push(dev_state(o)?);
+            }
         }
     }
 
@@ -280,7 +351,7 @@ pub fn prepare(pci: &str, bind: bool, huge_bytes: u64) -> Result<(), String> {
     }
 
     // Record first, then change: a crash in between is restored by the next run.
-    if !st.driver.is_empty() || !st.huge_path.is_empty() {
+    if !st.devs.is_empty() || !st.huge_path.is_empty() {
         save_state(&st)?;
         *RESTORE.lock().unwrap() = Some(st.clone());
     }
@@ -318,60 +389,96 @@ pub fn prepare(pci: &str, bind: bool, huge_bytes: u64) -> Result<(), String> {
         );
     }
 
-    if !st.driver.is_empty() {
+    if !st.devs.is_empty() {
         modprobe_vfio();
-        bind_to(pci, "vfio-pci")?;
-        let now = driver_of(pci).unwrap_or_default();
-        if now != "vfio-pci" && root().is_empty() {
-            return Err(format!("{} could not be bound to vfio-pci (driver now: {})", pci, if now.is_empty() { "none" } else { &now }));
+        for dv in &st.devs {
+            bind_to(&dv.pci, "vfio-pci")?;
+            let now = driver_of(&dv.pci).unwrap_or_default();
+            if now != "vfio-pci" && root().is_empty() {
+                return Err(format!(
+                    "{} could not be bound to vfio-pci (driver now: {})",
+                    dv.pci,
+                    if now.is_empty() { "none" } else { &now }
+                ));
+            }
+            log_info!(
+                "DPDK: {} moved from {}{} to vfio-pci{}; it goes back at the end",
+                dv.pci,
+                dv.driver,
+                if dv.iface.is_empty() { String::new() } else { format!(" (interface {})", dv.iface) },
+                if dv.pci == pci { "" } else { " (same IOMMU group)" }
+            );
         }
-        log_info!(
-            "DPDK: {} moved from {}{} to vfio-pci; it goes back at the end",
-            pci,
-            st.driver,
-            if st.iface.is_empty() { String::new() } else { format!(" (interface {})", st.iface) }
-        );
     }
     Ok(())
 }
 
+/// Wait for udev: a NIC given back to its driver appears as ethN first and is renamed to
+/// its predictable name a moment later.
+fn settle_netdev(d: &DevState) -> Option<String> {
+    if !root().is_empty() {
+        return netdev_of(&d.pci);
+    }
+    let _ = Command::new("udevadm").args(["settle", "-t", "10"]).status();
+    let mut name = None;
+    for _ in 0..100 {
+        name = netdev_of(&d.pci);
+        if name.as_deref() == Some(d.iface.as_str()) {
+            break;
+        }
+        sleep_ns(100 * crate::NS_PER_MS);
+    }
+    name
+}
+
+fn restore_iface(d: &DevState) -> Result<(), String> {
+    if d.iface.is_empty() {
+        return Ok(());
+    }
+    if !root().is_empty() {
+        return Ok(()); // fake tree: no interfaces to configure
+    }
+    let mut last = String::new();
+    for _ in 0..3 {
+        let Some(i) = settle_netdev(d) else {
+            last = format!("{} is bound to {} but no interface appeared", d.pci, d.driver);
+            continue;
+        };
+        let mut args = vec!["link".to_string(), "set".into(), "dev".into(), i.clone()];
+        if d.mtu > 0 {
+            args.extend(["mtu".into(), d.mtu.to_string()]);
+        }
+        if d.up {
+            args.push("up".into());
+        }
+        if matches!(Command::new("ip").args(&args).status(), Ok(s) if s.success()) {
+            log_info!("DPDK: {} is back on {} as {}{}", d.pci, d.driver, i, if d.up { ", up" } else { "" });
+            return Ok(());
+        }
+        last = format!("ip {} failed", args.join(" "));
+    }
+    Err(last)
+}
+
 fn restore_state(st: &State) -> Result<(), String> {
     let mut errs = Vec::new();
-    if !st.driver.is_empty() {
-        let res = (|| -> Result<(), String> {
-            bind_to(&st.pci, &st.driver)?;
-            write(&format!("{}/driver_override", dev(&st.pci)), "\n")?;
-            Ok(())
-        })();
-        if let Err(e) = res {
+    // Give every device back to its driver first, then configure the interfaces.
+    let mut rebound = Vec::new();
+    for d in &st.devs {
+        // Already back on its driver (e.g. restored by hand): only the interface is left.
+        if d.driver.is_empty() || (driver_of(&d.pci).as_deref() == Some(d.driver.as_str()) && root().is_empty()) {
+            rebound.push(d);
+            continue;
+        }
+        let res = bind_to(&d.pci, &d.driver).and_then(|_| write(&format!("{}/driver_override", dev(&d.pci)), "\n"));
+        match res {
+            Ok(()) => rebound.push(d),
+            Err(e) => errs.push(e),
+        }
+    }
+    for d in rebound {
+        if let Err(e) = restore_iface(d) {
             errs.push(e);
-        } else if root().is_empty() {
-            // The interface comes back under its predictable name; restore MTU and state.
-            let mut iface = None;
-            for _ in 0..50 {
-                iface = netdev_of(&st.pci);
-                if iface.is_some() {
-                    break;
-                }
-                sleep_ns(100 * crate::NS_PER_MS);
-            }
-            match iface {
-                Some(i) => {
-                    let mut args = vec!["link".to_string(), "set".into(), "dev".into(), i.clone()];
-                    if st.mtu > 0 {
-                        args.extend(["mtu".into(), st.mtu.to_string()]);
-                    }
-                    if st.up {
-                        args.push("up".into());
-                    }
-                    if !matches!(Command::new("ip").args(&args).status(), Ok(s) if s.success()) {
-                        errs.push(format!("ip {} failed", args.join(" ")));
-                    } else {
-                        log_info!("DPDK: {} is back on {} as {}{}", st.pci, st.driver, i, if st.up { ", up" } else { "" });
-                    }
-                }
-                None => errs.push(format!("{} is bound to {} but no interface appeared", st.pci, st.driver)),
-            }
         }
     }
     if !st.huge_path.is_empty() {
@@ -425,9 +532,14 @@ mod tests {
 
     #[test]
     fn state_text() {
-        let s = State { pci: "0000:3b:00.0".into(), driver: "bnxt_en".into(), iface: "ens1f0".into(), mtu: 9000, up: true,
+        let dv = |pci: &str, iface: &str| DevState { pci: pci.into(), driver: "bnxt_en".into(), iface: iface.into(), mtu: 9000, up: true };
+        let s = State { pci: "0000:3b:00.0".into(), devs: vec![dv("0000:3b:00.0", "ens1f0"), dv("0000:3b:00.1", "")],
                         huge_path: "/sys/x/nr_hugepages".into(), huge_orig: 3 };
         assert_eq!(State::from_text(&s.to_text()), s);
+        // the single-device format of the previous version
+        let old = State::from_text("pci=0000:01:00.3\ndriver=bnxt_en\niface=eth9\nmtu=1500\nup=1\nhuge_path=/h\nhuge_orig=0\n");
+        assert_eq!(old.devs, vec![DevState { pci: "0000:01:00.3".into(), driver: "bnxt_en".into(), iface: "eth9".into(), mtu: 1500, up: true }]);
+        assert_eq!(old.huge_path, "/h");
     }
 
     /// Bind, reserve and restore on a fake sysfs tree.
@@ -443,7 +555,7 @@ mod tests {
         mk("/sys/bus/pci/drivers/bnxt_en");
         mk("/sys/bus/pci/drivers/vfio-pci");
         mk(&format!("/sys/bus/pci/devices/{}/net/ens1f0", pci));
-        mk(&format!("/sys/bus/pci/devices/{}/iommu_group", pci));
+        mk(&format!("/sys/bus/pci/devices/{}/iommu_group/devices/{}", pci, pci));
         mk(&format!("/sys/bus/pci/devices/{}/driver", pci));
         put(&format!("/sys/bus/pci/devices/{}/numa_node", pci), "1\n");
         mk("/sys/class/net/ens1f0");
@@ -459,14 +571,14 @@ mod tests {
 
         // an interface with addresses is refused
         put("/sys/class/net/ens1f0/test_addresses", "10.0.0.5\n");
-        assert!(prepare(pci, true, 0).unwrap_err().contains("10.0.0.5"));
+        assert!(prepare(pci, true, false, 0).unwrap_err().contains("10.0.0.5"));
         std::fs::remove_file(r.join("sys/class/net/ens1f0/test_addresses")).unwrap();
 
         // the interface name leads to the PCI address
         symlink(r.join(format!("sys/bus/pci/devices/{}", pci)), r.join("sys/class/net/ens1f0/device")).unwrap();
         assert_eq!(resolve("ens1f0").unwrap(), Some((pci.to_string(), Some("ens1f0".to_string()))));
 
-        prepare(pci, true, 1 << 30).unwrap();
+        prepare(pci, true, false, 1 << 30).unwrap();
         // the interface is gone while the NIC is on vfio-pci: found through the state file
         std::fs::remove_dir_all(r.join("sys/class/net/ens1f0")).unwrap();
         assert_eq!(resolve("ens1f0").unwrap(), Some((pci.to_string(), Some("ens1f0".to_string()))));
@@ -474,8 +586,9 @@ mod tests {
         put("/sys/class/net/ens1f0/mtu", "9000\n");
         put("/sys/class/net/ens1f0/flags", "0x1003\n");
         let st = State::from_text(&read(&state_path(pci)).unwrap());
-        assert_eq!(st.driver, "bnxt_en");
-        assert_eq!((st.iface.as_str(), st.mtu, st.up), ("ens1f0", 9000, true));
+        assert_eq!(st.devs.len(), 1);
+        assert_eq!(st.devs[0].driver, "bnxt_en");
+        assert_eq!((st.devs[0].iface.as_str(), st.devs[0].mtu, st.devs[0].up), ("ens1f0", 9000, true));
         assert_eq!(st.huge_orig, 4);
         assert_eq!(read(huge).unwrap(), "516"); // 4 + 512 pages of 2 MB
         assert_eq!(read(&format!("/sys/bus/pci/devices/{}/driver_override", pci)).unwrap(), "vfio-pci");
@@ -488,8 +601,28 @@ mod tests {
         // a state file left by a killed run is restored by the next one
         save_state(&State { pci: pci.into(), huge_path: huge.into(), huge_orig: 2, ..Default::default() }).unwrap();
         put(huge, "100\n");
-        prepare(pci, false, 0).unwrap();
+        prepare(pci, false, false, 0).unwrap();
         assert_eq!(read(huge).unwrap(), "2");
+        assert!(read(&state_path(pci)).is_none());
+
+        // Another port of the card in the same IOMMU group, on bnxt_en: refused without
+        // --dpdk-bind-group, moved and given back with it.
+        let pci2 = "0000:3b:00.1";
+        mk(&format!("/sys/bus/pci/devices/{}/net/ens1f1", pci2));
+        symlink(r.join("sys/bus/pci/drivers/bnxt_en"), r.join(format!("sys/bus/pci/devices/{}/driver", pci2))).unwrap();
+        mk(&format!("/sys/bus/pci/devices/{}/iommu_group/devices/{}", pci, pci2));
+        mk("/sys/class/net/ens1f1");
+        put("/sys/class/net/ens1f1/mtu", "1500\n");
+        put("/sys/class/net/ens1f1/flags", "0x1002\n");
+        let e = prepare(pci, true, false, 0).unwrap_err();
+        assert!(e.contains(pci2) && e.contains("ens1f1") && e.contains("--dpdk-bind-group"), "{}", e);
+        prepare(pci, true, true, 0).unwrap();
+        let st = State::from_text(&read(&state_path(pci)).unwrap());
+        assert_eq!(st.devs.iter().map(|d| d.pci.as_str()).collect::<Vec<_>>(), vec![pci, pci2]);
+        assert_eq!((st.devs[1].iface.as_str(), st.devs[1].mtu, st.devs[1].up), ("ens1f1", 1500, false));
+        assert_eq!(read(&format!("/sys/bus/pci/devices/{}/driver_override", pci2)).unwrap(), "vfio-pci");
+        restore();
+        assert_eq!(read(&format!("/sys/bus/pci/devices/{}/driver_override", pci2)).unwrap(), "");
         assert!(read(&state_path(pci)).is_none());
         std::env::remove_var("RS_SYSFS_ROOT");
         let _ = std::fs::remove_dir_all(&r);
