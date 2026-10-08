@@ -426,6 +426,11 @@ replaystorm --status --dpdk ens1f0           # long-run statistics from another 
   group (another PCIe root port) or ACS in the BIOS, or the kernel path (`-i`) is used.
 - After the NIC is given back, the interface first appears as ethN and udev renames it;
   replaystorm waits for udev before restoring the MTU and the up state.
+- Mellanox/NVIDIA ConnectX (mlx5) works differently: the DPDK mlx5 driver runs next to the
+  kernel driver `mlx5_core` (needs `rdma-core`), the interface stays in the system, and VFIO
+  and IOMMU groups do not matter. `--dpdk-bind` leaves such a NIC alone. With the IOMMU in
+  translation mode (`intel_iommu=on` without `iommu=pt`) the NIC can only reach the memory
+  registered for it.
 - `--dpdk-hugepages SIZE` adds SIZE of 2 MB hugepages on the NIC's NUMA node (compacting memory
   if it is fragmented) and removes them at the end.
 - Both are restored at a normal end, on Ctrl-C/SIGTERM (also while the index is being built),

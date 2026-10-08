@@ -327,6 +327,10 @@ pub fn prepare(pci: &str, bind: bool, bind_group: bool, huge_bytes: u64) -> Resu
         let cur = driver_of(pci).unwrap_or_default();
         if cur == "vfio-pci" || cur == "uio_pci_generic" || cur == "igb_uio" {
             log_info!("DPDK: {} is already bound to {}; it is left so at the end", pci, cur);
+        } else if cur == "mlx5_core" {
+            // The mlx5 driver of DPDK works through the kernel driver (and the IOMMU mappings
+            // the kernel makes); on vfio-pci it would not find the NIC at all.
+            log_info!("DPDK: {} is a Mellanox/NVIDIA NIC (mlx5_core): it works next to its kernel driver, not moved", pci);
         } else {
             let noiommu = read("/sys/module/vfio/parameters/enable_unsafe_noiommu_mode").as_deref() == Some("Y");
             if !Path::new(&p(&format!("{}/iommu_group", d))).exists() && !noiommu {
@@ -659,6 +663,15 @@ mod tests {
         restore();
         assert_eq!(read(&format!("/sys/bus/pci/devices/{}/driver_override", pci2)).unwrap(), "");
         assert!(read(&state_path(pci)).is_none());
+
+        // A Mellanox NIC stays on mlx5_core: nothing is moved or recorded.
+        let mlx = "0000:5e:00.0";
+        mk("/sys/bus/pci/drivers/mlx5_core");
+        mk(&format!("/sys/bus/pci/devices/{}", mlx));
+        symlink(r.join("sys/bus/pci/drivers/mlx5_core"), r.join(format!("sys/bus/pci/devices/{}/driver", mlx))).unwrap();
+        prepare(mlx, true, true, 0).unwrap();
+        assert!(read(&format!("/sys/bus/pci/devices/{}/driver_override", mlx)).is_none());
+        assert!(read(&state_path(mlx)).is_none());
 
         // An NVMe drive in the same group: never moved, even with --dpdk-bind-group.
         let nvme = "0000:02:00.0";
