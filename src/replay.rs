@@ -54,10 +54,13 @@ struct LinkState {
 /// the schedule must not run on: when it comes back, T0 is shifted by the outage so the
 /// replay continues where it was instead of bursting to catch up.
 fn link_check(ls: &mut LinkState, ws: &[WorkerShared], iface: &str, sh: &Shared, now: i64) {
-    let mut down = match sysfs_read_str(iface, "operstate") {
-        Some(st) => st != "up" && st != "unknown",
-        // sysfs works but the interface is gone (driver reload, re-creation)
-        None => std::path::Path::new("/sys/class/net/lo").exists(),
+    let mut down = match crate::dpdk::port() {
+        Some(p) => crate::dpdk::link(p.port).is_some_and(|(_, up)| !up),
+        None => match sysfs_read_str(iface, "operstate") {
+            Some(st) => st != "up" && st != "unknown",
+            // sysfs works but the interface is gone (driver reload, re-creation)
+            None => std::path::Path::new("/sys/class/net/lo").exists(),
+        },
     };
     if !down {
         down = ws.iter().any(|w| !w.st.finished.load(RLX) && w.st.state.load(RLX) as usize == W_LINK);
@@ -238,7 +241,11 @@ fn take_snap(ws: &[WorkerShared], iface: &str, io: &Io) -> Snap {
         s.disk_temp = t.temp.load(RLX);
         s.throttle = t.throttle.load(RLX);
     }
-    match (sysfs_read_u64(iface, "statistics/tx_packets"), sysfs_read_u64(iface, "statistics/tx_dropped")) {
+    let counters = match crate::dpdk::port() {
+        Some(p) => crate::dpdk::stats(p.port).map(|(a, b)| (Some(a), Some(b))).unwrap_or((None, None)),
+        None => (sysfs_read_u64(iface, "statistics/tx_packets"), sysfs_read_u64(iface, "statistics/tx_dropped")),
+    };
+    match counters {
         (Some(a), Some(b)) => {
             s.sys_tx = a;
             s.sys_drop = b;
@@ -247,6 +254,31 @@ fn take_snap(ws: &[WorkerShared], iface: &str, io: &Io) -> Snap {
         _ => s.sys_ok = false,
     }
     s
+}
+
+/// Where the "sent" and "dropped" counters come from (sysfs of the interface, or the DPDK port).
+fn sent_src() -> &'static str {
+    if crate::dpdk::port().is_some() {
+        "port"
+    } else {
+        "sysfs"
+    }
+}
+
+fn drop_short() -> &'static str {
+    if crate::dpdk::port().is_some() {
+        "oerrors"
+    } else {
+        "tx_dropped"
+    }
+}
+
+fn drop_name() -> &'static str {
+    if crate::dpdk::port().is_some() {
+        "port oerrors"
+    } else {
+        "interface tx_dropped"
+    }
 }
 
 /* ---------- Long-run statistics on request ---------- */
@@ -295,7 +327,7 @@ fn status_text(x: &Status, cur: &Snap, start: &Snap, since_t0: i64, finished: bo
     let _ = writeln!(
         b,
         "replaystorm on {}, pid {}: {} for {} (started {}, now {})",
-        x.c.o.iface.as_deref().unwrap_or(""),
+        x.c.o.label(),
         std::process::id(),
         if finished { "finished after running" } else { "running" },
         fmt_dur(since_t0 as f64 / 1e9),
@@ -374,7 +406,7 @@ fn status_text(x: &Status, cur: &Snap, start: &Snap, since_t0: i64, finished: bo
         cur.enobufs
     );
     if cur.sys_ok && start.sys_ok {
-        let _ = write!(b, "; interface tx_dropped +{}", cur.sys_drop.wrapping_sub(start.sys_drop));
+        let _ = write!(b, "; {} +{}", drop_name(), cur.sys_drop.wrapping_sub(start.sys_drop));
     }
     b += "\n";
     let down_ns = x.link.down_ns + if x.link.since != 0 { now_ns() - x.link.since } else { 0 };
@@ -427,10 +459,11 @@ fn status_files(pattern: &str) -> Vec<String> {
 
 /// --status: print the live status of a running replaystorm. Returns the exit code.
 pub fn status_query(o: &Opts) -> i32 {
-    let path = match (&o.status_file, &o.iface) {
-        (Some(f), _) => f.clone(),
-        (None, Some(i)) => format!("/tmp/replaystorm-{}.status", i),
-        _ => "/tmp/replaystorm-*.status".to_string(),
+    let label = o.label();
+    let path = match &o.status_file {
+        Some(f) => f.clone(),
+        None if !label.is_empty() => format!("/tmp/replaystorm-{}.status", label),
+        None => "/tmp/replaystorm-*.status".to_string(),
     };
     let files = status_files(&path);
     if files.is_empty() {
@@ -476,7 +509,7 @@ fn json_open(c: &Ctx, nw: usize) -> Option<File> {
         f,
         "{{\n  \"file\": \"{}\",\n  \"interface\": \"{}\",\n  \"mode\": \"{}\",\n  \"multiplier\": {},\n  \"mbps\": {},\n  \"pps\": {},\n  \"loops\": {},\n  \"threads\": {},\n  \"ip_shards\": {},\n  \"timeline_ns\": {},\n  \"lap_ns\": {},\n  \"intervals\": [",
         file,
-        o.iface.as_deref().unwrap_or(""),
+        o.label(),
         o.mode.name(),
         fmt_g(c.mult, 9),
         fmt_g(o.mbps, 9),
@@ -570,9 +603,9 @@ fn print_row(r: &Row, c: &Ctx, dio_on: bool, link_down: bool) {
         format!("{:.3}", r.pkts as f64 / r.dt / 1e6)
     );
     if r.sys_ok {
-        s += &format!(" | sent (sysfs) {:.3} Mpps, tx_dropped +{}", r.sys_tx as f64 / r.dt / 1e6, r.sys_drop);
+        s += &format!(" | sent ({}) {:.3} Mpps, {} +{}", sent_src(), r.sys_tx as f64 / r.dt / 1e6, drop_short(), r.sys_drop);
     } else {
-        s += " | sysfs unavailable";
+        s += if crate::dpdk::port().is_some() { " | port counters unavailable" } else { " | sysfs unavailable" };
     }
     s += &format!(" | ENOBUFS +{} EAGAIN +{}", r.enobufs, r.eagain);
     if dio_on {
@@ -674,7 +707,8 @@ fn print_summary(x: &Summary, end: &Snap, start: &Snap, elapsed: f64, json: Opti
     let mpps = if elapsed > 0.0 { pkts as f64 / elapsed / 1e6 } else { 0.0 };
     println!("\n=== Summary{} ===", if stopped { " (stopped by signal)" } else { "" });
     println!(
-        "Sent to kernel: {} packets ({}), {} bytes in {:.3} s: {:.3} Gbit/s, {:.3} Mpps",
+        "Sent to {}: {} packets ({}), {} bytes in {:.3} s: {:.3} Gbit/s, {:.3} Mpps",
+        if crate::dpdk::port().is_some() { "the port" } else { "kernel" },
         pkts,
         fmt_count(pkts as f64),
         bytes,
@@ -685,18 +719,23 @@ fn print_summary(x: &Summary, end: &Snap, start: &Snap, elapsed: f64, json: Opti
     if end.sys_ok && start.sys_ok {
         let d = end.sys_tx.wrapping_sub(start.sys_tx);
         println!(
-            "Sent per sysfs tx_packets: {} ({:+.0} vs sent; other traffic on the interface is counted too), tx_dropped: +{}",
+            "Sent per {}: {} ({:+.0} vs sent; other traffic on the {} is counted too), {}: +{}",
+            if crate::dpdk::port().is_some() { "port counters (opackets)" } else { "sysfs tx_packets" },
             d,
             d as f64 - pkts as f64,
+            if crate::dpdk::port().is_some() { "port" } else { "interface" },
+            drop_short(),
             end.sys_drop.wrapping_sub(start.sys_drop)
         );
     } else {
-        println!("Interface statistics unavailable in sysfs");
+        println!("{}", if crate::dpdk::port().is_some() { "Port statistics unavailable" } else { "Interface statistics unavailable in sysfs" });
     }
     println!(
-        "send(): {} calls ({:.1} frames per call), ENOBUFS: {}, EAGAIN: {}",
+        "{}: {} calls ({:.1} frames per call), {}: {}, EAGAIN: {}",
+        if crate::dpdk::port().is_some() { "rte_eth_tx_burst()" } else { "send()" },
         end.sends,
         if end.sends > 0 { pkts as f64 / end.sends as f64 } else { 0.0 },
+        if crate::dpdk::port().is_some() { "TX queue full" } else { "ENOBUFS" },
         end.enobufs,
         end.eagain
     );
@@ -845,20 +884,40 @@ fn print_plan(c: &Ctx, ws: &[WorkerShared]) {
         }
         cpus += &w.cpu.to_string();
     }
-    log_info!(
-        "Interface {}, MTU {}, link {} ({}); {} threads (CPU {}{}), qdisc-bypass {}, packet-loss {}, batch {}, ring {} frames",
-        o.iface.as_deref().unwrap_or(""),
-        c.mtu,
-        if c.link_bps > 0.0 { fmt_bps(c.link_bps) } else { "?".into() },
-        c.link_src,
-        ws.len(),
-        cpus,
-        if c.cpus_from_numa { ", NIC NUMA node" } else { "" },
-        if o.qdisc_bypass { "on" } else { "off" },
-        if o.packet_loss { "on" } else { "off" },
-        o.batch,
-        o.ring_frames
-    );
+    let link = if c.link_bps > 0.0 { fmt_bps(c.link_bps) } else { "?".into() };
+    let numa = if c.cpus_from_numa { ", NIC NUMA node" } else { "" };
+    if let Some(p) = crate::dpdk::port() {
+        log_info!(
+            "DPDK port {} {} ({}), MTU {}, link {} ({}); {} threads (CPU {}{}), one TX queue each, batch {}, \
+             {} TX descriptors per queue",
+            p.port,
+            p.name,
+            p.driver,
+            c.mtu,
+            link,
+            c.link_src,
+            ws.len(),
+            cpus,
+            numa,
+            o.batch,
+            p.nb_desc
+        );
+    } else {
+        log_info!(
+            "Interface {}, MTU {}, link {} ({}); {} threads (CPU {}{}), qdisc-bypass {}, packet-loss {}, batch {}, ring {} frames",
+            o.iface.as_deref().unwrap_or(""),
+            c.mtu,
+            link,
+            c.link_src,
+            ws.len(),
+            cpus,
+            numa,
+            if o.qdisc_bypass { "on" } else { "off" },
+            if o.packet_loss { "on" } else { "off" },
+            o.batch,
+            o.ring_frames
+        );
+    }
     if o.loops == 0 {
         log_info!("Loops: infinite (until SIGINT/SIGTERM)");
     } else if o.loops > 1 {
@@ -887,7 +946,7 @@ pub fn run(c: &mut Ctx) -> i32 {
     let ixlock = RwLock::new(std::mem::take(&mut c.ix));
     let c: &Ctx = c;
     let o = &c.o;
-    let iface = o.iface.clone().unwrap_or_default();
+    let iface = o.label();
     let (shard_pkts, ixst) = {
         let ix = ixlock.read().unwrap();
         (ix.shard_pkts.clone(), ix.st)
@@ -1141,8 +1200,11 @@ pub fn run(c: &mut Ctx) -> i32 {
             let _ = std::thread::Builder::new().name("rs-stdin".into()).spawn(stdin_main);
         }
         log_info!(
-            "Long-run statistics: press Enter here, or from another terminal: replaystorm --status -i {} (file {}), or kill -USR1 {}",
-            iface,
+            "Long-run statistics: press Enter here, or from another terminal: replaystorm --status {} (file {}), or kill -USR1 {}",
+            match &o.dpdk {
+                Some(p) => format!("--dpdk {}", p),
+                None => format!("-i {}", iface),
+            },
             status_path,
             std::process::id()
         );

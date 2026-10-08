@@ -11,7 +11,8 @@ large captures (hundreds of GB) at 25 Gbit/s and beyond, on machines with many b
   NVMe temperature monitoring and a thermal governor.
 - Built for runs that last days or weeks: endless looping with new sessions on every lap,
   surviving link outages, a watchdog, and long-run statistics you can query at any time.
-- Only `AF_PACKET`: no DPDK, AF_XDP, netmap or libpcap. Rust, the only dependency is `libc`.
+- `AF_PACKET` by default; optionally DPDK (`--dpdk`, built with `make dpdk`). Rust, the only
+  dependency is `libc` (plus DPDK for the DPDK build).
 
 Contents: [Building](#building) · [Recipes](#recipes) · [How it works](#how-it-works) ·
 [Rate modes](#rate-modes) · [Timestamp replay](#timestamp-replay) ·
@@ -19,7 +20,7 @@ Contents: [Building](#building) · [Recipes](#recipes) · [How it works](#how-it
 [Files larger than RAM](#files-larger-than-ram) · [Long runs](#long-runs) ·
 [Statistics](#statistics) · [Tuning the sender](#tuning-the-sender) ·
 [Checking the receiver](#checking-the-receiver) · [Realism of the load](#realism-of-the-load) ·
-[Analysis mode](#analysis-mode) · [Input files](#input-files) · [Tests](#tests) ·
+[DPDK backend](#dpdk-backend) · [Analysis mode](#analysis-mode) · [Input files](#input-files) · [Tests](#tests) ·
 [Results](#results) · [Known limitations](#known-limitations) · [Source layout](#source-layout) ·
 [Command line reference](#command-line-reference)
 
@@ -36,6 +37,7 @@ make static         # a fully static binary (musl) that runs on any x86_64 Linux
 make unit-test      # cargo test --release
 make test           # unit tests + test pcap generation + functional tests on veth
 make clippy         # lints
+make dpdk           # with the DPDK backend (see DPDK backend)
 sudo install -m 755 replaystorm /usr/local/bin/
 ```
 
@@ -376,6 +378,60 @@ position falling behind: the peak exceeds the link, not enough cores, the disk o
 keep up. A functional test showed that the lateness replaystorm reports matches the interval error
 measured at the receiver to within a few microseconds.
 
+## DPDK backend
+
+With `--dpdk PORT` frames are sent by a DPDK poll-mode driver instead of the kernel: no skb,
+no qdisc, no TX completion interrupts. The kernel path spends ~80% of the CPU per packet; DPDK
+removes it, which matters for small packets and for 100G. Everything else is the same (index,
+sharding, schedules, mutation, direct I/O, statistics); each sender thread gets its own TX
+queue and mbuf pool, frames are copied into mbufs and sent with `rte_eth_tx_burst` in batches,
+a full TX queue is backpressure and the thread retries.
+
+Build (needs DPDK with pkg-config, e.g. `dnf install dpdk dpdk-devel dpdk-tools numactl-devel`):
+
+```sh
+make dpdk           # cargo build --release --features dpdk
+make dpdk-test      # DPDK functional tests through the af_packet driver on veth
+```
+
+A normal `make` builds without DPDK; such a binary rejects `--dpdk` with a hint.
+
+Preparing the server (example: RHEL 8, Broadcom bnxt):
+
+```sh
+# kernel command line: intel_iommu=on iommu=pt (AMD: amd_iommu=on iommu=pt), reboot
+dpdk-hugepages.py -p 1G --setup 8G          # or -p 2M
+modprobe vfio-pci
+dpdk-devbind.py -s                           # find the NIC's PCI address
+dpdk-devbind.py -b vfio-pci 0000:3b:00.0     # the interface disappears from the kernel
+```
+
+Running:
+
+```sh
+replaystorm --dpdk 0000:3b:00.0 --eal "-a 0000:3b:00.0" --mbps 99% --loop 0 \
+  --loop-mutate ip,port --cpus 1-11 --index-cache /var/tmp/big.rsidx big.pcap
+replaystorm --status --dpdk 0000:3b:00.0     # long-run statistics from another terminal
+dpdk-devbind.py -b bnxt_en 0000:3b:00.0      # give the NIC back to the kernel afterwards
+```
+
+- `PORT` is a PCI address, a virtual device name or a port number. `--eal` passes EAL
+  arguments; replaystorm adds `-l <first CPU>` (the EAL's main lcore; the sender threads pin
+  themselves), `--in-memory` (`--no-shconf` with `--no-huge`) and `--log-level=5` unless given.
+- The link speed and MTU come from the port; without `-t` the thread count is limited to the
+  port's TX queues. The CPUs default to the port's NUMA node.
+- Statistics: "sent (port)" and `oerrors` come from the port counters (`rte_eth_stats`)
+  instead of sysfs; the ENOBUFS column counts `rte_eth_tx_burst` calls that found the TX
+  queue full. Link down pauses the schedule as with the kernel path.
+- `--qdisc-bypass`, `--packet-loss` and `--ring-frames` above 4096 do not apply; `--ring-frames`
+  sets the TX descriptors per queue (up to the driver's limit).
+- Without a NIC, for tests: `--dpdk net_af_packet0 --eal "--no-huge --no-pci
+  --vdev=net_af_packet0,iface=veth0,qpairs=8"` sends through an ordinary interface;
+  `net_null0` discards frames and shows the program's own ceiling: 44.8 Gbit/s / 6.2 Mpps from
+  one thread on the laptop (AF_PACKET: 4.7 Gbit/s per thread).
+- Tested with DPDK 24.11 (shared libraries, drivers loaded from the plugin directory); the API
+  used exists since DPDK 21.11.
+
 ## Tuning the sender
 
 Most of the CPU time is spent in the kernel and the NIC driver, so these settings matter:
@@ -554,6 +610,7 @@ src/par.rs         parallel-for over chunks
 src/clock.rs       fast clock (TSC or CLOCK_MONOTONIC)
 src/worker.rs      sender thread: TX_RING, hot loop, pacing, link outages, wait states
 src/dio.rs         direct I/O streaming into a RAM window
+src/dpdk/          DPDK backend: mod.rs (EAL, port, TX queues), shim.c (C layer over DPDK inlines)
 src/stream.rs      page-cache streaming: readahead, pre-mapping, drop-behind
 src/therm.rs       NVMe temperature and the thermal governor
 src/live.rs        long-run statistics
@@ -617,6 +674,11 @@ Sending:
   --packet-loss           PACKET_LOSS: kernel silently skips malformed frames
   --link-speed X          link speed (25G, 10000M); default from ethtool
   --mtu N                 MTU (default from the interface, 1500 for --analyze)
+  --dpdk PORT             send through DPDK instead of AF_PACKET (binary built with
+                          make dpdk): PORT is a PCI address (0000:3b:00.0), a virtual
+                          device name or a port number; replaces -i
+  --eal "ARGS"            DPDK EAL arguments, e.g. "-a 0000:3b:00.0" or
+                          "--no-huge --vdev=net_af_packet0,iface=eth1,qpairs=12"
 
 Input:
   --preload               load the whole file into memory before start
@@ -651,6 +713,7 @@ Output:
   --status-file F         live status file, rewritten every second (default
                           /tmp/replaystorm-IF.status)
   --status [-i IF]        print the live status of a running replaystorm and exit
+                          (--status --dpdk PORT for a DPDK replay)
   -q, --quiet             do not print per-second statistics
   -h, --help              this help
 
@@ -666,6 +729,7 @@ Examples:
   replaystorm -i ens1f0 --duration 10m --stats-json run.json big.pcap
   replaystorm -i ens1f0 --loop 5 --loop-mutate ip,port big.pcap
   replaystorm -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap
+  replaystorm --dpdk 0000:3b:00.0 --eal "-a 0000:3b:00.0" --mbps 99% --loop 0 big.pcap
 
 While running: press Enter (or s) for long-run statistics: minimum, worst minute,
 percentiles, averages; r resets them, q stops; kill -USR1 PID prints them too.

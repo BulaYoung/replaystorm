@@ -73,7 +73,7 @@ pub fn prepare(mut o: Opts) -> Result<Ctx, i32> {
         mtu = 1500;
     }
     let mut link_bps = o.link_speed_bps;
-    let mut link_src = "--link-speed";
+    let mut link_src = if o.link_from_port { "DPDK port" } else { "--link-speed" };
     if link_bps <= 0.0 {
         if let Some(b) = o.iface.as_deref().and_then(iface_speed) {
             link_bps = b;

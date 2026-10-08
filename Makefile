@@ -4,7 +4,7 @@ CARGO ?= $(shell command -v cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
 BUILD := build
 MUSL  := x86_64-unknown-linux-musl
 
-.PHONY: all replaystorm static clean test unit-test func-test pcaps clippy
+.PHONY: all replaystorm static dpdk dpdk-test clean test unit-test func-test pcaps clippy
 
 all: replaystorm
 
@@ -17,6 +17,15 @@ replaystorm:
 static:
 	$(CARGO) build --release --target $(MUSL)
 	cp target/$(MUSL)/release/replaystorm replaystorm
+
+# With the DPDK backend (--dpdk): needs DPDK with pkg-config (dpdk-devel).
+dpdk:
+	$(CARGO) build --release --features dpdk
+	cp target/release/replaystorm replaystorm
+
+# DPDK tests through the af_packet driver on veth (no NIC, no hugepages needed).
+dpdk-test: dpdk pcaps
+	tests/func_veth.sh $(BUILD)/pcaps --dpdk
 
 unit-test:
 	$(CARGO) test --release

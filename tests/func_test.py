@@ -444,6 +444,85 @@ def t_mutate(pcaps):
     check(l2_ok, "MAC addresses on changed laps are the same")
 
 
+DPDK_PORT = "net_af_packet0"
+
+
+def dpdk_args(qpairs=8):
+    # The DPDK af_packet driver sends through the veth: the same receiver checks the frames.
+    return ["--dpdk", DPDK_PORT, "--eal",
+            "--no-huge --no-pci -m 512 --vdev=%s,iface=%s,qpairs=%d" % (DPDK_PORT, TX, qpairs)]
+
+
+def replay_dpdk(pcap, extra, json_path=None, qpairs=8):
+    rx = Receiver(RX)
+    args = dpdk_args(qpairs) + ["-q"] + extra
+    if json_path:
+        args += ["--stats-json", json_path]
+    rc, out = run_afr(args + [pcap])
+    frames = rx.finish()
+    js = None
+    if json_path and os.path.exists(json_path):
+        with open(json_path) as f:
+            js = json.load(f)
+    return rc, out, frames, js
+
+
+def t_dpdk(pcaps, spin):
+    print("== DPDK backend (--dpdk through the af_packet driver): frames byte for byte")
+    for name, extra in (("l2mix.pcap", ["--pps", "3000", "-t", "3"]),
+                        ("l2mix_ns_be.pcap", ["--topspeed", "-t", "2"]),
+                        ("l2mix.pcap", ["--mbps", "20", "-t", "4", "--ts-order", "sort", "--io", "direct", "--loop", "2"])):
+        p = os.path.join(pcaps, name)
+        rc, out, frames, js = replay_dpdk(p, extra, "/tmp/afr_func.json")
+        check(rc == 0, "dpdk %s %s: exit code 0 (%d)" % (name, " ".join(extra), rc))
+        if rc:
+            print(out)
+        laps = 2 if "--loop" in extra else 1
+        compare_frames(expected_frames(p) * laps, [f for _, f in frames], "dpdk " + name)
+        n = len(expected_frames(p)) * laps
+        check(js and js["summary"].get("sys_tx_packets") == n,
+              "dpdk %s: port counters report %d frames sent" % (name, n))
+    p = os.path.join(pcaps, "raw_ip.pcap")
+    sm, dm = "02:aa:bb:cc:dd:01", "02:aa:bb:cc:dd:02"
+    rc, out, frames, _ = replay_dpdk(p, ["--pps", "2000", "--smac", sm, "--dmac", dm])
+    compare_frames(expected_frames(p, smac=sm, dmac=dm), [f for _, f in frames], "dpdk raw_ip")
+
+    print("== DPDK: --loop-mutate checksums")
+    p = os.path.join(pcaps, "l2mix.pcap")
+    rc, out, frames, _ = replay_dpdk(p, ["--loop", "3", "--pps", "20000", "-t", "1", "--loop-mutate", "ip,port"])
+    got = [f for _, f in frames]
+    bad = [f for f in got if ip_l4_sums_ok(f) is False]
+    checked = [f for f in got if ip_l4_sums_ok(f) is True]
+    check(rc == 0 and len(got) == 3 * len(expected_frames(p)), "dpdk mutate: 3 laps (%d frames)" % len(got))
+    check(not bad and checked, "dpdk mutate: checksums correct (%d frames, %d errors)" % (len(checked), len(bad)))
+
+    print("== DPDK: timestamp-based timing x1")
+    p = os.path.join(pcaps, "timing.pcap")
+    rc, out, frames, js = replay_dpdk(p, ["--multiplier", "1", "-t", "3", "--spin-us", str(spin)], "/tmp/afr_func.json")
+    n, errs, real, want = timing_errors(p, frames, 1.0)
+    p95 = errs[int(len(errs) * 0.95)]
+    print("      dpdk x1: packets %d, |error| p50 %.1f us, p95 %.1f us; duration %.4f s (expected %.4f s)"
+          % (n, errs[len(errs) // 2] / 1e3, p95 / 1e3, real / 1e9, want / 1e9))
+    check(rc == 0 and n == 300, "dpdk x1: all 300 packets received")
+    check(p95 < TOL_P95, "dpdk x1: p95 interval error < %d us" % (TOL_P95 // 1000))
+    check(abs(real - want) < 0.002 * want + 300_000, "dpdk x1: total duration matches (±0.2%)")
+
+    print("== DPDK: status and errors")
+    p = os.path.join(pcaps, "timing.pcap")
+    proc = subprocess.Popen([BIN] + dpdk_args() + ["-q", "--multiplier", "0.2", p],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    time.sleep(3)
+    rc, st = run_afr(["--status", "--dpdk", DPDK_PORT])
+    check(rc == 0 and "running for" in st and "dpdk-" + DPDK_PORT in st, "--status --dpdk shows the running replay")
+    proc.send_signal(signal.SIGINT)
+    out = proc.communicate(timeout=30)[0].decode()
+    check(proc.returncode == 0 and "Summary" in out, "dpdk: SIGINT gives the summary and code 0")
+    rc, out = run_afr(dpdk_args()[:2] + ["--eal", "--no-huge --no-pci -m 256", p])
+    check(rc == 1 and "no DPDK ports" in out, "dpdk: no ports -> code 1 and a hint (%d)" % rc)
+    rc, out = run_afr(["-i", TX, "--dpdk", DPDK_PORT, p])
+    check(rc == 2, "-i together with --dpdk: code 2")
+
+
 def t_cli(pcaps):
     print("== CLI and errors")
     rc, out = run_afr(["--analyze", os.path.join(pcaps, "fake.pcapng")])
@@ -538,12 +617,15 @@ def main():
     ap.add_argument("--tol-p95-us", type=int, default=100)
     ap.add_argument("--tol-max-us", type=int, default=1000)
     ap.add_argument("--only", default="")
+    ap.add_argument("--dpdk", action="store_true", help="the binary has DPDK support: test --dpdk only")
     a = ap.parse_args()
     BIN, TX, RX = os.path.abspath(a.bin), a.tx, a.rx
     TOL_P95, TOL_MAX = a.tol_p95_us * 1000, a.tol_max_us * 1000
     tests = {"bytes": lambda: t_bytes(a.pcaps), "timing": lambda: t_timing(a.pcaps, a.spin_us),
              "mutate": lambda: t_mutate(a.pcaps), "cli": lambda: t_cli(a.pcaps),
              "robust": lambda: t_robust(a.pcaps)}
+    if a.dpdk:
+        tests = {"dpdk": lambda: t_dpdk(a.pcaps, a.spin_us)}
     for name, fn in tests.items():
         if not a.only or name in a.only.split(","):
             fn()

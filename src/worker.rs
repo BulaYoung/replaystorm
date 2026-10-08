@@ -3,6 +3,7 @@
 use crate::cli::{LagPolicy, Mode};
 use crate::clock;
 use crate::dio::{Dio, DIO_CHUNK, DIO_CHUNK_SHIFT};
+use crate::dpdk::TxQueue;
 use crate::index::PktIndex;
 use crate::mutate::{mutate, MutateCfg};
 use crate::prepare::Ctx;
@@ -273,6 +274,7 @@ struct Worker<'a> {
     dio_buf: *const u8,
     pk: Vec<Pkt>,
     tx: TxRing,
+    dq: Option<TxQueue>, // DPDK TX queue instead of the TX ring
     // hot state (thread only)
     head: usize,
     pending: u32,
@@ -420,8 +422,76 @@ impl<'a> Worker<'a> {
         self.pending = 0;
     }
 
+    /// DPDK: rte_eth_tx_burst until the NIC has taken every pending frame. A full TX queue
+    /// is backpressure, like ENOBUFS: back off and retry.
+    fn flush_dpdk(&mut self) {
+        self.pending = 0;
+        let mut fails = 0;
+        let (mut prev, mut t0, mut state) = (W_RUN, 0, W_RUN);
+        loop {
+            self.l_sends += 1;
+            let dq = self.dq.as_mut().unwrap();
+            dq.tx();
+            if dq.pending() == 0 {
+                break;
+            }
+            self.l_enobufs += 1;
+            let want = if self.sh.down_since.load(RLX) != 0 { W_LINK } else { W_QUEUE };
+            if state != want {
+                self.wleave(state, prev, t0);
+                let (t, p) = self.wenter(want);
+                t0 = t;
+                prev = p;
+                state = if t0 != 0 { want } else { W_RUN };
+            }
+            if stop_requested() {
+                break; // the frames left are freed with the queue
+            }
+            fails += 1;
+            backoff(fails);
+        }
+        self.wleave(state, prev, t0);
+        self.publish();
+        self.now = clock::clock_ns();
+    }
+
+    /// DPDK: a free mbuf. When the pool is empty, all mbufs are queued in the NIC: send
+    /// what is pending and let the driver return the completed ones.
+    fn acquire_mbuf(&mut self) -> Option<*mut libc::c_void> {
+        if let Some(m) = self.dq.as_mut().unwrap().alloc() {
+            return Some(m);
+        }
+        let (t0, prev) = self.wenter(W_RING);
+        let mut spins = 0u32;
+        loop {
+            if stop_requested() {
+                self.wleave(W_RING, prev, t0);
+                return None;
+            }
+            if self.pending > 0 {
+                self.flush();
+            } else {
+                let dq = self.dq.as_mut().unwrap();
+                dq.cleanup();
+            }
+            if let Some(m) = self.dq.as_mut().unwrap().alloc() {
+                self.wleave(W_RING, prev, t0);
+                return Some(m);
+            }
+            spins += 1;
+            if spins > 64 {
+                sleep_ns(10_000);
+            } else {
+                cpu_relax();
+            }
+        }
+    }
+
     /// Batched send(): the kernel transmits all frames with status SEND_REQUEST.
     fn flush(&mut self) {
+        if self.dq.is_some() {
+            return self.flush_dpdk();
+        }
         let mut fails = 0;
         self.pending = 0;
         let mut prev = W_RUN;
@@ -547,6 +617,13 @@ impl<'a> Worker<'a> {
 
     /// Wait until all ring frames have been sent (no longer than timeout).
     fn drain(&mut self, timeout: i64) {
+        if self.dq.is_some() {
+            if self.dq.as_ref().unwrap().pending() > 0 {
+                self.flush();
+            }
+            self.publish();
+            return;
+        }
         if self.tx.ring.is_null() {
             return;
         }
@@ -628,13 +705,19 @@ impl<'a> Worker<'a> {
     #[inline(always)]
     fn emit(&mut self, p: Pkt, lap: u64) -> bool {
         let Some(src) = self.pkt_data(p, lap) else { return false };
-        let Some(h) = self.acquire() else { return false };
         let o = &self.c.o;
         let raw_ip = self.c.pf.raw_ip;
         let len = offlen_len(p.offlen) as usize;
-        let mut flen = len;
+        let flen = len + if raw_ip != 0 { 14 } else { 0 };
+        // Destination: a TX ring frame, or a DPDK mbuf.
+        let (h, m, dst) = if self.dq.is_some() {
+            let Some(m) = self.acquire_mbuf() else { return false };
+            (std::ptr::null_mut(), m, unsafe { self.dq.as_ref().unwrap().data(m, flen as u32) })
+        } else {
+            let Some(h) = self.acquire() else { return false };
+            (h, std::ptr::null_mut(), unsafe { (h as *mut u8).add(self.tx.data_off) })
+        };
         unsafe {
-            let dst = (h as *mut u8).add(self.tx.data_off);
             if raw_ip != 0 {
                 // Synthetic Ethernet header for RAW IP.
                 std::ptr::copy_nonoverlapping(o.dmac.as_ptr(), dst, 6);
@@ -643,17 +726,22 @@ impl<'a> Worker<'a> {
                 *dst.add(12) = if v6 { 0x86 } else { 0x08 };
                 *dst.add(13) = if v6 { 0xdd } else { 0x00 };
                 std::ptr::copy_nonoverlapping(src, dst.add(14), len);
-                flen += 14;
             } else {
                 std::ptr::copy_nonoverlapping(src, dst, len);
             }
             if self.mutate && lap > 0 {
                 mutate(std::slice::from_raw_parts_mut(dst, flen), lap, &self.mut_cfg);
             }
-            (*h).tp_len = flen as u32;
-            (*(h as *const AtomicU32)).store(libc::TP_STATUS_SEND_REQUEST, Ordering::Release);
         }
-        self.head = if self.head + 1 == self.tx.frame_nr { 0 } else { self.head + 1 };
+        if let Some(dq) = self.dq.as_mut() {
+            dq.push(m);
+        } else {
+            unsafe {
+                (*h).tp_len = flen as u32;
+                (*(h as *const AtomicU32)).store(libc::TP_STATUS_SEND_REQUEST, Ordering::Release);
+            }
+            self.head = if self.head + 1 == self.tx.frame_nr { 0 } else { self.head + 1 };
+        }
         self.pending += 1;
         self.l_pkts += 1;
         self.l_bytes += flen as u64;
@@ -875,7 +963,17 @@ pub fn worker_main<'a, 'd: 'a>(c: &'a Ctx, ix: &RwLock<PktIndex>, me: &'a Worker
     };
     let ring_len = ring_frame_len(c, max_frame);
     let mut ok = true;
-    let tx = match TxRing::open(o.iface.as_deref().unwrap_or(""), o.ring_frames as usize, ring_len, o.qdisc_bypass, o.packet_loss) {
+    // DPDK: queue number = this thread's position among the sender threads.
+    let dq = crate::dpdk::port().map(|p| {
+        let q = all.iter().position(|w| std::ptr::eq(w, me)).unwrap_or(0);
+        TxQueue::new(p.port, q as u16, o.batch as usize)
+    });
+    let tx = if dq.is_some() {
+        Ok(TxRing::closed())
+    } else {
+        TxRing::open(o.iface.as_deref().unwrap_or(""), o.ring_frames as usize, ring_len, o.qdisc_bypass, o.packet_loss)
+    };
+    let tx = match tx {
         Ok(t) => t,
         Err(e) => {
             *me.err.lock().unwrap() = format!("thread {}: {}", me.id, e);
@@ -908,6 +1006,7 @@ pub fn worker_main<'a, 'd: 'a>(c: &'a Ctx, ix: &RwLock<PktIndex>, me: &'a Worker
         dio_buf: std::ptr::null(),
         pk,
         tx,
+        dq,
         head: 0,
         pending: 0,
         now: 0,

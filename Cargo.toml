@@ -2,10 +2,18 @@
 name = "replaystorm"
 version = "1.0.0"
 edition = "2021"
-description = "Multithreaded pcap replayer over AF_PACKET preserving L2"
+description = "Multithreaded pcap replayer over AF_PACKET (and optionally DPDK) preserving L2"
+build = "build.rs"
 
 [dependencies]
 libc = "0.2"
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[features]
+# DPDK sending backend (--dpdk): needs DPDK with pkg-config (dpdk-devel). make dpdk
+dpdk = ["dep:cc"]
 
 [lib]
 path = "src/lib.rs"

@@ -21,6 +21,7 @@ pub mod cli;
 pub mod clock;
 pub mod dio;
 pub mod dissect;
+pub mod dpdk;
 pub mod idxcache;
 pub mod index;
 pub mod live;

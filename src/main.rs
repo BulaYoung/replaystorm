@@ -13,6 +13,13 @@ fn main() {
     if o.status_query {
         std::process::exit(replay::status_query(&o));
     }
+    let mut o = o;
+    if o.dpdk.is_some() && !o.analyze {
+        if let Err(e) = replaystorm::dpdk::init(&mut o) {
+            replaystorm::util::log_err_str(&e);
+            std::process::exit(1);
+        }
+    }
     let analyze = o.analyze;
     let rc = match prepare::prepare(o) {
         Err(rc) => rc,
@@ -25,5 +32,6 @@ fn main() {
             }
         }
     };
+    replaystorm::dpdk::shutdown();
     std::process::exit(rc);
 }

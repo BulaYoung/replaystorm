@@ -96,6 +96,21 @@ pub struct Opts {
     pub mutate_port: bool,
     pub mutate_ip_offset: u32, // host byte order
     pub mutate_port_step: u32,
+
+    pub dpdk: Option<String>, // --dpdk PORT: send through DPDK instead of AF_PACKET
+    pub eal: Option<String>,  // --eal "ARGS": DPDK EAL arguments
+    pub link_from_port: bool, // the link speed was read from the DPDK port
+}
+
+impl Opts {
+    /// Name of the output: the interface, or the DPDK port (status file name, logs).
+    pub fn label(&self) -> String {
+        match (&self.iface, &self.dpdk) {
+            (Some(i), _) => i.clone(),
+            (None, Some(p)) => format!("dpdk-{}", p.replace('/', "_")),
+            _ => String::new(),
+        }
+    }
 }
 
 impl Default for Opts {
@@ -147,6 +162,9 @@ impl Default for Opts {
             mutate_port: false,
             mutate_ip_offset: 0x0001_0000,
             mutate_port_step: 1,
+            dpdk: None,
+            eal: None,
+            link_from_port: false,
         }
     }
 }
@@ -201,6 +219,11 @@ Sending:
   --packet-loss           PACKET_LOSS: kernel silently skips malformed frames
   --link-speed X          link speed (25G, 10000M); default from ethtool
   --mtu N                 MTU (default from the interface, 1500 for --analyze)
+  --dpdk PORT             send through DPDK instead of AF_PACKET (binary built with
+                          make dpdk): PORT is a PCI address (0000:3b:00.0), a virtual
+                          device name or a port number; replaces -i
+  --eal \"ARGS\"            DPDK EAL arguments, e.g. \"-a 0000:3b:00.0\" or
+                          \"--no-huge --vdev=net_af_packet0,iface=eth1,qpairs=12\"
 
 Input:
   --preload               load the whole file into memory before start
@@ -235,6 +258,7 @@ Output:
   --status-file F         live status file, rewritten every second (default
                           /tmp/replaystorm-IF.status)
   --status [-i IF]        print the live status of a running replaystorm and exit
+                          (--status --dpdk PORT for a DPDK replay)
   -q, --quiet             do not print per-second statistics
   -h, --help              this help
 
@@ -250,6 +274,7 @@ Examples:
   replaystorm -i ens1f0 --duration 10m --stats-json run.json big.pcap
   replaystorm -i ens1f0 --loop 5 --loop-mutate ip,port big.pcap
   replaystorm -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap
+  replaystorm --dpdk 0000:3b:00.0 --eal \"-a 0000:3b:00.0\" --mbps 99% --loop 0 big.pcap
 
 While running: press Enter (or s) for long-run statistics: minimum, worst minute,
 percentiles, averages; r resets them, q stops; kill -USR1 PID prints them too.
@@ -304,6 +329,8 @@ const LONG_OPTS: &[(&str, bool)] = &[
     ("loop-mutate", true),
     ("mutate-ip-offset", true),
     ("mutate-port-step", true),
+    ("dpdk", true),
+    ("eal", true),
 ];
 
 /// Short options: (letter, long name, takes an argument).
@@ -605,6 +632,8 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, ()> {
                 Some(u) if u > 0 && u < 64512 => o.mutate_port_step = u as u32,
                 _ => return bad("--mutate-port-step", v),
             },
+            "dpdk" => o.dpdk = Some(v.to_string()),
+            "eal" => o.eal = Some(v.to_string()),
             _ => unreachable!(),
         }
     }
@@ -625,8 +654,16 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, ()> {
         return Err(());
     }
     o.file = positional.remove(0);
-    if !o.analyze && o.iface.is_none() {
-        log_err!("no interface given (-i), or use --analyze");
+    if o.iface.is_some() && o.dpdk.is_some() {
+        log_err!("-i and --dpdk are mutually exclusive: --dpdk sends through a DPDK port instead of an interface");
+        return Err(());
+    }
+    if o.eal.is_some() && o.dpdk.is_none() {
+        log_err!("--eal needs --dpdk PORT");
+        return Err(());
+    }
+    if !o.analyze && o.iface.is_none() && o.dpdk.is_none() {
+        log_err!("no interface given (-i), or use --dpdk PORT or --analyze");
         return Err(());
     }
     set_quiet(o.quiet);
