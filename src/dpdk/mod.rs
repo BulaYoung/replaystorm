@@ -99,7 +99,28 @@ fn port_cpus(name: &str, socket: i32, allowed: &libc::cpu_set_t) -> Vec<i32> {
 #[cfg(feature = "dpdk")]
 pub fn init(o: &mut Opts) -> Result<(), String> {
     use std::ffi::CString;
-    let want = o.dpdk.clone().unwrap();
+    let given = o.dpdk.clone().unwrap();
+    // An interface name is turned into the NIC's PCI address (DPDK knows no interface names).
+    let resolved = sys::resolve(&given)?;
+    let want = match &resolved {
+        Some((pci, Some(iface))) => {
+            let drv = sys::driver_of(pci).unwrap_or_default();
+            log_info!("DPDK: interface {} is the NIC {}{}", iface, pci, if drv.is_empty() { String::new() } else { format!(" (driver {})", drv) });
+            // Only vfio/uio drivers (and mlx5, which works next to its kernel driver) are
+            // usable by DPDK.
+            let usable = matches!(drv.as_str(), "vfio-pci" | "uio_pci_generic" | "igb_uio" | "mlx5_core");
+            if !usable && !o.dpdk_bind {
+                return Err(format!(
+                    "{} ({}) is driven by the kernel ({}): add --dpdk-bind to move it to vfio-pci for the run, \
+                     or bind it yourself (dpdk-devbind.py -b vfio-pci {})",
+                    iface, pci, drv, pci
+                ));
+            }
+            pci.clone()
+        }
+        Some((pci, None)) => pci.clone(),
+        None => given.clone(),
+    };
     // The EAL pins the calling thread to its main lcore; the replay's own threads choose
     // their CPUs themselves, so the original mask is restored afterwards.
     let mut allowed: libc::cpu_set_t = unsafe { std::mem::zeroed() };
@@ -110,7 +131,7 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
     // --dpdk-bind / --dpdk-hugepages: prepare the system; restored by shutdown().
     if o.dpdk_bind || o.dpdk_hugepages > 0 {
         let pci = sys::pci_addr(&want).ok_or_else(|| {
-            format!("--dpdk-bind/--dpdk-hugepages need the port as a PCI address (0000:3b:00.0), not '{}'", want)
+            format!("--dpdk-bind/--dpdk-hugepages need a PCI NIC (interface name or PCI address), not '{}'", want)
         })?;
         sys::prepare(&pci, o.dpdk_bind, o.dpdk_hugepages)?;
     }
@@ -118,6 +139,11 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
     let user: Vec<String> = o.eal.as_deref().unwrap_or("").split_whitespace().map(String::from).collect();
     let has = |opts: &[&str]| user.iter().any(|a| opts.iter().any(|o| a == o || a.starts_with(&format!("{}=", o))));
     let mut args = vec!["replaystorm".to_string()];
+    // Probe only this NIC (otherwise the EAL takes every device bound to vfio-pci).
+    if resolved.is_some() && !has(&["-a", "--allow", "-b", "--block", "--no-pci"]) {
+        args.push("-a".into());
+        args.push(want.clone());
+    }
     if !has(&["-l", "--lcores", "-c"]) {
         args.push("-l".into());
         args.push(first_cpu.to_string());

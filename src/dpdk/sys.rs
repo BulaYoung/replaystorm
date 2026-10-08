@@ -102,6 +102,36 @@ fn addresses(iface: &str) -> Vec<String> {
     out
 }
 
+/// The PCI address behind --dpdk: given as is, found from an interface name, or (when
+/// the interface is gone because a previous run left the NIC on vfio-pci) from the state
+/// file of that run. None: not a PCI NIC (a virtual device name or a port number).
+pub fn resolve(name: &str) -> Result<Option<(String, Option<String>)>, String> {
+    if let Some(pci) = pci_addr(name) {
+        return Ok(Some((pci, None)));
+    }
+    if Path::new(&p(&format!("/sys/class/net/{}", name))).exists() {
+        let link = std::fs::read_link(p(&format!("/sys/class/net/{}/device", name)))
+            .map_err(|_| format!("{} is not a PCI network card (no device in sysfs)", name))?;
+        let base = link.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let pci = pci_addr(&base).ok_or_else(|| format!("{} is not a PCI network card ({})", name, base))?;
+        return Ok(Some((pci, Some(name.to_string()))));
+    }
+    for dir in ["/run", "/tmp"] {
+        let Ok(rd) = std::fs::read_dir(p(dir)) else { continue };
+        for e in rd.flatten() {
+            let f = e.file_name().to_string_lossy().into_owned();
+            if !(f.starts_with("replaystorm-dpdk-") && f.ends_with(".state")) {
+                continue;
+            }
+            let st = State::from_text(&std::fs::read_to_string(e.path()).unwrap_or_default());
+            if st.iface == name && pci_addr(&st.pci).is_some() {
+                return Ok(Some((st.pci, Some(name.to_string()))));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// What was changed, to be restored.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct State {
@@ -384,6 +414,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_names() {
+        assert_eq!(resolve("0000:3b:00.0").unwrap(), Some(("0000:3b:00.0".into(), None)));
+        assert_eq!(resolve("no_such_if_xyz").unwrap(), None);
+        // lo exists but is not a PCI device
+        if root().is_empty() && Path::new("/sys/class/net/lo").exists() {
+            assert!(resolve("lo").is_err());
+        }
+    }
+
+    #[test]
     fn state_text() {
         let s = State { pci: "0000:3b:00.0".into(), driver: "bnxt_en".into(), iface: "ens1f0".into(), mtu: 9000, up: true,
                         huge_path: "/sys/x/nr_hugepages".into(), huge_orig: 3 };
@@ -422,7 +462,17 @@ mod tests {
         assert!(prepare(pci, true, 0).unwrap_err().contains("10.0.0.5"));
         std::fs::remove_file(r.join("sys/class/net/ens1f0/test_addresses")).unwrap();
 
+        // the interface name leads to the PCI address
+        symlink(r.join(format!("sys/bus/pci/devices/{}", pci)), r.join("sys/class/net/ens1f0/device")).unwrap();
+        assert_eq!(resolve("ens1f0").unwrap(), Some((pci.to_string(), Some("ens1f0".to_string()))));
+
         prepare(pci, true, 1 << 30).unwrap();
+        // the interface is gone while the NIC is on vfio-pci: found through the state file
+        std::fs::remove_dir_all(r.join("sys/class/net/ens1f0")).unwrap();
+        assert_eq!(resolve("ens1f0").unwrap(), Some((pci.to_string(), Some("ens1f0".to_string()))));
+        mk("/sys/class/net/ens1f0");
+        put("/sys/class/net/ens1f0/mtu", "9000\n");
+        put("/sys/class/net/ens1f0/flags", "0x1003\n");
         let st = State::from_text(&read(&state_path(pci)).unwrap());
         assert_eq!(st.driver, "bnxt_en");
         assert_eq!((st.iface.as_str(), st.mtu, st.up), ("ens1f0", 9000, true));

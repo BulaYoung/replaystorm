@@ -400,7 +400,6 @@ Preparing the server (example: RHEL 8, Broadcom bnxt):
 
 ```sh
 # kernel command line: intel_iommu=on iommu=pt (AMD: amd_iommu=on iommu=pt), reboot
-dpdk-devbind.py -s                           # find the NIC's PCI address
 ```
 
 The NIC and the hugepages can be prepared by hand (`dpdk-hugepages.py -p 1G --setup 8G`,
@@ -408,9 +407,9 @@ The NIC and the hugepages can be prepared by hand (`dpdk-hugepages.py -p 1G --se
 the kernel until it is bound back), or by replaystorm for the time of the run:
 
 ```sh
-replaystorm --dpdk 0000:3b:00.0 --dpdk-bind --dpdk-hugepages 4G --mbps 99% --loop 0 \
+replaystorm --dpdk ens1f0 --dpdk-bind --dpdk-hugepages 4G --mbps 99% --loop 0 \
   --loop-mutate ip,port --cpus 1-11 --index-cache /var/tmp/big.rsidx big.pcap
-replaystorm --status --dpdk 0000:3b:00.0     # long-run statistics from another terminal
+replaystorm --status --dpdk ens1f0           # long-run statistics from another terminal
 ```
 
 - `--dpdk-bind` moves the NIC from its kernel driver to `vfio-pci` (loading the module if
@@ -428,7 +427,11 @@ replaystorm --status --dpdk 0000:3b:00.0     # long-run statistics from another 
   `dpdk-hugepages.py`) and replaystorm leaves them as they are; it always stops and closes the
   port and releases the EAL memory at the end.
 
-- `PORT` is a PCI address, a virtual device name or a port number. `--eal` passes EAL
+- `PORT` is the NIC's interface name (its PCI address is found in sysfs; while the NIC is on
+  vfio-pci after a killed run, from the state file), a PCI address, a virtual device name or
+  a port number. For a NIC given by interface or PCI address, `-a PCI` is added to the EAL
+  arguments so that only this NIC is probed. A NIC still on its kernel driver needs
+  `--dpdk-bind` (except mlx5, which works next to its kernel driver). `--eal` passes EAL
   arguments; replaystorm adds `-l <first CPU>` (the EAL's main lcore; the sender threads pin
   themselves), `--in-memory` (`--no-shconf` with `--no-huge`) and `--log-level=5` unless given.
 - The link speed and MTU come from the port; without `-t` the thread count is limited to the
@@ -688,11 +691,12 @@ Sending:
   --link-speed X          link speed (25G, 10000M); default from ethtool
   --mtu N                 MTU (default from the interface, 1500 for --analyze)
   --dpdk PORT             send through DPDK instead of AF_PACKET (binary built with
-                          make dpdk): PORT is a PCI address (0000:3b:00.0), a virtual
-                          device name or a port number; replaces -i
+                          make dpdk): PORT is the NIC's interface name (ens1f0) or PCI
+                          address (0000:3b:00.0), a virtual device name or a port
+                          number; replaces -i
   --eal "ARGS"            DPDK EAL arguments, e.g. "-a 0000:3b:00.0" or
                           "--no-huge --vdev=net_af_packet0,iface=eth1,qpairs=12"
-  --dpdk-bind             move the NIC (PORT is its PCI address) from its kernel driver
+  --dpdk-bind             move the NIC from its kernel driver
                           to vfio-pci for the run and give it back at the end, with its
                           MTU and up state; refused if the interface has IP addresses
   --dpdk-hugepages SIZE   reserve SIZE of 2 MB hugepages (e.g. 4G) on the NIC's NUMA node
@@ -748,7 +752,7 @@ Examples:
   replaystorm -i ens1f0 --loop 5 --loop-mutate ip,port big.pcap
   replaystorm -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap
   replaystorm --dpdk 0000:3b:00.0 --eal "-a 0000:3b:00.0" --mbps 99% --loop 0 big.pcap
-  replaystorm --dpdk 0000:3b:00.0 --dpdk-bind --dpdk-hugepages 4G --mbps 99% big.pcap
+  replaystorm --dpdk ens1f0 --dpdk-bind --dpdk-hugepages 4G --mbps 99% big.pcap
 
 While running: press Enter (or s) for long-run statistics: minimum, worst minute,
 percentiles, averages; r resets them, q stops; kill -USR1 PID prints them too.

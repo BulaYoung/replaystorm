@@ -224,11 +224,12 @@ Sending:
   --link-speed X          link speed (25G, 10000M); default from ethtool
   --mtu N                 MTU (default from the interface, 1500 for --analyze)
   --dpdk PORT             send through DPDK instead of AF_PACKET (binary built with
-                          make dpdk): PORT is a PCI address (0000:3b:00.0), a virtual
-                          device name or a port number; replaces -i
+                          make dpdk): PORT is the NIC's interface name (ens1f0) or PCI
+                          address (0000:3b:00.0), a virtual device name or a port
+                          number; replaces -i
   --eal \"ARGS\"            DPDK EAL arguments, e.g. \"-a 0000:3b:00.0\" or
                           \"--no-huge --vdev=net_af_packet0,iface=eth1,qpairs=12\"
-  --dpdk-bind             move the NIC (PORT is its PCI address) from its kernel driver
+  --dpdk-bind             move the NIC from its kernel driver
                           to vfio-pci for the run and give it back at the end, with its
                           MTU and up state; refused if the interface has IP addresses
   --dpdk-hugepages SIZE   reserve SIZE of 2 MB hugepages (e.g. 4G) on the NIC's NUMA node
@@ -284,7 +285,7 @@ Examples:
   replaystorm -i ens1f0 --loop 5 --loop-mutate ip,port big.pcap
   replaystorm -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap
   replaystorm --dpdk 0000:3b:00.0 --eal \"-a 0000:3b:00.0\" --mbps 99% --loop 0 big.pcap
-  replaystorm --dpdk 0000:3b:00.0 --dpdk-bind --dpdk-hugepages 4G --mbps 99% big.pcap
+  replaystorm --dpdk ens1f0 --dpdk-bind --dpdk-hugepages 4G --mbps 99% big.pcap
 
 While running: press Enter (or s) for long-run statistics: minimum, worst minute,
 percentiles, averages; r resets them, q stops; kill -USR1 PID prints them too.
