@@ -400,20 +400,33 @@ Preparing the server (example: RHEL 8, Broadcom bnxt):
 
 ```sh
 # kernel command line: intel_iommu=on iommu=pt (AMD: amd_iommu=on iommu=pt), reboot
-dpdk-hugepages.py -p 1G --setup 8G          # or -p 2M
-modprobe vfio-pci
 dpdk-devbind.py -s                           # find the NIC's PCI address
-dpdk-devbind.py -b vfio-pci 0000:3b:00.0     # the interface disappears from the kernel
 ```
 
-Running:
+The NIC and the hugepages can be prepared by hand (`dpdk-hugepages.py -p 1G --setup 8G`,
+`modprobe vfio-pci`, `dpdk-devbind.py -b vfio-pci 0000:3b:00.0`; the interface disappears from
+the kernel until it is bound back), or by replaystorm for the time of the run:
 
 ```sh
-replaystorm --dpdk 0000:3b:00.0 --eal "-a 0000:3b:00.0" --mbps 99% --loop 0 \
+replaystorm --dpdk 0000:3b:00.0 --dpdk-bind --dpdk-hugepages 4G --mbps 99% --loop 0 \
   --loop-mutate ip,port --cpus 1-11 --index-cache /var/tmp/big.rsidx big.pcap
 replaystorm --status --dpdk 0000:3b:00.0     # long-run statistics from another terminal
-dpdk-devbind.py -b bnxt_en 0000:3b:00.0      # give the NIC back to the kernel afterwards
 ```
+
+- `--dpdk-bind` moves the NIC from its kernel driver to `vfio-pci` (loading the module if
+  needed) and at the end binds it back to the same driver and restores the interface's MTU
+  and up state. It refuses a NIC whose interface has IP addresses (it may carry the server's
+  own connection) and one without an IOMMU group. A NIC that is already on vfio-pci is used
+  and left as it is.
+- `--dpdk-hugepages SIZE` adds SIZE of 2 MB hugepages on the NIC's NUMA node (compacting memory
+  if it is fragmented) and removes them at the end.
+- Both are restored at a normal end, on Ctrl-C/SIGTERM (also while the index is being built),
+  on `q` and on errors. The change is recorded in `/run/replaystorm-dpdk-PCI.state` before it
+  is made: if the process is killed (`kill -9`), the next run with `--dpdk-bind` or
+  `--dpdk-hugepages` restores it first. Both need root.
+- Without these options the NIC and hugepages are managed by hand (`dpdk-devbind.py`,
+  `dpdk-hugepages.py`) and replaystorm leaves them as they are; it always stops and closes the
+  port and releases the EAL memory at the end.
 
 - `PORT` is a PCI address, a virtual device name or a port number. `--eal` passes EAL
   arguments; replaystorm adds `-l <first CPU>` (the EAL's main lcore; the sender threads pin
@@ -679,6 +692,11 @@ Sending:
                           device name or a port number; replaces -i
   --eal "ARGS"            DPDK EAL arguments, e.g. "-a 0000:3b:00.0" or
                           "--no-huge --vdev=net_af_packet0,iface=eth1,qpairs=12"
+  --dpdk-bind             move the NIC (PORT is its PCI address) from its kernel driver
+                          to vfio-pci for the run and give it back at the end, with its
+                          MTU and up state; refused if the interface has IP addresses
+  --dpdk-hugepages SIZE   reserve SIZE of 2 MB hugepages (e.g. 4G) on the NIC's NUMA node
+                          for the run and release them at the end
 
 Input:
   --preload               load the whole file into memory before start
@@ -730,6 +748,7 @@ Examples:
   replaystorm -i ens1f0 --loop 5 --loop-mutate ip,port big.pcap
   replaystorm -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap
   replaystorm --dpdk 0000:3b:00.0 --eal "-a 0000:3b:00.0" --mbps 99% --loop 0 big.pcap
+  replaystorm --dpdk 0000:3b:00.0 --dpdk-bind --dpdk-hugepages 4G --mbps 99% big.pcap
 
 While running: press Enter (or s) for long-run statistics: minimum, worst minute,
 percentiles, averages; r resets them, q stops; kill -USR1 PID prints them too.

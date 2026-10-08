@@ -130,6 +130,10 @@ pub fn prepare(mut o: Opts) -> Result<Ctx, i32> {
         Some(i) => i,
         None => {
             let i = index::build(&pf, &icfg).map_err(|e| {
+                if crate::stop_requested() {
+                    log_info!("Stopped before the start");
+                    return 0;
+                }
                 log_err!("{}", e);
                 1
             })?;

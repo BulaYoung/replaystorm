@@ -356,6 +356,7 @@ pub fn build(pf: &PcapFile, cfg: &IdxCfg) -> Result<PktIndex, String> {
     let mut stats: Vec<IdxStats> = Vec::new();
     let mut n = 0usize;
     let mut oom = false;
+    let mut stopped = false;
     let mut rc = RecResult::Ok;
     let mut off = PCAP_FILE_HDR_LEN;
 
@@ -411,19 +412,23 @@ pub fn build(pf: &PcapFile, cfg: &IdxCfg) -> Result<PktIndex, String> {
             n += 1;
             if n & (PUBLISH_EVERY - 1) == 0 {
                 shared.scanned.store(n, Ordering::Release);
+                if crate::stop_requested() {
+                    stopped = true;
+                    break;
+                }
             }
         }
         shared.scanned.store(n, Ordering::Release);
         shared.done.store(true, Ordering::Release);
 
-        if heap && !oom {
+        if heap && !oom && !stopped {
             ix.offlen = Arr::Heap(std::mem::take(&mut heap_ol));
             ix.ts = Arr::Heap(std::mem::take(&mut heap_ts));
             ix.h32 = Arr::Heap(vec![0u32; n]);
             ix.flags = Arr::Heap(vec![0u8; n]);
             start(&ix, &mut handles);
         }
-        if handles.is_empty() && !oom && n > 0 {
+        if handles.is_empty() && !oom && !stopped && n > 0 {
             // Threads failed to start; hash in this thread.
             shared.next_chunk.store(0, Ordering::SeqCst);
             stats.push(hasher_main(pf, &shared, SyncPtr(ix.offlen.ptr()), SyncPtr(ix.h32.ptr()), SyncPtr(ix.flags.ptr())));
@@ -432,7 +437,7 @@ pub fn build(pf: &PcapFile, cfg: &IdxCfg) -> Result<PktIndex, String> {
             stats.push(h.join().unwrap_or_default());
         }
     });
-    if rc != RecResult::Ok && rc != RecResult::End {
+    if !stopped && rc != RecResult::Ok && rc != RecResult::End {
         ix.tail_problem = Some(rc);
         ix.tail_off = off;
     }
@@ -454,6 +459,9 @@ pub fn build(pf: &PcapFile, cfg: &IdxCfg) -> Result<PktIndex, String> {
     ix.st.pkts = n as u64;
     if oom {
         return Err(format!("out of memory for the index ({} packets)", n));
+    }
+    if stopped {
+        return Err("stopped while building the index".into());
     }
     Ok(ix)
 }

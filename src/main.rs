@@ -15,8 +15,12 @@ fn main() {
     }
     let mut o = o;
     if o.dpdk.is_some() && !o.analyze {
+        // Ctrl-C/SIGTERM before the replay (index, timeline) stops cleanly as well, so that
+        // the NIC and hugepages taken for DPDK are given back.
+        replaystorm::replay::install_stop_signals();
         if let Err(e) = replaystorm::dpdk::init(&mut o) {
             replaystorm::util::log_err_str(&e);
+            replaystorm::dpdk::shutdown();
             std::process::exit(1);
         }
     }

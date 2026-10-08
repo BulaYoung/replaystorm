@@ -100,6 +100,8 @@ pub struct Opts {
     pub dpdk: Option<String>, // --dpdk PORT: send through DPDK instead of AF_PACKET
     pub eal: Option<String>,  // --eal "ARGS": DPDK EAL arguments
     pub link_from_port: bool, // the link speed was read from the DPDK port
+    pub dpdk_bind: bool,      // --dpdk-bind: move the NIC to vfio-pci and back
+    pub dpdk_hugepages: u64,  // --dpdk-hugepages: bytes reserved for the run (0 = none)
 }
 
 impl Opts {
@@ -165,6 +167,8 @@ impl Default for Opts {
             dpdk: None,
             eal: None,
             link_from_port: false,
+            dpdk_bind: false,
+            dpdk_hugepages: 0,
         }
     }
 }
@@ -224,6 +228,11 @@ Sending:
                           device name or a port number; replaces -i
   --eal \"ARGS\"            DPDK EAL arguments, e.g. \"-a 0000:3b:00.0\" or
                           \"--no-huge --vdev=net_af_packet0,iface=eth1,qpairs=12\"
+  --dpdk-bind             move the NIC (PORT is its PCI address) from its kernel driver
+                          to vfio-pci for the run and give it back at the end, with its
+                          MTU and up state; refused if the interface has IP addresses
+  --dpdk-hugepages SIZE   reserve SIZE of 2 MB hugepages (e.g. 4G) on the NIC's NUMA node
+                          for the run and release them at the end
 
 Input:
   --preload               load the whole file into memory before start
@@ -275,6 +284,7 @@ Examples:
   replaystorm -i ens1f0 --loop 5 --loop-mutate ip,port big.pcap
   replaystorm -i ens1f0 --smac 02:00:00:00:00:01 --dmac 02:00:00:00:00:02 raw.pcap
   replaystorm --dpdk 0000:3b:00.0 --eal \"-a 0000:3b:00.0\" --mbps 99% --loop 0 big.pcap
+  replaystorm --dpdk 0000:3b:00.0 --dpdk-bind --dpdk-hugepages 4G --mbps 99% big.pcap
 
 While running: press Enter (or s) for long-run statistics: minimum, worst minute,
 percentiles, averages; r resets them, q stops; kill -USR1 PID prints them too.
@@ -331,6 +341,8 @@ const LONG_OPTS: &[(&str, bool)] = &[
     ("mutate-port-step", true),
     ("dpdk", true),
     ("eal", true),
+    ("dpdk-bind", false),
+    ("dpdk-hugepages", true),
 ];
 
 /// Short options: (letter, long name, takes an argument).
@@ -634,6 +646,11 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, ()> {
             },
             "dpdk" => o.dpdk = Some(v.to_string()),
             "eal" => o.eal = Some(v.to_string()),
+            "dpdk-bind" => o.dpdk_bind = true,
+            "dpdk-hugepages" => match parse_size(v) {
+                Some(b) if b >= 2 << 20 => o.dpdk_hugepages = b,
+                _ => return bad("--dpdk-hugepages", v),
+            },
             _ => unreachable!(),
         }
     }
@@ -658,8 +675,12 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, ()> {
         log_err!("-i and --dpdk are mutually exclusive: --dpdk sends through a DPDK port instead of an interface");
         return Err(());
     }
-    if o.eal.is_some() && o.dpdk.is_none() {
-        log_err!("--eal needs --dpdk PORT");
+    if (o.eal.is_some() || o.dpdk_bind || o.dpdk_hugepages > 0) && o.dpdk.is_none() {
+        log_err!("--eal, --dpdk-bind and --dpdk-hugepages need --dpdk PORT");
+        return Err(());
+    }
+    if o.dpdk_hugepages > 0 && o.eal.as_deref().unwrap_or("").split_whitespace().any(|a| a == "--no-huge") {
+        log_err!("--dpdk-hugepages and --eal \"--no-huge\" contradict each other");
         return Err(());
     }
     if !o.analyze && o.iface.is_none() && o.dpdk.is_none() {

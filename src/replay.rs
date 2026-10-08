@@ -30,6 +30,12 @@ extern "C" fn on_usr1(_: libc::c_int) {
     WANT_STATUS.store(true, Ordering::SeqCst);
 }
 
+/// SIGINT/SIGTERM request a graceful stop.
+pub fn install_stop_signals() {
+    install_signal(libc::SIGINT, on_signal, 0);
+    install_signal(libc::SIGTERM, on_signal, 0);
+}
+
 fn install_signal(sig: libc::c_int, h: extern "C" fn(libc::c_int), flags: libc::c_int) {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();

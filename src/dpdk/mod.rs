@@ -33,6 +33,13 @@ pub fn port() -> Option<&'static PortInfo> {
 }
 
 #[cfg(feature = "dpdk")]
+pub mod sys;
+
+/// The EAL has been initialized (it must be released at the end).
+#[cfg(feature = "dpdk")]
+static EAL_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "dpdk")]
 mod ffi {
     use std::os::raw::{c_char, c_int, c_uint, c_void};
     extern "C" {
@@ -100,6 +107,14 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
     unsafe { libc::sched_getaffinity(0, sz, &mut allowed) };
     let first_cpu = (0..libc::CPU_SETSIZE).find(|&c| unsafe { libc::CPU_ISSET(c as usize, &allowed) }).unwrap_or(0);
 
+    // --dpdk-bind / --dpdk-hugepages: prepare the system; restored by shutdown().
+    if o.dpdk_bind || o.dpdk_hugepages > 0 {
+        let pci = sys::pci_addr(&want).ok_or_else(|| {
+            format!("--dpdk-bind/--dpdk-hugepages need the port as a PCI address (0000:3b:00.0), not '{}'", want)
+        })?;
+        sys::prepare(&pci, o.dpdk_bind, o.dpdk_hugepages)?;
+    }
+
     let user: Vec<String> = o.eal.as_deref().unwrap_or("").split_whitespace().map(String::from).collect();
     let has = |opts: &[&str]| user.iter().any(|a| opts.iter().any(|o| a == o || a.starts_with(&format!("{}=", o))));
     let mut args = vec!["replaystorm".to_string()];
@@ -125,6 +140,7 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
     if r < 0 {
         return Err(format!("rte_eal_init: {} (EAL arguments: {})", dpdk_err(r), args[1..].join(" ")));
     }
+    EAL_UP.store(true, std::sync::atomic::Ordering::SeqCst);
     if unsafe { ffi::rs_dpdk_port_count() } == 0 {
         return Err("no DPDK ports: bind the NIC to vfio-pci (dpdk-devbind.py -b vfio-pci PCI) or pass a virtual \
                     device with --eal \"--vdev=...\""
@@ -255,14 +271,18 @@ pub fn stats(port: u16) -> Option<(u64, u64)> {
     None
 }
 
-/// Stop and close the port and release the EAL.
+/// Stop and close the port, release the EAL, then give the system back what
+/// --dpdk-bind / --dpdk-hugepages took (the NIC to its driver, the hugepages).
 pub fn shutdown() {
     #[cfg(feature = "dpdk")]
-    if let Some(p) = PORT.get() {
-        unsafe {
-            ffi::rs_dpdk_close(p.port);
-            ffi::rs_dpdk_cleanup();
+    {
+        if let Some(p) = PORT.get() {
+            unsafe { ffi::rs_dpdk_close(p.port) };
         }
+        if EAL_UP.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            unsafe { ffi::rs_dpdk_cleanup() };
+        }
+        sys::restore();
     }
 }
 
