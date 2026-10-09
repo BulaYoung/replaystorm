@@ -366,28 +366,28 @@ fn tx_descriptors(o: &Opts, max_desc: u16, ntxq: usize, data_room: u32, driver: 
     if o.ring_frames_set {
         return o.ring_frames.min(max).min(u16::MAX as u32) as u16;
     }
-    // mlx5 stops inlining frame headers into the descriptors of a large queue (txq_inline
-    // 290 -> 12 bytes), and the NIC then fetches every header with a separate DMA read.
-    if driver.starts_with("mlx5") {
-        return max.min(4096) as u16;
-    }
+    // mlx5 inlines less of each frame into the descriptors of a larger queue (txq_inline
+    // 290 -> 204 bytes at 8192, -> 12 at 32768, then every header is a separate DMA read).
+    // 8192 measured faster than 4096 at 100G (fewer full-queue waits); a power of two,
+    // which mlx5 rounds up to anyway.
+    let cap = if driver.starts_with("mlx5") { 8192 } else { 32768 };
     let per = data_room as u64 + MBUF_OVERHEAD;
     let pool = |d: u32| (d as u64 + 2 * o.batch as u64 + 1024) * per * ntxq as u64;
     let free = hugepages_free();
     if free == 0 {
         return max.min(4096) as u16; // no hugepages (--no-huge): memory size unknown, stay modest
     }
-    let mut d = max.min(32768);
+    let mut d = max.min(cap);
     // Leave a quarter of the hugepages to the EAL and the driver.
     while d > 1024 && pool(d) > free / 4 * 3 {
         d /= 2;
     }
-    if d < max.min(32768) {
+    if d < max.min(cap) {
         log_info!(
             "DPDK: {} TX descriptors per queue (the NIC allows {}; more need more hugepages: {:.1} GB for {} queues)",
             d,
             max,
-            pool(max.min(32768)) as f64 / 0.75 / (1u64 << 30) as f64,
+            pool(max.min(cap)) as f64 / 0.75 / (1u64 << 30) as f64,
             ntxq
         );
     }

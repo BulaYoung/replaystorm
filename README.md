@@ -491,9 +491,9 @@ replaystorm --status --dpdk ens1f0           # long-run statistics from another 
 - Statistics: "sent (port)" and `oerrors` come from the port counters (`rte_eth_stats`)
   instead of sysfs; the ENOBUFS column counts `rte_eth_tx_burst` calls that found the TX
   queue full. Link down pauses the schedule as with the kernel path.
-- `--qdisc-bypass` and `--packet-loss` do not apply. TX descriptors per queue: 4096 for mlx5
-  (with larger queues it stops inlining frame headers into descriptors), else the NIC's maximum
-  (up to 32768), reduced if the mbuf pools of all queues would not fit into 3/4 of the free
+- `--qdisc-bypass` and `--packet-loss` do not apply. TX descriptors per queue: 8192 for mlx5
+  (faster than 4096 at 100G; with larger queues it inlines less of each frame into the
+  descriptors), else the NIC's maximum (up to 32768); reduced if the mbuf pools of all queues would not fit into 3/4 of the free
   hugepages (a message says so); `--ring-frames N` sets them explicitly. Without hugepages
   (`--no-huge`) the default is 4096.
 - Without a NIC, for tests: `--dpdk net_af_packet0 --eal "--no-huge --no-pci
