@@ -204,8 +204,6 @@ static void zc_free_cb(void *addr, void *opaque)
 	(void)opaque;
 }
 
-static int iova_is_va;
-
 /* Point mbuf m at len bytes of the preloaded file at addr. */
 void rs_dpdk_attach(struct rte_mbuf *m, void *addr, uint32_t len)
 {
@@ -213,8 +211,10 @@ void rs_dpdk_attach(struct rte_mbuf *m, void *addr, uint32_t len)
 	sh->free_cb = zc_free_cb;
 	sh->fcb_opaque = NULL;
 	rte_mbuf_ext_refcnt_set(sh, 1);
-	rte_iova_t iova = iova_is_va ? (rte_iova_t)(uintptr_t)addr : rte_mem_virt2iova(addr);
-	rte_pktmbuf_attach_extbuf(m, addr, iova, (uint16_t)len, sh);
+	/* The IOVA is the virtual address: rs_dpdk_extmem() only enables zero-copy where that
+	 * is right (IOVA as VA, mlx5 which translates addresses itself, or a driver without
+	 * DMA). Looking up a physical address per frame would be a system call per frame. */
+	rte_pktmbuf_attach_extbuf(m, addr, (rte_iova_t)(uintptr_t)addr, (uint16_t)len, sh);
 	m->data_off = 0;
 	m->data_len = (uint16_t)len;
 	m->pkt_len = len;
@@ -235,18 +235,29 @@ void rs_dpdk_chain(struct rte_mbuf *head, struct rte_mbuf *tail)
  */
 int rs_dpdk_extmem(uint16_t port, void *addr, size_t len, size_t dma_len, size_t page_sz, char *err, size_t errlen)
 {
-	iova_is_va = rte_eal_iova_mode() == RTE_IOVA_VA;
-	if (rte_extmem_register(addr, len, NULL, 0, page_sz) != 0 && rte_errno != EEXIST)
-		return fail(err, errlen, "rte_extmem_register", rte_errno);
 	struct rte_eth_dev_info info;
 	int r = rte_eth_dev_info_get(port, &info);
 	if (r != 0)
 		return fail(err, errlen, "rte_eth_dev_info_get", r);
+	/* mlx5 translates virtual addresses itself (memory region keys) and ignores the IOVA. */
+	int mlx5 = info.driver_name && strstr(info.driver_name, "mlx5") != NULL;
+	if (rte_extmem_register(addr, len, NULL, 0, page_sz) != 0 && rte_errno != EEXIST)
+		return fail(err, errlen, "rte_extmem_register", rte_errno);
 	/* Only the mapped part (the file), not the alignment after it. */
 	if (rte_dev_dma_map(info.device, addr, (uint64_t)(uintptr_t)addr, dma_len) != 0) {
 		if (rte_errno == ENOTSUP)
-			return 1;
-		return fail(err, errlen, "rte_dev_dma_map", rte_errno);
+			return 1; /* no DMA mapping needed: the driver copies the data itself */
+		r = rte_errno;
+		rte_extmem_unregister(addr, len);
+		return fail(err, errlen, "rte_dev_dma_map", r);
+	}
+	if (rte_eal_iova_mode() != RTE_IOVA_VA && !mlx5) {
+		/* The NIC would need physical addresses: one lookup per frame is far too slow. */
+		rte_dev_dma_unmap(info.device, addr, (uint64_t)(uintptr_t)addr, dma_len);
+		rte_extmem_unregister(addr, len);
+		snprintf(err, errlen, "%s needs physical addresses (IOVA as PA, no IOMMU): enable the IOMMU",
+		         info.driver_name ? info.driver_name : "the driver");
+		return -ENOTSUP;
 	}
 	return 0;
 }

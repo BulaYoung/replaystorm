@@ -408,6 +408,9 @@ it is the largest.
 - On by default with `--dpdk --preload`; `--zero-copy off` copies every frame. The summary
   says how many frames went out without copying.
 - Drivers without multi-segment TX use zero-copy only for frames sent unchanged.
+- Frames carry virtual addresses: fine with IOVA as VA (an IOMMU), with mlx5 (which translates
+  addresses itself with its memory keys) and with drivers without DMA. Another driver in IOVA
+  as PA mode (no IOMMU) gets no zero-copy, with a message.
 - The file is mapped 2 MB aligned for the registration and stays mapped until the port is
   closed. The functional tests check that every frame is byte for byte the same as with
   copying, on three `--loop-mutate` laps, for Ethernet and RAW IP.
