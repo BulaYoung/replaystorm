@@ -114,10 +114,27 @@ pub fn prepare(mut o: Opts) -> Result<Ctx, i32> {
     if o.preload {
         log_info!("Loading the whole file into memory (--preload)...");
     }
+    let tl = now_ns();
     let pf = PcapFile::open(&o.file, o.preload).map_err(|e| {
         log_err!("{}", e);
         1
     })?;
+    if pf.preloaded {
+        let sec = (now_ns() - tl) as f64 / 1e9;
+        log_info!(
+            "Loaded {:.1} GB into memory in {:.1} s ({:.2} GB/s){}",
+            pf.size as f64 / 1e9,
+            sec,
+            if sec > 0.0 { pf.size as f64 / sec / 1e9 } else { 0.0 },
+            if pf.locked { ", locked in RAM: the disk is not read again" } else { "" }
+        );
+        if !pf.locked {
+            log_warn!(
+                "could not lock the file in RAM (mlock): under memory pressure parts of it may be \
+                 evicted and read from disk again. Run as root or raise ulimit -l"
+            );
+        }
+    }
 
     // Index.
     let t0 = now_ns();

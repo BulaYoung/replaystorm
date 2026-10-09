@@ -29,6 +29,7 @@ pub struct PcapFile {
     pub snaplen: u32,
     pub raw_ip: i32,    // 0 = Ethernet, 4/6 = fixed version, 1 = version from packet
     pub preloaded: bool,
+    pub locked: bool,   // --preload: the file is locked in RAM (mlock)
     mapped: bool,
 }
 
@@ -83,6 +84,7 @@ impl PcapFile {
             snaplen: 0,
             raw_ip: 0,
             preloaded: false,
+            locked: false,
             mapped: false,
         }
     }
@@ -111,6 +113,11 @@ impl PcapFile {
         pf.base = p as *const u8;
         pf.mapped = true;
         pf.preloaded = preload;
+        // --preload: keep the whole file in RAM for the run, so that the page cache never
+        // evicts parts of it under memory pressure (other programs reading big files).
+        if preload {
+            pf.locked = unsafe { libc::mlock(p, pf.size) } == 0;
+        }
         // Indexing reads the file sequentially.
         unsafe {
             libc::madvise(p, pf.size, if preload { libc::MADV_WILLNEED } else { libc::MADV_SEQUENTIAL })

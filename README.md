@@ -273,8 +273,11 @@ Check a drive: `nvme smart-log /dev/nvme0n1 | grep -i -E "^temperature|T1 Trans 
 A background thread keeps `--readahead` bytes requested with `MADV_WILLNEED` (in 1 MB pieces: the
 kernel caps each request at `read_ahead_kb`), pre-maps the nearest 512 MB with `MADV_POPULATE_READ`
 (or by touching pages on kernels before 5.14), and with `--drop-behind` (auto for big files) drops
-what all threads have passed from the page cache. `--preload` (whole file into RAM before start) is
-ignored with a warning if the file does not fit.
+what all threads have passed from the page cache. `--preload` (whole file into RAM before start, locked
+there with `mlock` so it is never evicted; the disk is not read again) is ignored with a
+warning if the file does not fit into 80% of the available memory. For a file larger than RAM,
+cut it at packet boundaries into pieces that fit (`editcap -c PACKETS` or `-i SECONDS`), not
+with `split`: every piece must be a complete pcap.
 
 ### Index cache
 
