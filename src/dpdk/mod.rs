@@ -138,7 +138,17 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
     let mut allowed: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     let sz = std::mem::size_of::<libc::cpu_set_t>();
     unsafe { libc::sched_getaffinity(0, sz, &mut allowed) };
-    let first_cpu = (0..libc::CPU_SETSIZE).find(|&c| unsafe { libc::CPU_ISSET(c as usize, &allowed) }).unwrap_or(0);
+    // The EAL main lcore (only the setup and control run there) on a CPU near the NIC.
+    let isset = |c: i32| c >= 0 && (c as usize) < libc::CPU_SETSIZE as usize && unsafe { libc::CPU_ISSET(c as usize, &allowed) };
+    let local: Vec<i32> = match &resolved {
+        Some((pci, _)) => pci_local_cpus(pci).into_iter().filter(|&c| isset(c)).collect(),
+        None => Vec::new(),
+    };
+    let first_cpu = local
+        .first()
+        .copied()
+        .or_else(|| (0..libc::CPU_SETSIZE as i32).find(|&c| isset(c)))
+        .unwrap_or(0);
 
     // --dpdk-bind / --dpdk-hugepages: prepare the system; restored by shutdown().
     if o.dpdk_bind || o.dpdk_hugepages > 0 {
@@ -208,7 +218,11 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
 
     // CPUs and thread count as in the kernel path, but near the port.
     let cpus = match &o.cpus {
-        Some(list) => parse_cpulist(list, MAX_CPUS).unwrap_or_default(),
+        Some(list) => {
+            let c = parse_cpulist(list, MAX_CPUS).unwrap_or_default();
+            warn_remote_cpus(&c, &local, &name);
+            c
+        }
         None => {
             let c = port_cpus(&name, socket, &allowed);
             o.cpus = Some(c.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","));

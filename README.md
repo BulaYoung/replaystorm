@@ -449,7 +449,9 @@ replaystorm --status --dpdk ens1f0           # long-run statistics from another 
   arguments; replaystorm adds `-l <first CPU>` (the EAL's main lcore; the sender threads pin
   themselves), `--in-memory` (`--no-shconf` with `--no-huge`) and `--log-level=5` unless given.
 - The link speed and MTU come from the port; without `-t` the thread count is limited to the
-  port's TX queues. The CPUs default to the port's NUMA node.
+  port's TX queues. The CPUs default to the port's NUMA node (its `local_cpulist`), and the EAL
+  main lcore is put there too. A `--cpus` list with CPUs of another NUMA node gives a warning
+  (also with `-i`).
 - Statistics: "sent (port)" and `oerrors` come from the port counters (`rte_eth_stats`)
   instead of sysfs; the ENOBUFS column counts `rte_eth_tx_burst` calls that found the TX
   queue full. Link down pauses the schedule as with the kernel path.

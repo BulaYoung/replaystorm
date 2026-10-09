@@ -32,7 +32,16 @@ pub fn prepare(mut o: Opts) -> Result<Ctx, i32> {
     // CPUs and thread count.
     let (cpus, cpus_from_numa) = match &o.cpus {
         Some(list) => match parse_cpulist(list, MAX_CPUS) {
-            Some(c) if !c.is_empty() => (c, false),
+            Some(c) if !c.is_empty() => {
+                if let Some(iface) = o.iface.as_deref() {
+                    let local = std::fs::read_to_string(format!("/sys/class/net/{}/device/local_cpulist", iface))
+                        .ok()
+                        .and_then(|s| parse_cpulist(&s, 1024))
+                        .unwrap_or_default();
+                    warn_remote_cpus(&c, &local, iface);
+                }
+                (c, false)
+            }
             _ => {
                 log_err!("invalid --cpus list '{}'", list);
                 return Err(2);

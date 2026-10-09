@@ -309,6 +309,33 @@ pub fn iface_cpus(iface: Option<&str>, max: usize) -> (Vec<i32>, bool) {
     ((0..setsize).filter(|&c| isset(c)).take(max).collect(), false)
 }
 
+/// CPUs of the PCI device's NUMA node (its local_cpulist), empty if unknown.
+pub fn pci_local_cpus(pci: &str) -> Vec<i32> {
+    read_sysfs(&format!("/sys/bus/pci/devices/{}/local_cpulist", pci))
+        .and_then(|s| parse_cpulist(&s, 1024))
+        .unwrap_or_default()
+}
+
+/// Warn when --cpus puts sender threads on CPUs far from the NIC (another NUMA node):
+/// every frame then crosses the interconnect between the sockets.
+pub fn warn_remote_cpus(cpus: &[i32], local: &[i32], nic: &str) {
+    if local.is_empty() {
+        return;
+    }
+    let remote: Vec<String> = cpus.iter().filter(|c| !local.contains(c)).map(|c| c.to_string()).collect();
+    if remote.is_empty() {
+        return;
+    }
+    let mut near: Vec<String> = local.iter().map(|c| c.to_string()).collect();
+    near.truncate(64);
+    log_warn!(
+        "--cpus: CPUs {} are not on the NUMA node of {}; the CPUs near it are {}. Leave out --cpus to use them",
+        remote.join(","),
+        nic,
+        near.join(",")
+    );
+}
+
 pub fn sysfs_read_str(iface: &str, attr: &str) -> Option<String> {
     let s = read_sysfs(&format!("/sys/class/net/{}/{}", iface, attr))?;
     Some(s.split('\n').next().unwrap_or("").to_string())
