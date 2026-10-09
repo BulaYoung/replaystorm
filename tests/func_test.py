@@ -526,6 +526,21 @@ def t_dpdk(pcaps, spin):
               % (name, len(got_zc), len(got_cp)))
         bad = [f for f in got_zc if ip_l4_sums_ok(f) is False]
         check(not bad, "%s: checksums correct on every lap (%d errors)" % (name, len(bad)))
+        if lt == 1:
+            # Frames changed in memory lap by lap (normally only for long shards; the
+            # af_packet driver copies inside tx_burst, so any length is safe here).
+            os.environ["RS_INPLACE_MIN_FRAMES"] = "0"
+            try:
+                rc3, out3, f_ip, _ = replay_dpdk(p, extra)
+            finally:
+                del os.environ["RS_INPLACE_MIN_FRAMES"]
+            got_ip = [f for _, f in f_ip]
+            check(rc3 == 0 and "change the frames in memory" in out3,
+                  "%s: --loop-mutate changes the frames in memory" % name)
+            check(len(got_ip) == 3 * 400 and collections.Counter(got_ip) == collections.Counter(got_cp),
+                  "%s: in memory, every frame identical to the copied one (%d)" % (name, len(got_ip)))
+            bad = [f for f in got_ip if ip_l4_sums_ok(f) is False]
+            check(not bad, "%s: in memory, checksums correct on every lap (%d errors)" % (name, len(bad)))
         os.unlink(p)
 
     print("== DPDK: status and errors")

@@ -87,6 +87,7 @@ pub struct WStats {
     pub wait_ns: [AtomicU64; W_COUNT],
     pub link_lost: AtomicU64,   // frames lost when the interface was re-created
     pub zc: AtomicU64,          // frames sent without copying (zero-copy)
+    pub inplace: AtomicBool,    // zero-copy frames modified in memory (see inplace_ok)
     pub finished: AtomicBool,
 }
 
@@ -289,6 +290,9 @@ struct Worker<'a> {
     l_eagain: u64,
     zc: bool,       // DPDK zero-copy from the preloaded file
     zc_multi: bool, // with a copied header segment in front
+    // Zero-copy with --loop-mutate: the frames are modified in the preloaded file itself, one
+    // lap further on each visit, so they go out as a single segment (see inplace_ok).
+    inplace: bool,
     l_zc: u64,
 }
 
@@ -787,7 +791,18 @@ impl<'a> Worker<'a> {
         let o = &self.c.o;
         let raw_ip = self.c.pf.raw_ip;
         let len = offlen_len(p.offlen) as usize;
-        if self.zc && len > ZC_MIN_FRAME {
+        // In place: the frame in memory is in the state of the previous lap; moving it on by
+        // one lap gives the same addresses and ports as mutate(original, lap). Nothing is
+        // left to change in the copy, so it is sent as is.
+        let lap = if self.inplace {
+            if lap > 0 {
+                mutate(unsafe { std::slice::from_raw_parts_mut(src as *mut u8, len) }, 1, &self.mut_cfg);
+            }
+            0
+        } else {
+            lap
+        };
+        if self.zc && (len > ZC_MIN_FRAME || self.inplace) {
             if let Some(ok) = self.emit_zc(src, len, lap) {
                 return ok;
             }
@@ -986,6 +1001,25 @@ impl<'a> Worker<'a> {
     }
 }
 
+/// Whether this thread can modify its frames in the preloaded file instead of sending a
+/// copied header. A frame is rewritten one lap after it was last sent; the NIC must have
+/// read it by then. TX completes in order and at most nb_desc frames of a queue are in
+/// flight, so a shard much longer than that (plus the batch being filled) is safe.
+/// RS_INPLACE_MIN_FRAMES overrides the minimum (tests on virtual devices that copy at once).
+fn inplace_ok(c: &Ctx, w: &Worker) -> bool {
+    if !w.zc || !w.mutate || c.pf.raw_ip != 0 || !c.pf.preloaded {
+        return false;
+    }
+    let min = match std::env::var("RS_INPLACE_MIN_FRAMES").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(v) => v,
+        None => {
+            let desc = crate::dpdk::port().map_or(4096, |p| p.nb_desc as usize);
+            (8 * (desc + 2 * c.o.batch as usize)).max(1 << 16)
+        }
+    };
+    w.pk.len() >= min
+}
+
 /// Copy this thread's shard out of the global index.
 fn build_shard(c: &Ctx, ix: &PktIndex, sid: usize) -> Vec<Pkt> {
     let cnt = ix.shard_pkts[sid] as usize;
@@ -1099,8 +1133,11 @@ pub fn worker_main<'a, 'd: 'a>(c: &'a Ctx, ix: &RwLock<PktIndex>, me: &'a Worker
         l_eagain: 0,
         zc: crate::dpdk::zero_copy(),
         zc_multi: crate::dpdk::zero_copy_multi(),
+        inplace: false,
         l_zc: 0,
     };
+    w.inplace = inplace_ok(c, &w);
+    me.st.inplace.store(w.inplace, RLX);
     if let Some(s) = setup.get() {
         w.dio = s.dio;
         if let Some(lead) = s.fence_lead {

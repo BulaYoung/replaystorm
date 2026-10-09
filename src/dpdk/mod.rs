@@ -403,6 +403,9 @@ pub fn init(_o: &mut Opts) -> Result<(), String> {
 pub fn link(port: u16) -> Option<(u32, bool)> {
     #[cfg(feature = "dpdk")]
     {
+        if CLOSED.load(std::sync::atomic::Ordering::SeqCst) {
+            return None; // after shutdown (the stats thread may still ask)
+        }
         let (mut speed, mut up) = (0u32, 0i32);
         if unsafe { ffi::rs_dpdk_link(port, &mut speed, &mut up) } == 0 {
             return Some((speed, up != 0));
@@ -416,6 +419,9 @@ pub fn link(port: u16) -> Option<(u32, bool)> {
 pub fn stats(port: u16) -> Option<(u64, u64)> {
     #[cfg(feature = "dpdk")]
     {
+        if CLOSED.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
         let (mut p, mut b, mut e) = (0u64, 0u64, 0u64);
         if unsafe { ffi::rs_dpdk_stats(port, &mut p, &mut b, &mut e) } == 0 {
             return Some((p, e));

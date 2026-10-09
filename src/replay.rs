@@ -756,6 +756,15 @@ fn print_summary(x: &Summary, end: &Snap, start: &Snap, elapsed: f64, json: Opti
             if pkts > 0 { 100.0 * zc as f64 / pkts as f64 } else { 0.0 },
             256
         );
+        let ip = x.ws.iter().filter(|w| w.st.inplace.load(RLX)).count();
+        if ip > 0 {
+            println!(
+                "Zero-copy with --loop-mutate: {} of {} threads change the frames in memory (sent as one segment, \
+                 frames of any size)",
+                ip,
+                x.ws.len()
+            );
+        }
     }
     let late_n: u64 = end.hist.iter().sum();
     let timed = c.o.mode == Mode::Timed;

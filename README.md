@@ -408,6 +408,14 @@ it is the largest.
 - On by default with `--dpdk --preload`; `--zero-copy off` copies every frame. The summary
   says how many frames went out without copying.
 - Drivers without multi-segment TX use zero-copy only for frames sent unchanged.
+- `--loop-mutate` on a long file (a thread's share well beyond its TX queue: at least 8 x
+  (descriptors + 2 x batch), and 65536 frames) changes the frames in the preloaded memory
+  itself, one lap further each time a frame is visited, instead of a copied header: every
+  frame, small ones too, is one segment read by one DMA, and mlx5 can pack several into one
+  descriptor (eMPW). On the 100G test server this is what limited the two-segment frames:
+  the NIC queues were full, not the CPU. The frame is rewritten a whole lap after it was
+  sent; TX completes in order, so the NIC has read it long before. The summary says how
+  many threads work this way. (The checksums are updated incrementally either way.)
 - Frames carry virtual addresses: fine with IOVA as VA (an IOMMU), with mlx5 (which translates
   addresses itself with its memory keys) and with drivers without DMA. Another driver in IOVA
   as PA mode (no IOMMU) gets no zero-copy, with a message.
