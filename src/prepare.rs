@@ -127,11 +127,12 @@ pub fn prepare(mut o: Opts) -> Result<Ctx, i32> {
             sec,
             if sec > 0.0 { pf.size as f64 / sec / 1e9 } else { 0.0 },
             if pf.locked { ", locked in RAM: the disk is not read again" } else { "" }
+            // (the program's own memory in 2 MB pages; the page-cache copy has been dropped)
         );
         if !pf.locked {
             log_warn!(
                 "could not lock the file in RAM (mlock): under memory pressure parts of it may be \
-                 evicted and read from disk again. Run as root or raise ulimit -l"
+                 swapped out. Run as root or raise ulimit -l"
             );
         }
     }

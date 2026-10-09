@@ -111,62 +111,20 @@ impl PcapFile {
         if pf.size == 0 {
             return Err(format!("{}: empty file", path));
         }
-        let flags = libc::MAP_PRIVATE | if preload { libc::MAP_POPULATE } else { 0 };
-        let p = if preload {
-            // A preloaded file may be handed to the NIC as external memory (zero-copy), which
-            // is registered in units of PRELOAD_ALIGN: map it at such an address, inside a
-            // reserved range that covers the rounded-up length.
-            let span = pf.size.div_ceil(PRELOAD_ALIGN) * PRELOAD_ALIGN;
-            let res = unsafe {
-                libc::mmap(std::ptr::null_mut(), span + PRELOAD_ALIGN, libc::PROT_NONE,
-                           libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0)
-            };
-            if res == libc::MAP_FAILED {
-                return Err(format!("mmap {}: {}", path, strerror(errno())));
-            }
-            let aligned = (res as usize).div_ceil(PRELOAD_ALIGN) * PRELOAD_ALIGN;
-            let p = unsafe {
-                libc::mmap(aligned as *mut libc::c_void, pf.size, libc::PROT_READ, flags | libc::MAP_FIXED, pf.fd, 0)
-            };
-            if p == libc::MAP_FAILED {
-                let e = errno();
-                unsafe { libc::munmap(res, span + PRELOAD_ALIGN) };
-                return Err(format!("mmap {}: {}", path, strerror(e)));
-            }
-            // Give back the reserved head before the aligned start and the tail after the span.
-            unsafe {
-                if aligned > res as usize {
-                    libc::munmap(res, aligned - res as usize);
-                }
-                let end = res as usize + span + PRELOAD_ALIGN;
-                if end > aligned + span {
-                    libc::munmap((aligned + span) as *mut libc::c_void, end - aligned - span);
-                }
-            }
-            pf.map_base = aligned as *mut libc::c_void;
-            pf.map_len = span;
-            p
+        if preload {
+            pf.load_into_memory(path)?;
         } else {
-            let p = unsafe { libc::mmap(std::ptr::null_mut(), pf.size, libc::PROT_READ, flags, pf.fd, 0) };
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), pf.size, libc::PROT_READ, libc::MAP_PRIVATE, pf.fd, 0) };
             if p == libc::MAP_FAILED {
                 return Err(format!("mmap {}: {}", path, strerror(errno())));
             }
             pf.map_base = p;
             pf.map_len = pf.size;
-            p
-        };
-        pf.base = p as *const u8;
-        pf.mapped = true;
-        pf.preloaded = preload;
-        // --preload: keep the whole file in RAM for the run, so that the page cache never
-        // evicts parts of it under memory pressure (other programs reading big files).
-        if preload {
-            pf.locked = unsafe { libc::mlock(p, pf.size) } == 0;
+            pf.base = p as *const u8;
+            pf.mapped = true;
+            // Indexing reads the file sequentially.
+            unsafe { libc::madvise(p, pf.size, libc::MADV_SEQUENTIAL) };
         }
-        // Indexing reads the file sequentially.
-        unsafe {
-            libc::madvise(p, pf.size, if preload { libc::MADV_WILLNEED } else { libc::MADV_SEQUENTIAL })
-        };
         pf.parse_header()?;
         Ok(pf)
     }
@@ -174,6 +132,114 @@ impl PcapFile {
     /// The preloaded mapping: aligned start and length rounded up to PRELOAD_ALIGN.
     pub fn preload_span(&self) -> Option<(*mut u8, usize)> {
         (self.preloaded && self.mapped).then_some((self.map_base as *mut u8, self.map_len))
+    }
+
+    /// --preload: read the whole file into the program's own memory, 2 MB aligned, backed by
+    /// 2 MB pages where possible, locked in RAM, on the NUMA node the process prefers. Not
+    /// a page-cache mapping: the page cache is dropped as the file is read (so the file is not
+    /// held twice), and this memory can be registered with a NIC for DMA (zero-copy), which
+    /// a read-only file mapping cannot.
+    fn load_into_memory(&mut self, path: &str) -> Result<(), String> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let size = self.size;
+        let span = size.div_ceil(PRELOAD_ALIGN) * PRELOAD_ALIGN;
+        let res = unsafe {
+            libc::mmap(std::ptr::null_mut(), span + PRELOAD_ALIGN, libc::PROT_NONE,
+                       libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0)
+        };
+        if res == libc::MAP_FAILED {
+            return Err(format!("cannot reserve {:.1} GB for {}: {}", span as f64 / 1e9, path, strerror(errno())));
+        }
+        let aligned = (res as usize).div_ceil(PRELOAD_ALIGN) * PRELOAD_ALIGN;
+        // Keep only [aligned, aligned + span) of the reservation.
+        unsafe {
+            if aligned > res as usize {
+                libc::munmap(res, aligned - res as usize);
+            }
+            let end = res as usize + span + PRELOAD_ALIGN;
+            if end > aligned + span {
+                libc::munmap((aligned + span) as *mut libc::c_void, end - aligned - span);
+            }
+        }
+        self.map_base = aligned as *mut libc::c_void;
+        self.map_len = span;
+        self.mapped = true;
+        let p = unsafe {
+            libc::mmap(self.map_base, span, libc::PROT_READ | libc::PROT_WRITE,
+                       libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE, -1, 0)
+        };
+        if p == libc::MAP_FAILED {
+            return Err(format!("cannot allocate {:.1} GB for {}: {}", span as f64 / 1e9, path, strerror(errno())));
+        }
+        unsafe { libc::madvise(p, span, libc::MADV_HUGEPAGE) };
+        self.base = p as *const u8;
+
+        // Several readers: a file still in the page cache is copied at memory speed, one on
+        // disk is read at the disk's speed.
+        const CHUNK: usize = 64 << 20;
+        let nchunks = size.div_ceil(CHUNK);
+        let next = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let err = std::sync::Mutex::new(String::new());
+        let readers = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8);
+        let (fd, dst) = (self.fd, crate::SyncPtr(p as *mut u8));
+        let t0 = crate::util::now_ns();
+        std::thread::scope(|s| {
+            for _ in 0..readers {
+                s.spawn(|| loop {
+                    let c = next.fetch_add(1, Ordering::SeqCst);
+                    if c >= nchunks || failed.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let off = c * CHUNK;
+                    let len = CHUNK.min(size - off);
+                    let mut got = 0;
+                    while got < len {
+                        // Each chunk is written by one reader only.
+                        let r = unsafe {
+                            libc::pread(fd, dst.get(off + got) as *mut libc::c_void, len - got, (off + got) as libc::off_t)
+                        };
+                        if r < 0 && errno() == libc::EINTR {
+                            continue;
+                        }
+                        if r <= 0 {
+                            *err.lock().unwrap() =
+                                format!("reading {} at offset {}: {}", path, off + got, if r < 0 { strerror(errno()) } else { "unexpected end of file".into() });
+                            failed.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                        got += r as usize;
+                    }
+                    // The data now lives in our memory: drop the page-cache copy.
+                    unsafe { libc::posix_fadvise(fd, off as libc::off_t, len as libc::off_t, libc::POSIX_FADV_DONTNEED) };
+                    done.fetch_add(len, Ordering::Relaxed);
+                });
+            }
+            // Progress for long loads (a large file read from disk takes minutes).
+            let mut last = t0;
+            while done.load(Ordering::Relaxed) < size && !failed.load(Ordering::Relaxed) {
+                crate::util::sleep_ns(100_000_000);
+                let now = crate::util::now_ns();
+                if now - last >= 10 * crate::NS_PER_SEC {
+                    last = now;
+                    let d = done.load(Ordering::Relaxed);
+                    log_info!(
+                        "  loaded {:.1} of {:.1} GB ({:.2} GB/s)",
+                        d as f64 / 1e9,
+                        size as f64 / 1e9,
+                        d as f64 / ((now - t0) as f64 / 1e9) / 1e9
+                    );
+                }
+            }
+        });
+        if failed.load(Ordering::SeqCst) {
+            return Err(err.into_inner().unwrap());
+        }
+        // Keep the whole file in RAM for the run.
+        self.locked = unsafe { libc::mlock(p, span) } == 0;
+        self.preloaded = true;
+        Ok(())
     }
 
     #[inline(always)]

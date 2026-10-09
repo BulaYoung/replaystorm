@@ -279,7 +279,7 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
         o.mtu = mtu as u32;
     }
     let data_room = (o.mtu as usize + 18).max(2048) as u32;
-    let nb_desc = tx_descriptors(o, max_desc, ntxq, data_room);
+    let nb_desc = tx_descriptors(o, max_desc, ntxq, data_room, &driver);
     let nmbufs = nb_desc as u32 + 2 * o.batch + 1024;
     let mut err = [0u8; 256];
     // Zero-copy needs the whole file in memory for the run (--preload).
@@ -361,10 +361,15 @@ fn hugepages_free() -> u64 {
 /// TX descriptors per queue: --ring-frames if given, else the NIC's maximum, as far as the
 /// mbuf pools of all queues fit into the free hugepages.
 #[cfg(feature = "dpdk")]
-fn tx_descriptors(o: &Opts, max_desc: u16, ntxq: usize, data_room: u32) -> u16 {
+fn tx_descriptors(o: &Opts, max_desc: u16, ntxq: usize, data_room: u32, driver: &str) -> u16 {
     let max = if max_desc == 0 { 4096 } else { max_desc as u32 };
     if o.ring_frames_set {
         return o.ring_frames.min(max).min(u16::MAX as u32) as u16;
+    }
+    // mlx5 stops inlining frame headers into the descriptors of a large queue (txq_inline
+    // 290 -> 12 bytes), and the NIC then fetches every header with a separate DMA read.
+    if driver.starts_with("mlx5") {
+        return max.min(4096) as u16;
     }
     let per = data_room as u64 + MBUF_OVERHEAD;
     let pool = |d: u32| (d as u64 + 2 * o.batch as u64 + 1024) * per * ntxq as u64;
