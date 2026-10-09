@@ -102,23 +102,35 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
     let given = o.dpdk.clone().unwrap();
     // An interface name is turned into the NIC's PCI address (DPDK knows no interface names).
     let resolved = sys::resolve(&given)?;
+    // A NIC given by interface name or PCI address: say which it is, and check that DPDK
+    // can use it with its current driver.
     let want = match &resolved {
-        Some((pci, Some(iface))) => {
+        Some((pci, iface)) => {
+            if !std::path::Path::new(&format!("/sys/bus/pci/devices/{}", pci)).exists() {
+                return Err(format!("PCI device {} not found (lspci -D, dpdk-devbind.py -s)", pci));
+            }
             let drv = sys::driver_of(pci).unwrap_or_default();
-            log_info!("DPDK: interface {} is the NIC {}{}", iface, pci, if drv.is_empty() { String::new() } else { format!(" (driver {})", drv) });
+            let iface = iface.clone().or_else(|| sys::netdev_of(pci));
+            log_info!(
+                "DPDK: NIC {}{}{}",
+                pci,
+                iface.as_ref().map(|i| format!(", interface {}", i)).unwrap_or_default(),
+                if drv.is_empty() { ", no driver".to_string() } else { format!(", driver {}", drv) }
+            );
             // Only vfio/uio drivers (and mlx5, which works next to its kernel driver) are
             // usable by DPDK.
             let usable = matches!(drv.as_str(), "vfio-pci" | "uio_pci_generic" | "igb_uio" | "mlx5_core");
             if !usable && !o.dpdk_bind {
                 return Err(format!(
-                    "{} ({}) is driven by the kernel ({}): add --dpdk-bind to move it to vfio-pci for the run, \
-                     or bind it yourself (dpdk-devbind.py -b vfio-pci {})",
-                    iface, pci, drv, pci
+                    "{} is {}: add --dpdk-bind to move it to vfio-pci for the run, or bind it yourself \
+                     (dpdk-devbind.py -b vfio-pci {})",
+                    pci,
+                    if drv.is_empty() { "not bound to any driver".to_string() } else { format!("driven by the kernel ({})", drv) },
+                    pci
                 ));
             }
             pci.clone()
         }
-        Some((pci, None)) => pci.clone(),
         None => given.clone(),
     };
     // The EAL pins the calling thread to its main lcore; the replay's own threads choose

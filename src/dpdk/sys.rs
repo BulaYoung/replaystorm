@@ -55,7 +55,7 @@ pub fn driver_of(pci: &str) -> Option<String> {
 }
 
 /// Network interface of the device, if the kernel driver has created one.
-fn netdev_of(pci: &str) -> Option<String> {
+pub fn netdev_of(pci: &str) -> Option<String> {
     let rd = std::fs::read_dir(p(&format!("{}/net", dev(pci)))).ok()?;
     rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).next()
 }
