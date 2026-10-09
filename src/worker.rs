@@ -5,7 +5,7 @@ use crate::clock;
 use crate::dio::{Dio, DIO_CHUNK, DIO_CHUNK_SHIFT};
 use crate::dpdk::TxQueue;
 use crate::index::PktIndex;
-use crate::mutate::{mutate, MutateCfg};
+use crate::mutate::{mutate, mutate_extent, MutateCfg};
 use crate::prepare::Ctx;
 use crate::sched::{lh_bucket, radix_sort16, target, Rec16, TsOrder, LH_BUCKETS};
 use crate::util::{cpu_relax, errno, now_ns, sleep_ns, strerror};
@@ -86,6 +86,7 @@ pub struct WStats {
     pub state: AtomicI32,       // W_*
     pub wait_ns: [AtomicU64; W_COUNT],
     pub link_lost: AtomicU64,   // frames lost when the interface was re-created
+    pub zc: AtomicU64,          // frames sent without copying (zero-copy)
     pub finished: AtomicBool,
 }
 
@@ -286,7 +287,15 @@ struct Worker<'a> {
     l_sends: u64,
     l_enobufs: u64,
     l_eagain: u64,
+    zc: bool,       // DPDK zero-copy from the preloaded file
+    zc_multi: bool, // with a copied header segment in front
+    l_zc: u64,
 }
+
+/// Zero-copy: frames up to this length are copied (cheaper than two mbufs).
+const ZC_MIN_FRAME: usize = 256;
+/// Zero-copy: at most this many header bytes are copied for a frame that is modified.
+const ZC_MAX_HEADER: usize = 192;
 
 /// Back off after the device queue rejected frames (ENOBUFS/EAGAIN). Hammering send() in a
 /// tight loop only burns the CPU: the queue frees up at line rate anyway. The first few
@@ -378,6 +387,7 @@ impl<'a> Worker<'a> {
         st.sends.store(self.l_sends, RLX);
         st.enobufs.store(self.l_enobufs, RLX);
         st.eagain.store(self.l_eagain, RLX);
+        st.zc.store(self.l_zc, RLX);
     }
 
     fn fatal(&self, what: &str, e: i32) {
@@ -457,8 +467,9 @@ impl<'a> Worker<'a> {
 
     /// DPDK: a free mbuf. When the pool is empty, all mbufs are queued in the NIC: send
     /// what is pending and let the driver return the completed ones.
-    fn acquire_mbuf(&mut self) -> Option<*mut libc::c_void> {
-        if let Some(m) = self.dq.as_mut().unwrap().alloc() {
+    fn acquire_mbuf(&mut self, zc: bool) -> Option<*mut libc::c_void> {
+        let alloc = |dq: &mut TxQueue| if zc { dq.alloc_zc() } else { dq.alloc() };
+        if let Some(m) = alloc(self.dq.as_mut().unwrap()) {
             return Some(m);
         }
         let (t0, prev) = self.wenter(W_RING);
@@ -474,7 +485,7 @@ impl<'a> Worker<'a> {
                 let dq = self.dq.as_mut().unwrap();
                 dq.cleanup();
             }
-            if let Some(m) = self.dq.as_mut().unwrap().alloc() {
+            if let Some(m) = alloc(self.dq.as_mut().unwrap()) {
                 self.wleave(W_RING, prev, t0);
                 return Some(m);
             }
@@ -701,6 +712,74 @@ impl<'a> Worker<'a> {
         Some(unsafe { self.dio_buf.add((off & (DIO_CHUNK - 1)) as usize) })
     }
 
+    /// Synthetic Ethernet header for RAW IP (src: the IP packet).
+    #[inline(always)]
+    unsafe fn write_eth(&self, dst: *mut u8, src: *const u8, len: usize) {
+        let o = &self.c.o;
+        let raw_ip = self.c.pf.raw_ip;
+        std::ptr::copy_nonoverlapping(o.dmac.as_ptr(), dst, 6);
+        std::ptr::copy_nonoverlapping(o.smac.as_ptr(), dst.add(6), 6);
+        let v6 = raw_ip == 6 || (raw_ip == 1 && len > 0 && (*src >> 4) == 6);
+        *dst.add(12) = if v6 { 0x86 } else { 0x08 };
+        *dst.add(13) = if v6 { 0xdd } else { 0x00 };
+    }
+
+    /// Zero-copy: the frame goes out straight from the preloaded file. Only what has to
+    /// differ from the file is copied into a small header mbuf (the synthetic Ethernet header
+    /// for RAW IP, the headers --loop-mutate changes); the rest follows as a second segment
+    /// pointing into the file. None: the frame has to be copied after all.
+    #[inline(always)]
+    fn emit_zc(&mut self, src: *const u8, len: usize, lap: u64) -> Option<bool> {
+        let raw_ip = self.c.pf.raw_ip;
+        let eth = if raw_ip != 0 { 14 } else { 0 };
+        let mutating = self.mutate && lap > 0;
+        let hs = if mutating {
+            mutate_extent(unsafe { std::slice::from_raw_parts(src, len) }, raw_ip)
+        } else {
+            0
+        };
+        if hs > ZC_MAX_HEADER || hs + 64 > len {
+            return None;
+        }
+        let hlen = eth + hs;
+        if hlen > 0 && !self.zc_multi {
+            return None; // the driver takes single-segment frames only
+        }
+        let Some(tail) = self.acquire_mbuf(true) else { return Some(false) };
+        let frame = if hlen > 0 {
+            let Some(head) = self.acquire_mbuf(false) else {
+                self.dq.as_mut().unwrap().push_free(tail);
+                return Some(false);
+            };
+            let dq = self.dq.as_ref().unwrap();
+            unsafe {
+                let dst = dq.data(head, hlen as u32);
+                if eth > 0 {
+                    self.write_eth(dst, src, len);
+                }
+                std::ptr::copy_nonoverlapping(src, dst.add(eth), hs);
+                if mutating {
+                    mutate(std::slice::from_raw_parts_mut(dst, hlen), lap, &self.mut_cfg);
+                }
+                dq.attach(tail, src.add(hs), (len - hs) as u32);
+                dq.chain(head, tail);
+            }
+            head
+        } else {
+            unsafe { self.dq.as_ref().unwrap().attach(tail, src, len as u32) };
+            tail
+        };
+        self.dq.as_mut().unwrap().push(frame);
+        self.pending += 1;
+        self.l_pkts += 1;
+        self.l_bytes += (len + eth) as u64;
+        self.l_zc += 1;
+        if self.pending >= self.c.o.batch {
+            self.flush();
+        }
+        Some(true)
+    }
+
     /// Copy a packet into the ring and mark it for sending.
     #[inline(always)]
     fn emit(&mut self, p: Pkt, lap: u64) -> bool {
@@ -708,10 +787,15 @@ impl<'a> Worker<'a> {
         let o = &self.c.o;
         let raw_ip = self.c.pf.raw_ip;
         let len = offlen_len(p.offlen) as usize;
+        if self.zc && len > ZC_MIN_FRAME {
+            if let Some(ok) = self.emit_zc(src, len, lap) {
+                return ok;
+            }
+        }
         let flen = len + if raw_ip != 0 { 14 } else { 0 };
         // Destination: a TX ring frame, or a DPDK mbuf.
         let (h, m, dst) = if self.dq.is_some() {
-            let Some(m) = self.acquire_mbuf() else { return false };
+            let Some(m) = self.acquire_mbuf(false) else { return false };
             (std::ptr::null_mut(), m, unsafe { self.dq.as_ref().unwrap().data(m, flen as u32) })
         } else {
             let Some(h) = self.acquire() else { return false };
@@ -720,11 +804,7 @@ impl<'a> Worker<'a> {
         unsafe {
             if raw_ip != 0 {
                 // Synthetic Ethernet header for RAW IP.
-                std::ptr::copy_nonoverlapping(o.dmac.as_ptr(), dst, 6);
-                std::ptr::copy_nonoverlapping(o.smac.as_ptr(), dst.add(6), 6);
-                let v6 = raw_ip == 6 || (raw_ip == 1 && len > 0 && (*src >> 4) == 6);
-                *dst.add(12) = if v6 { 0x86 } else { 0x08 };
-                *dst.add(13) = if v6 { 0xdd } else { 0x00 };
+                self.write_eth(dst, src, len);
                 std::ptr::copy_nonoverlapping(src, dst.add(14), len);
             } else {
                 std::ptr::copy_nonoverlapping(src, dst, len);
@@ -1017,6 +1097,9 @@ pub fn worker_main<'a, 'd: 'a>(c: &'a Ctx, ix: &RwLock<PktIndex>, me: &'a Worker
         l_sends: 0,
         l_enobufs: 0,
         l_eagain: 0,
+        zc: crate::dpdk::zero_copy(),
+        zc_multi: crate::dpdk::zero_copy_multi(),
+        l_zc: 0,
     };
     if let Some(s) = setup.get() {
         w.dio = s.dio;

@@ -32,7 +32,11 @@ fn main() {
                 replay::analyze(&c);
                 0
             } else {
-                replay::run(&mut c)
+                let rc = replay::run(&mut c);
+                // The port goes first: with zero-copy its queues still point into the file.
+                replaystorm::dpdk::shutdown();
+                drop(c);
+                rc
             }
         }
     };

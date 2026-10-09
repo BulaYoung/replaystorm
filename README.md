@@ -390,6 +390,27 @@ sharding, schedules, mutation, direct I/O, statistics); each sender thread gets 
 queue and mbuf pool, frames are copied into mbufs and sent with `rte_eth_tx_burst` in batches,
 a full TX queue is backpressure and the thread retries.
 
+### Zero-copy (`--dpdk` with `--preload`)
+
+With the whole file in memory for the run, frames are not copied into mbufs at all: the
+preloaded file is registered with the port as external memory (`rte_extmem_register`,
+`rte_dev_dma_map`; for mlx5 a memory region), and a frame is an mbuf pointing to its bytes in
+the file, read by the NIC with DMA. What has to differ from the file is copied into a small
+header mbuf in front of it (a two-segment frame): the synthetic Ethernet header for RAW IP,
+and on `--loop-mutate` laps the headers up to the end of the L4 checksum. Frames up to 256
+bytes are copied (cheaper than two mbufs). Without copying, the CPU and the memory bandwidth
+it used are free: on the laptop with the null driver (which does not read the data) one
+thread went from 46 to 115 Gbit/s, four from 52 to 220 Gbit/s. With a real NIC the frame data
+is still read once by its DMA, so the gain depends on the platform; on memory-bound servers
+it is the largest.
+
+- On by default with `--dpdk --preload`; `--zero-copy off` copies every frame. The summary
+  says how many frames went out without copying.
+- Drivers without multi-segment TX use zero-copy only for frames sent unchanged.
+- The file is mapped 2 MB aligned for the registration and stays mapped until the port is
+  closed. The functional tests check that every frame is byte for byte the same as with
+  copying, on three `--loop-mutate` laps, for Ethernet and RAW IP.
+
 Build (needs DPDK with pkg-config, e.g. `dnf install dpdk dpdk-devel dpdk-tools numactl-devel`):
 
 ```sh
@@ -724,6 +745,9 @@ Sending:
   --dpdk-bind-group       like --dpdk-bind, and also move the other devices of the NIC's
                           IOMMU group (usually the other ports of the card), which VFIO
                           requires when they share one group
+  --zero-copy MODE        auto | off: with --dpdk and --preload, frames larger than 256
+                          bytes are sent straight from the file in memory instead of
+                          being copied; only headers that change are copied (auto)
   --dpdk-hugepages SIZE   reserve SIZE of 2 MB hugepages (e.g. 4G) on the NIC's NUMA node
                           for the run and release them at the end
 

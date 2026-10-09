@@ -104,6 +104,7 @@ pub struct Opts {
     pub dpdk_bind: bool,      // --dpdk-bind: move the NIC to vfio-pci and back
     pub dpdk_bind_group: bool, // --dpdk-bind-group: also the rest of its IOMMU group
     pub dpdk_hugepages: u64,  // --dpdk-hugepages: bytes reserved for the run (0 = none)
+    pub zero_copy: bool,      // --zero-copy auto|off (DPDK with --preload)
 }
 
 impl Opts {
@@ -173,6 +174,7 @@ impl Default for Opts {
             dpdk_bind: false,
             dpdk_bind_group: false,
             dpdk_hugepages: 0,
+            zero_copy: true,
         }
     }
 }
@@ -240,6 +242,9 @@ Sending:
   --dpdk-bind-group       like --dpdk-bind, and also move the other devices of the NIC's
                           IOMMU group (usually the other ports of the card), which VFIO
                           requires when they share one group
+  --zero-copy MODE        auto | off: with --dpdk and --preload, frames larger than 256
+                          bytes are sent straight from the file in memory instead of
+                          being copied; only headers that change are copied (auto)
   --dpdk-hugepages SIZE   reserve SIZE of 2 MB hugepages (e.g. 4G) on the NIC's NUMA node
                           for the run and release them at the end
 
@@ -351,6 +356,7 @@ const LONG_OPTS: &[(&str, bool)] = &[
     ("dpdk", true),
     ("eal", true),
     ("dpdk-bind", false),
+    ("zero-copy", true),
     ("dpdk-bind-group", false),
     ("dpdk-hugepages", true),
 ];
@@ -660,6 +666,13 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, ()> {
             "dpdk" => o.dpdk = Some(v.to_string()),
             "eal" => o.eal = Some(v.to_string()),
             "dpdk-bind" => o.dpdk_bind = true,
+            "zero-copy" => {
+                o.zero_copy = match v {
+                    "auto" => true,
+                    "off" => false,
+                    _ => return bad("--zero-copy", v),
+                }
+            }
             "dpdk-bind-group" => {
                 o.dpdk_bind = true;
                 o.dpdk_bind_group = true;

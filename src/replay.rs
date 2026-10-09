@@ -746,6 +746,17 @@ fn print_summary(x: &Summary, end: &Snap, start: &Snap, elapsed: f64, json: Opti
         end.eagain
     );
     println!("Skipped frames (per lap): {}, truncated at capture: {}", x.skipped, x.truncated);
+    if crate::dpdk::zero_copy() {
+        let zc: u64 = x.ws.iter().map(|w| w.st.zc.load(RLX)).sum();
+        println!(
+            "Zero-copy: {} of {} frames ({:.1}%) sent straight from the file in memory; the rest (up to {} bytes, \
+             or with long headers to change) copied",
+            zc,
+            pkts,
+            if pkts > 0 { 100.0 * zc as f64 / pkts as f64 } else { 0.0 },
+            256
+        );
+    }
     let late_n: u64 = end.hist.iter().sum();
     let timed = c.o.mode == Mode::Timed;
     if timed && late_n > 0 {
@@ -949,6 +960,12 @@ where
 /// Replay; returns the exit code.
 pub fn run(c: &mut Ctx) -> i32 {
     report::warnings(c);
+    // DPDK zero-copy: frames point straight into the preloaded file.
+    if crate::dpdk::port().is_some() && c.o.zero_copy {
+        if let Some(span) = c.pf.preload_span() {
+            crate::dpdk::register_file(span, c.pf.size);
+        }
+    }
     let ixlock = RwLock::new(std::mem::take(&mut c.ix));
     let c: &Ctx = c;
     let o = &c.o;

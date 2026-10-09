@@ -507,6 +507,27 @@ def t_dpdk(pcaps, spin):
     check(p95 < TOL_P95, "dpdk x1: p95 interval error < %d us" % (TOL_P95 // 1000))
     check(abs(real - want) < 0.002 * want + 300_000, "dpdk x1: total duration matches (±0.2%)")
 
+    print("== DPDK zero-copy (--preload): the same frames as with copying, on every lap")
+    for lt, name in ((1, "Ethernet"), (101, "RAW IP")):
+        p = "/tmp/afr_zc_%d.pcap" % lt
+        write_big_frames_pcap(p, lt)
+        extra = ["--preload", "--loop", "3", "--pps", "20000", "-t", "2", "--loop-mutate", "ip,port"]
+        rc1, out1, f_zc, _ = replay_dpdk(p, extra)
+        rc2, out2, f_cp, _ = replay_dpdk(p, extra + ["--zero-copy", "off"])
+        zc = [l for l in out1.splitlines() if l.startswith("Zero-copy:")]
+        pct = float(zc[0].split("(")[1].split("%")[0]) if zc else 0.0
+        check(rc1 == 0 and rc2 == 0 and pct > 60,
+              "%s: zero-copy used for %.1f%% of the frames" % (name, pct))
+        check("Zero-copy:" not in out2, "%s: --zero-copy off copies every frame" % name)
+        got_zc = [f for _, f in f_zc]
+        got_cp = [f for _, f in f_cp]
+        check(len(got_zc) == len(got_cp) == 3 * 400 and collections.Counter(got_zc) == collections.Counter(got_cp),
+              "%s: 3 laps with --loop-mutate, every frame identical to the copied one (%d, %d)"
+              % (name, len(got_zc), len(got_cp)))
+        bad = [f for f in got_zc if ip_l4_sums_ok(f) is False]
+        check(not bad, "%s: checksums correct on every lap (%d errors)" % (name, len(bad)))
+        os.unlink(p)
+
     print("== DPDK: status and errors")
     p = os.path.join(pcaps, "timing.pcap")
     proc = subprocess.Popen([BIN] + dpdk_args() + ["-q", "--multiplier", "0.2", p],
@@ -521,6 +542,65 @@ def t_dpdk(pcaps, spin):
     check(rc == 1 and "no DPDK ports" in out, "dpdk: no ports -> code 1 and a hint (%d)" % rc)
     rc, out = run_afr(["-i", TX, "--dpdk", DPDK_PORT, p])
     check(rc == 2, "-i together with --dpdk: code 2")
+
+
+def csum16(b):
+    if len(b) % 2:
+        b += b"\0"
+    s = sum(struct.unpack("!%dH" % (len(b) // 2), b))
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+
+def big_frame(i, raw):
+    """Frames of 300..1500 bytes with valid checksums: IPv4/IPv6, TCP/UDP, some in a VLAN."""
+    import random
+    rnd = random.Random(i)
+    v6 = i % 3 == 2
+    proto = 6 if i % 2 == 0 else 17
+    plen = rnd.randint(260, 1400)
+    payload = bytes(rnd.getrandbits(8) for _ in range(plen))
+    sport, dport = 1024 + i % 5000, (443 if proto == 6 else 53)
+    l4len = (20 if proto == 6 else 8) + plen
+    if v6:
+        src = bytes.fromhex("20010db8000000000000000000%06x" % i)
+        dst = bytes.fromhex("20010db8000000010000000000000001")
+        pseudo = src + dst + struct.pack("!IxxxB", l4len, proto)
+    else:
+        src = struct.pack("!I", 0x0a000000 + i)
+        dst = struct.pack("!I", 0xc0a80101)
+        pseudo = src + dst + struct.pack("!xBH", proto, l4len)
+    if proto == 6:
+        l4 = struct.pack("!HHIIBBHHH", sport, dport, i, 0, 0x50, 0x18, 8192, 0, 0) + payload
+        c = csum16(pseudo + l4)
+        l4 = l4[:16] + struct.pack("!H", c) + l4[18:]
+    else:
+        l4 = struct.pack("!HHHH", sport, dport, l4len, 0) + payload
+        c = csum16(pseudo + l4) or 0xFFFF
+        l4 = l4[:6] + struct.pack("!H", c) + l4[8:]
+    if v6:
+        ip = struct.pack("!IHBB", 0x60000000, l4len, proto, 64) + src + dst
+        et = b"\x86\xdd"
+    else:
+        h = struct.pack("!BBHHHBBH", 0x45, 0, 20 + l4len, i & 0xFFFF, 0, 64, proto, 0) + src + dst
+        ip = h[:10] + struct.pack("!H", csum16(h)) + h[12:]
+        et = b"\x08\x00"
+    if raw:
+        return ip + l4
+    l2 = bytes([2, 0, 0, 0, 1, i & 0xFF]) + bytes([2, 0, 0, 0, 2, 7])
+    if i % 4 == 1:
+        l2 += b"\x81\x00" + struct.pack("!H", 100 + i % 7)
+    return l2 + et + ip + l4
+
+
+def write_big_frames_pcap(path, linktype, n=400):
+    with open(path, "wb") as f:
+        f.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, linktype))
+        for i in range(n):
+            fr = big_frame(i, linktype != 1)
+            f.write(struct.pack("<IIII", 1700000000 + i // 1000, (i % 1000) * 1000, len(fr), len(fr)))
+            f.write(fr)
 
 
 def t_cli(pcaps):

@@ -82,6 +82,20 @@ fn l4_csum(f: &[u8], d: &Dis) -> (Option<usize>, bool) {
     (Some(c), is_udp)
 }
 
+/// How many bytes at the start of the frame mutate() may change: everything up to the end
+/// of the L4 header part it rewrites (addresses, ports, checksums). 0: nothing (not IP).
+pub fn mutate_extent(f: &[u8], raw_ip: i32) -> usize {
+    let d = dissect(f, raw_ip);
+    if d.l3 == 0 {
+        return 0;
+    }
+    let mut end = d.l3_off as usize + if d.l3 == 4 { 20 } else { 40 };
+    if d.l4_off != 0 {
+        end = end.max(d.l4_off as usize + 20);
+    }
+    end.min(f.len())
+}
+
 /// Modify the frame in place for lap (> 0). Returns true if the frame was changed.
 pub fn mutate(f: &mut [u8], lap: u64, cfg: &MutateCfg) -> bool {
     if lap == 0 {
@@ -278,6 +292,34 @@ mod tests {
         }
         fill_sums(&mut f);
         f
+    }
+
+    /// Mutating only the first mutate_extent() bytes gives the same frame as mutating it all.
+    #[test]
+    fn extent_covers_changes() {
+        let cfg = MutateCfg { ip: true, port: true, ip_offset: 0x00010000, port_step: 3, raw_ip: 0 };
+        let frames = [
+            build_v4(false, 6, 0x0a000001, 0xc0a80105, 51000, 443, 0),
+            build_v4(true, 17, 0x0a000001, 0xc0a80105, 3000, 4000, 0),
+            build_v4(false, 17, 0x0a000001, 0x0a000002, 5000, 6000, 0x2000),
+            build_v6(6),
+            build_v6(17),
+        ];
+        for f in frames {
+            let mut full = f.clone();
+            mutate(&mut full, 7, &cfg);
+            let n = mutate_extent(&f, 0);
+            assert!(n > 0 && n <= f.len());
+            let mut head = f[..n].to_vec();
+            mutate(&mut head, 7, &cfg);
+            let mut joined = head;
+            joined.extend_from_slice(&f[n..]);
+            assert_eq!(joined, full);
+        }
+        let mut arp = [0u8; 60];
+        arp[12] = 0x08;
+        arp[13] = 0x06;
+        assert_eq!(mutate_extent(&arp, 0), 0);
     }
 
     #[test]

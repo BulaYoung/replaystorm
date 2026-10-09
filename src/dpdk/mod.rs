@@ -23,6 +23,26 @@ pub struct PortInfo {
     pub nb_desc: u16, // descriptors per TX queue
     pub mtu: u16,
     pub socket: i32,
+    pub zc_capable: bool, // zero-copy pools are set up
+    pub zc_multi: bool,   // the driver sends multi-segment frames (header + file data)
+}
+
+/// Zero-copy is active: frames are sent straight from the preloaded file.
+static ZERO_COPY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The registered file: (address, registered length, DMA-mapped length, mapped for DMA).
+#[cfg(feature = "dpdk")]
+static EXTMEM: std::sync::Mutex<Option<(usize, usize, usize, bool)>> = std::sync::Mutex::new(None);
+/// The port has been stopped and closed.
+#[cfg(feature = "dpdk")]
+static CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn zero_copy() -> bool {
+    ZERO_COPY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Zero-copy frames may have a copied header segment in front of the file data.
+pub fn zero_copy_multi() -> bool {
+    zero_copy() && PORT.get().is_some_and(|p| p.zc_multi)
 }
 
 /// The port in use (set once by init).
@@ -50,7 +70,12 @@ mod ffi {
         pub fn rs_dpdk_port_name(port: u16, buf: *mut c_char, n: usize) -> c_int;
         pub fn rs_dpdk_info(port: u16, max_txq: *mut u16, max_desc: *mut u16, mtu: *mut u16, socket: *mut c_int, driver: *mut c_char, n: usize) -> c_int;
         pub fn rs_dpdk_link(port: u16, speed: *mut u32, up: *mut c_int) -> c_int;
-        pub fn rs_dpdk_setup(port: u16, ntxq: u16, nb_desc: u16, nmbufs: c_uint, data_room: c_uint, mtu: u16, err: *mut c_char, errlen: usize) -> c_int;
+        pub fn rs_dpdk_setup(port: u16, ntxq: u16, nb_desc: u16, nmbufs: c_uint, data_room: c_uint, mtu: u16, zc: c_int, zc_ok: *mut c_int, err: *mut c_char, errlen: usize) -> c_int;
+        pub fn rs_dpdk_alloc_zc(q: u16, m: *mut *mut c_void, n: c_uint) -> c_int;
+        pub fn rs_dpdk_attach(m: *mut c_void, addr: *const u8, len: u32);
+        pub fn rs_dpdk_chain(head: *mut c_void, tail: *mut c_void);
+        pub fn rs_dpdk_extmem(port: u16, addr: *mut u8, len: usize, dma_len: usize, page_sz: usize, err: *mut c_char, errlen: usize) -> c_int;
+        pub fn rs_dpdk_extmem_release(port: u16, addr: *mut u8, len: usize, dma_len: usize, mapped: c_int);
         pub fn rs_dpdk_alloc(q: u16, m: *mut *mut c_void, n: c_uint) -> c_int;
         pub fn rs_dpdk_data(m: *mut c_void, len: u32) -> *mut u8;
         pub fn rs_dpdk_tx(port: u16, q: u16, m: *mut *mut c_void, n: u16) -> u16;
@@ -257,8 +282,12 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
     let nb_desc = tx_descriptors(o, max_desc, ntxq, data_room);
     let nmbufs = nb_desc as u32 + 2 * o.batch + 1024;
     let mut err = [0u8; 256];
+    // Zero-copy needs the whole file in memory for the run (--preload).
+    let want_zc = o.preload && o.zero_copy;
+    let mut zc_ok = 0i32;
     let r = unsafe {
-        ffi::rs_dpdk_setup(port, ntxq as u16, nb_desc, nmbufs, data_room, o.mtu as u16, err.as_mut_ptr() as *mut _, err.len())
+        ffi::rs_dpdk_setup(port, ntxq as u16, nb_desc, nmbufs, data_room, o.mtu as u16, want_zc as i32, &mut zc_ok,
+                           err.as_mut_ptr() as *mut _, err.len())
     };
     if r < 0 {
         return Err(format!("port {}: {}", name, cstr(&err)));
@@ -276,7 +305,24 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
             sleep_ns(100 * crate::NS_PER_MS);
         }
     }
-    let info = PortInfo { port, name, driver, ntxq: ntxq as u16, nb_desc: r as u16, mtu: o.mtu as u16, socket };
+    if want_zc && zc_ok == 0 {
+        log_warn!(
+            "{}: the driver cannot send multi-segment frames: zero-copy only for frames that are sent \
+             unchanged (no --loop-mutate laps, no RAW IP)",
+            driver
+        );
+    }
+    let info = PortInfo {
+        port,
+        name,
+        driver,
+        ntxq: ntxq as u16,
+        nb_desc: r as u16,
+        mtu: o.mtu as u16,
+        socket,
+        zc_capable: want_zc,
+        zc_multi: zc_ok != 0,
+    };
     log_info!(
         "DPDK: port {} {} ({}), {} TX queues of {} descriptors, NUMA node {}, link {}",
         info.port,
@@ -380,7 +426,13 @@ pub fn shutdown() {
     #[cfg(feature = "dpdk")]
     {
         if let Some(p) = PORT.get() {
-            unsafe { ffi::rs_dpdk_close(p.port) };
+            if !CLOSED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                // Closing frees the frames still queued, before their memory goes away.
+                unsafe { ffi::rs_dpdk_close(p.port) };
+                if let Some((addr, len, dma_len, mapped)) = EXTMEM.lock().unwrap().take() {
+                    unsafe { ffi::rs_dpdk_extmem_release(p.port, addr as *mut u8, len, dma_len, mapped as i32) };
+                }
+            }
         }
         if EAL_UP.swap(false, std::sync::atomic::Ordering::SeqCst) {
             unsafe { ffi::rs_dpdk_cleanup() };
@@ -389,11 +441,48 @@ pub fn shutdown() {
     }
 }
 
+/// Zero-copy: register the preloaded file (aligned start, aligned length; the first
+/// mapped_len bytes are mapped) with the port, so that frames can point into it. Returns
+/// whether zero-copy is on.
+pub fn register_file(span: (*mut u8, usize), mapped_len: usize) -> bool {
+    #[cfg(feature = "dpdk")]
+    {
+        let Some(p) = PORT.get().filter(|p| p.zc_capable) else { return false };
+        let (addr, len) = span;
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let dma_len = mapped_len.div_ceil(page) * page;
+        let mut err = [0u8; 256];
+        let t0 = now_ns();
+        let r = unsafe {
+            ffi::rs_dpdk_extmem(p.port, addr, len, dma_len, crate::pcap::PRELOAD_ALIGN, err.as_mut_ptr() as *mut _, err.len())
+        };
+        if r < 0 {
+            log_warn!("zero-copy is off: {}", cstr(&err));
+            return false;
+        }
+        *EXTMEM.lock().unwrap() = Some((addr as usize, len, dma_len, r == 0));
+        ZERO_COPY.store(true, std::sync::atomic::Ordering::SeqCst);
+        log_info!(
+            "DPDK: zero-copy: frames are sent straight from the preloaded file ({:.1} GB {} in {:.1} s)",
+            mapped_len as f64 / 1e9,
+            if r == 0 { "registered for DMA" } else { "used by the driver as is" },
+            (now_ns() - t0) as f64 / 1e9
+        );
+        true
+    }
+    #[cfg(not(feature = "dpdk"))]
+    {
+        let _ = (span, mapped_len);
+        false
+    }
+}
+
 /// A sender thread's TX queue: allocated mbufs ready for frames, and frames not yet sent.
 pub struct TxQueue {
     port: u16,
     q: u16,
     stash: Vec<*mut libc::c_void>,
+    zc_stash: Vec<*mut libc::c_void>, // mbufs of the zero-copy pool
     pending: Vec<*mut libc::c_void>,
     #[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
     batch: usize,
@@ -403,7 +492,14 @@ unsafe impl Send for TxQueue {}
 
 impl TxQueue {
     pub fn new(port: u16, q: u16, batch: usize) -> TxQueue {
-        TxQueue { port, q, stash: Vec::with_capacity(batch), pending: Vec::with_capacity(batch), batch }
+        TxQueue {
+            port,
+            q,
+            stash: Vec::with_capacity(batch),
+            zc_stash: Vec::with_capacity(batch),
+            pending: Vec::with_capacity(batch),
+            batch,
+        }
     }
 
     pub fn pending(&self) -> usize {
@@ -417,19 +513,45 @@ impl TxQueue {
             return Some(m);
         }
         #[cfg(feature = "dpdk")]
-        {
-            // Bulk allocation is all-or-nothing: fall back to smaller requests.
-            let mut n = self.batch;
-            while n > 0 {
-                self.stash.resize(n, std::ptr::null_mut());
-                if unsafe { ffi::rs_dpdk_alloc(self.q, self.stash.as_mut_ptr(), n as u32) } == 0 {
-                    return self.stash.pop();
-                }
-                n /= 4;
-            }
-            self.stash.clear();
-        }
+        return refill(&mut self.stash, self.batch, |m, n| unsafe { ffi::rs_dpdk_alloc(self.q, m, n) });
+        #[cfg(not(feature = "dpdk"))]
         None
+    }
+
+    /// A free mbuf of the zero-copy pool (no data room: it points into the file).
+    #[inline(always)]
+    pub fn alloc_zc(&mut self) -> Option<*mut libc::c_void> {
+        if let Some(m) = self.zc_stash.pop() {
+            return Some(m);
+        }
+        #[cfg(feature = "dpdk")]
+        return refill(&mut self.zc_stash, self.batch, |m, n| unsafe { ffi::rs_dpdk_alloc_zc(self.q, m, n) });
+        #[cfg(not(feature = "dpdk"))]
+        None
+    }
+
+    /// Point zero-copy mbuf m at len bytes of the preloaded file.
+    ///
+    /// # Safety
+    /// m comes from alloc_zc(); addr..addr+len lies in the registered file.
+    #[inline(always)]
+    pub unsafe fn attach(&self, m: *mut libc::c_void, addr: *const u8, len: u32) {
+        #[cfg(feature = "dpdk")]
+        ffi::rs_dpdk_attach(m, addr, len);
+        #[cfg(not(feature = "dpdk"))]
+        let _ = (m, addr, len);
+    }
+
+    /// Chain a copied header (head) and the rest of the frame (tail) into one frame.
+    ///
+    /// # Safety
+    /// head and tail are mbufs of this queue's pools, with their lengths set.
+    #[inline(always)]
+    pub unsafe fn chain(&self, head: *mut libc::c_void, tail: *mut libc::c_void) {
+        #[cfg(feature = "dpdk")]
+        ffi::rs_dpdk_chain(head, tail);
+        #[cfg(not(feature = "dpdk"))]
+        let _ = (head, tail);
     }
 
     /// Frame buffer of length len in mbuf m.
@@ -450,6 +572,11 @@ impl TxQueue {
     #[inline(always)]
     pub fn push(&mut self, m: *mut libc::c_void) {
         self.pending.push(m);
+    }
+
+    /// Give back an allocated zero-copy mbuf that was not used.
+    pub fn push_free(&mut self, m: *mut libc::c_void) {
+        self.zc_stash.push(m);
     }
 
     /// One rte_eth_tx_burst of the pending frames; returns how many the NIC took.
@@ -477,11 +604,28 @@ impl TxQueue {
     }
 }
 
+/// Refill a stash with a bulk allocation (all-or-nothing: fall back to smaller requests).
+#[cfg(feature = "dpdk")]
+#[inline(never)]
+fn refill(stash: &mut Vec<*mut libc::c_void>, batch: usize, alloc: impl Fn(*mut *mut libc::c_void, u32) -> i32) -> Option<*mut libc::c_void> {
+    let mut n = batch;
+    while n > 0 {
+        stash.resize(n, std::ptr::null_mut());
+        if alloc(stash.as_mut_ptr(), n as u32) == 0 {
+            return stash.pop();
+        }
+        n /= 4;
+    }
+    stash.clear();
+    None
+}
+
 impl Drop for TxQueue {
     fn drop(&mut self) {
         #[cfg(feature = "dpdk")]
         {
             self.stash.append(&mut self.pending);
+            self.stash.append(&mut self.zc_stash);
             if !self.stash.is_empty() {
                 unsafe { ffi::rs_dpdk_free(self.stash.as_mut_ptr(), self.stash.len() as u32) };
             }

@@ -14,6 +14,8 @@ pub const LINKTYPE_RAW_OLD: u32 = 12; // DLT_RAW on some platforms
 pub const PCAP_MAX_CAPLEN: u32 = 256 * 1024;
 pub const PCAP_FILE_HDR_LEN: u64 = 24;
 pub const PCAP_REC_HDR_LEN: u64 = 16;
+/// Alignment of a preloaded file in memory (and of its external-memory registration).
+pub const PRELOAD_ALIGN: usize = 2 << 20;
 
 const MAGIC_US: u32 = 0xa1b2c3d4;
 const MAGIC_NS: u32 = 0xa1b23c4d;
@@ -31,6 +33,8 @@ pub struct PcapFile {
     pub preloaded: bool,
     pub locked: bool,   // --preload: the file is locked in RAM (mlock)
     mapped: bool,
+    map_base: *mut libc::c_void, // what to unmap: the mapping and its reserved alignment
+    map_len: usize,
 }
 
 unsafe impl Send for PcapFile {}
@@ -86,6 +90,8 @@ impl PcapFile {
             preloaded: false,
             locked: false,
             mapped: false,
+            map_base: std::ptr::null_mut(),
+            map_len: 0,
         }
     }
 
@@ -106,10 +112,49 @@ impl PcapFile {
             return Err(format!("{}: empty file", path));
         }
         let flags = libc::MAP_PRIVATE | if preload { libc::MAP_POPULATE } else { 0 };
-        let p = unsafe { libc::mmap(std::ptr::null_mut(), pf.size, libc::PROT_READ, flags, pf.fd, 0) };
-        if p == libc::MAP_FAILED {
-            return Err(format!("mmap {}: {}", path, strerror(errno())));
-        }
+        let p = if preload {
+            // A preloaded file may be handed to the NIC as external memory (zero-copy), which
+            // is registered in units of PRELOAD_ALIGN: map it at such an address, inside a
+            // reserved range that covers the rounded-up length.
+            let span = pf.size.div_ceil(PRELOAD_ALIGN) * PRELOAD_ALIGN;
+            let res = unsafe {
+                libc::mmap(std::ptr::null_mut(), span + PRELOAD_ALIGN, libc::PROT_NONE,
+                           libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0)
+            };
+            if res == libc::MAP_FAILED {
+                return Err(format!("mmap {}: {}", path, strerror(errno())));
+            }
+            let aligned = (res as usize).div_ceil(PRELOAD_ALIGN) * PRELOAD_ALIGN;
+            let p = unsafe {
+                libc::mmap(aligned as *mut libc::c_void, pf.size, libc::PROT_READ, flags | libc::MAP_FIXED, pf.fd, 0)
+            };
+            if p == libc::MAP_FAILED {
+                let e = errno();
+                unsafe { libc::munmap(res, span + PRELOAD_ALIGN) };
+                return Err(format!("mmap {}: {}", path, strerror(e)));
+            }
+            // Give back the reserved head before the aligned start and the tail after the span.
+            unsafe {
+                if aligned > res as usize {
+                    libc::munmap(res, aligned - res as usize);
+                }
+                let end = res as usize + span + PRELOAD_ALIGN;
+                if end > aligned + span {
+                    libc::munmap((aligned + span) as *mut libc::c_void, end - aligned - span);
+                }
+            }
+            pf.map_base = aligned as *mut libc::c_void;
+            pf.map_len = span;
+            p
+        } else {
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), pf.size, libc::PROT_READ, flags, pf.fd, 0) };
+            if p == libc::MAP_FAILED {
+                return Err(format!("mmap {}: {}", path, strerror(errno())));
+            }
+            pf.map_base = p;
+            pf.map_len = pf.size;
+            p
+        };
         pf.base = p as *const u8;
         pf.mapped = true;
         pf.preloaded = preload;
@@ -124,6 +169,11 @@ impl PcapFile {
         };
         pf.parse_header()?;
         Ok(pf)
+    }
+
+    /// The preloaded mapping: aligned start and length rounded up to PRELOAD_ALIGN.
+    pub fn preload_span(&self) -> Option<(*mut u8, usize)> {
+        (self.preloaded && self.mapped).then_some((self.map_base as *mut u8, self.map_len))
     }
 
     #[inline(always)]
@@ -214,8 +264,8 @@ impl PcapFile {
 
 impl Drop for PcapFile {
     fn drop(&mut self) {
-        if self.mapped && !self.base.is_null() {
-            unsafe { libc::munmap(self.base as *mut libc::c_void, self.size) };
+        if self.mapped && !self.map_base.is_null() {
+            unsafe { libc::munmap(self.map_base, self.map_len) };
         }
         if self.fd >= 0 {
             unsafe { libc::close(self.fd) };
