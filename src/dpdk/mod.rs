@@ -48,7 +48,7 @@ mod ffi {
         pub fn rs_dpdk_port_count() -> c_uint;
         pub fn rs_dpdk_find_port(name: *const c_char, port: *mut u16) -> c_int;
         pub fn rs_dpdk_port_name(port: u16, buf: *mut c_char, n: usize) -> c_int;
-        pub fn rs_dpdk_info(port: u16, max_txq: *mut u16, mtu: *mut u16, socket: *mut c_int, driver: *mut c_char, n: usize) -> c_int;
+        pub fn rs_dpdk_info(port: u16, max_txq: *mut u16, max_desc: *mut u16, mtu: *mut u16, socket: *mut c_int, driver: *mut c_char, n: usize) -> c_int;
         pub fn rs_dpdk_link(port: u16, speed: *mut u32, up: *mut c_int) -> c_int;
         pub fn rs_dpdk_setup(port: u16, ntxq: u16, nb_desc: u16, nmbufs: c_uint, data_room: c_uint, mtu: u16, err: *mut c_char, errlen: usize) -> c_int;
         pub fn rs_dpdk_alloc(q: u16, m: *mut *mut c_void, n: c_uint) -> c_int;
@@ -210,7 +210,10 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
     let name = cstr(&name);
     let (mut max_txq, mut mtu, mut socket) = (0u16, 0u16, 0i32);
     let mut driver = [0u8; 64];
-    let r = unsafe { ffi::rs_dpdk_info(port, &mut max_txq, &mut mtu, &mut socket, driver.as_mut_ptr() as *mut _, driver.len()) };
+    let mut max_desc = 0u16;
+    let r = unsafe {
+        ffi::rs_dpdk_info(port, &mut max_txq, &mut max_desc, &mut mtu, &mut socket, driver.as_mut_ptr() as *mut _, driver.len())
+    };
     if r != 0 {
         return Err(format!("rte_eth_dev_info_get: {}", dpdk_err(r)));
     }
@@ -251,7 +254,7 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
         o.mtu = mtu as u32;
     }
     let data_room = (o.mtu as usize + 18).max(2048) as u32;
-    let nb_desc = o.ring_frames.min(4096) as u16;
+    let nb_desc = tx_descriptors(o, max_desc, ntxq, data_room);
     let nmbufs = nb_desc as u32 + 2 * o.batch + 1024;
     let mut err = [0u8; 256];
     let r = unsafe {
@@ -290,6 +293,54 @@ pub fn init(o: &mut Opts) -> Result<(), String> {
     );
     let _ = PORT.set(info);
     Ok(())
+}
+
+/// Memory of one mbuf in the pool: data room, headroom, the mbuf and the pool's own header.
+#[cfg(feature = "dpdk")]
+const MBUF_OVERHEAD: u64 = 128 + 128 + 64;
+
+/// Free hugepage memory (default hugepage size), bytes.
+#[cfg(feature = "dpdk")]
+fn hugepages_free() -> u64 {
+    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return 0 };
+    let field = |name: &str| -> u64 {
+        s.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.split_whitespace().next()?.parse().ok())
+            .unwrap_or(0)
+    };
+    field("HugePages_Free:") * field("Hugepagesize:") * 1024
+}
+
+/// TX descriptors per queue: --ring-frames if given, else the NIC's maximum, as far as the
+/// mbuf pools of all queues fit into the free hugepages.
+#[cfg(feature = "dpdk")]
+fn tx_descriptors(o: &Opts, max_desc: u16, ntxq: usize, data_room: u32) -> u16 {
+    let max = if max_desc == 0 { 4096 } else { max_desc as u32 };
+    if o.ring_frames_set {
+        return o.ring_frames.min(max).min(u16::MAX as u32) as u16;
+    }
+    let per = data_room as u64 + MBUF_OVERHEAD;
+    let pool = |d: u32| (d as u64 + 2 * o.batch as u64 + 1024) * per * ntxq as u64;
+    let free = hugepages_free();
+    if free == 0 {
+        return max.min(4096) as u16; // no hugepages (--no-huge): memory size unknown, stay modest
+    }
+    let mut d = max.min(32768);
+    // Leave a quarter of the hugepages to the EAL and the driver.
+    while d > 1024 && pool(d) > free / 4 * 3 {
+        d /= 2;
+    }
+    if d < max.min(32768) {
+        log_info!(
+            "DPDK: {} TX descriptors per queue (the NIC allows {}; more need more hugepages: {:.1} GB for {} queues)",
+            d,
+            max,
+            pool(max.min(32768)) as f64 / 0.75 / (1u64 << 30) as f64,
+            ntxq
+        );
+    }
+    d as u16
 }
 
 #[cfg(not(feature = "dpdk"))]

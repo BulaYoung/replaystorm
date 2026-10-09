@@ -458,8 +458,10 @@ replaystorm --status --dpdk ens1f0           # long-run statistics from another 
 - Statistics: "sent (port)" and `oerrors` come from the port counters (`rte_eth_stats`)
   instead of sysfs; the ENOBUFS column counts `rte_eth_tx_burst` calls that found the TX
   queue full. Link down pauses the schedule as with the kernel path.
-- `--qdisc-bypass`, `--packet-loss` and `--ring-frames` above 4096 do not apply; `--ring-frames`
-  sets the TX descriptors per queue (up to the driver's limit).
+- `--qdisc-bypass` and `--packet-loss` do not apply. TX descriptors per queue: the NIC's maximum
+  (up to 32768), reduced if the mbuf pools of all queues would not fit into 3/4 of the free
+  hugepages (a message says so); `--ring-frames N` sets them explicitly. Without hugepages
+  (`--no-huge`) the default is 4096.
 - Without a NIC, for tests: `--dpdk net_af_packet0 --eal "--no-huge --no-pci
   --vdev=net_af_packet0,iface=veth0,qpairs=8"` sends through an ordinary interface;
   `net_null0` discards frames and shows the program's own ceiling: 44.8 Gbit/s / 6.2 Mpps from
@@ -704,7 +706,8 @@ Sending:
   --cpus LIST             CPUs for threads, e.g. 2-9,12 (default:
                           /sys/class/net/IF/device/local_cpulist)
   --batch N               frames per send() call (64)
-  --ring-frames N         frames in each thread's TX_RING (4096)
+  --ring-frames N         frames in each thread's TX_RING (4096); with --dpdk the TX
+                          descriptors per queue (default: the NIC's maximum)
   --qdisc-bypass          PACKET_QDISC_BYPASS: bypass qdisc, straight to the driver
   --packet-loss           PACKET_LOSS: kernel silently skips malformed frames
   --link-speed X          link speed (25G, 10000M); default from ethtool

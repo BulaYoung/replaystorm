@@ -70,6 +70,7 @@ pub struct Opts {
 
     pub batch: u32,
     pub ring_frames: u32,
+    pub ring_frames_set: bool, // --ring-frames given (DPDK: otherwise the NIC's maximum)
     pub qdisc_bypass: bool,
     pub packet_loss: bool,
     pub link_speed_bps: f64, // 0 means auto-detect
@@ -142,6 +143,7 @@ impl Default for Opts {
             clock_mode: ClockMode::Auto,
             batch: 64,
             ring_frames: 4096,
+            ring_frames_set: false,
             qdisc_bypass: false,
             packet_loss: false,
             link_speed_bps: 0.0,
@@ -220,7 +222,8 @@ Sending:
   --cpus LIST             CPUs for threads, e.g. 2-9,12 (default:
                           /sys/class/net/IF/device/local_cpulist)
   --batch N               frames per send() call (64)
-  --ring-frames N         frames in each thread's TX_RING (4096)
+  --ring-frames N         frames in each thread's TX_RING (4096); with --dpdk the TX
+                          descriptors per queue (default: the NIC's maximum)
   --qdisc-bypass          PACKET_QDISC_BYPASS: bypass qdisc, straight to the driver
   --packet-loss           PACKET_LOSS: kernel silently skips malformed frames
   --link-speed X          link speed (25G, 10000M); default from ethtool
@@ -570,7 +573,10 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, ()> {
                 _ => return bad("--batch", v),
             },
             "ring-frames" => match parse_u64(v) {
-                Some(u) if (16..=1 << 20).contains(&u) => o.ring_frames = u as u32,
+                Some(u) if (16..=1 << 20).contains(&u) => {
+                    o.ring_frames = u as u32;
+                    o.ring_frames_set = true;
+                }
                 _ => return bad("--ring-frames", v),
             },
             "qdisc-bypass" => o.qdisc_bypass = true,

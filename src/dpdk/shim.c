@@ -57,13 +57,15 @@ int rs_dpdk_port_name(uint16_t port, char *buf, size_t n)
 	return 0;
 }
 
-int rs_dpdk_info(uint16_t port, uint16_t *max_txq, uint16_t *mtu, int *socket, char *driver, size_t n)
+int rs_dpdk_info(uint16_t port, uint16_t *max_txq, uint16_t *max_desc, uint16_t *mtu, int *socket, char *driver,
+                 size_t n)
 {
 	struct rte_eth_dev_info info;
 	int r = rte_eth_dev_info_get(port, &info);
 	if (r != 0)
 		return r;
 	*max_txq = info.max_tx_queues;
+	*max_desc = info.tx_desc_lim.nb_max;
 	if (rte_eth_dev_get_mtu(port, mtu) != 0)
 		*mtu = 1500;
 	*socket = rte_eth_dev_socket_id(port);
